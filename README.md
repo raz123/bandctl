@@ -4,7 +4,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.1 release asset (recommended):**
+**v1.2 release asset (recommended):**
+
+- Direct download: [bandctl-v1.2.zip](https://github.com/raz123/bandctl/releases/download/v1.2/bandctl-v1.2.zip)
+- SHA-256: `8e581b995cbdf605aad66e373323a5c0ff699ce69e111bcbfa1579e30a43ce29`
+- Release page: [Band Controller v1.2 — Manager WebUI fix](https://github.com/raz123/bandctl/releases/tag/v1.2)
+
+**v1.1 release (still live):**
 
 - Direct download: [bandctl-v1.1.zip](https://github.com/raz123/bandctl/releases/download/v1.1/bandctl-v1.1.zip)
 - SHA-256: `87269da4b1ff1a9cc5cd57f583156e269042e8234233e6becb96b69749fcc8a9`
@@ -27,14 +33,18 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Install
 
-1. Download [bandctl-v1.1.zip](https://github.com/raz123/bandctl/releases/download/v1.1/bandctl-v1.1.zip) to your device.
+1. Download [bandctl-v1.2.zip](https://github.com/raz123/bandctl/releases/download/v1.2/bandctl-v1.2.zip) to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.1.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-v1.2.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
-   - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager; the API calls reach the module's python server, which also serves it at http://localhost:8080.
+   - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
+
+### What's new in v1.2
+
+- **Manager WebUI now works.** v1.1's WebView pages resolved the API base relative to the Manager's `https://mui.kernelsu.org` origin, so API calls were intercepted by the WebViewAssetLoader and 404'd. The API base is now unconditional (`http://127.0.0.1:8080`), which is correct whether the page is served by the Manager or by the python server itself. Desktop use at http://localhost:8080 is unchanged.
 
 ## Features
 

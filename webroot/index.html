@@ -201,10 +201,12 @@ em { font-style: normal; color: #7a86b8; font-size: 0.8em; }
 'use strict';
 
 /* ============ API contract (FIXED) ============ */
-// Served by the python server (http://localhost:8080) -> relative paths;
-// served by the KernelSU Manager WebUI (ksu:// or appassets scheme) ->
-// absolute paths back to the python server.
-var API_BASE = (location.protocol === 'http:' || location.protocol === 'https:') ? '' : 'http://127.0.0.1:8080';
+// The module python server always listens on 127.0.0.1:8080, whether this
+// page is served by that server directly (desktop browser) or from the
+// Manager WebView (https://mui.kernelsu.org/... via WebViewAssetLoader).
+// The Manager allows cleartext to loopback, so the fetch below reaches the
+// python server in both cases — no protocol detection needed.
+var API_BASE = 'http://127.0.0.1:8080';
 var API_READ = API_BASE + '/api/read?action=read';
 var API_WRITE = API_BASE + '/api/write?action=write';
 var API_SIGNAL = API_BASE + '/api/signal?action=signal';
