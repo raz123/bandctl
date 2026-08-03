@@ -482,6 +482,16 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_OPTIONS(self):
+        # CORS preflight for cross-origin POSTs from the KernelSU WebUI
+        # origin (ksu://webui/bandctl/ or appassets://...).
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def handle_api(self):
         query = self.path.split('?', 1)[1] if '?' in self.path else ''
         action = ''
@@ -717,6 +727,9 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Content-Length', len(body))
         self.end_headers()
         self.wfile.write(body)

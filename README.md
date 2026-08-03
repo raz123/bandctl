@@ -4,11 +4,16 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.0 release asset:**
+**v1.1 release asset (recommended):**
+
+- Direct download: [bandctl-v1.1.zip](https://github.com/raz123/bandctl/releases/download/v1.1/bandctl-v1.1.zip)
+- SHA-256: `87269da4b1ff1a9cc5cd57f583156e269042e8234233e6becb96b69749fcc8a9`
+- Release page: [Band Controller v1.1 — Manager WebUI](https://github.com/raz123/bandctl/releases/tag/v1.1)
+
+**v1.0 release (still live):**
 
 - Direct download: [bandctl-v1.0.zip](https://github.com/raz123/bandctl/releases/download/v1.0/bandctl-v1.0.zip)
 - SHA-256: `6ce0d9dc5cbe8084f133aef547e29b90851edb0c43a04b35f43f3a7164d7862b`
-- Release page: [Band Controller v1.0 — NSG-independent](https://github.com/raz123/bandctl/releases/tag/v1.0)
 
 ## Requirements
 
@@ -22,11 +27,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Install
 
-1. Download [bandctl-v1.0.zip](https://github.com/raz123/bandctl/releases/download/v1.0/bandctl-v1.0.zip) to your device.
+1. Download [bandctl-v1.1.zip](https://github.com/raz123/bandctl/releases/download/v1.1/bandctl-v1.1.zip) to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.0.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-v1.1.zip`
 3. Reboot (or let the module start the service).
-4. Open the web UI at **http://localhost:8080** from the device browser.
+4. Open the web UI:
+   - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager; the API calls reach the module's python server, which also serves it at http://localhost:8080.
+   - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
 
 ## Features
@@ -42,6 +49,7 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 - **Live band-camping log** — the module records serving-cell EARFCN/band samples so you can see whether a forced band actually stuck.
 - **RSRP graph UI** — the web UI plots signal strength over time.
 - **Config persistence** — band settings are mirrored to `/data/adb/modules/bandctl/config/bands.json` and survive reboots.
+- **KernelSU Manager WebUI** — after install, open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl`); the UI also still works at http://localhost:8080.
 
 ## How it works
 
@@ -70,7 +78,7 @@ Bands **6, 7, and 66 are intentionally absent/disabled** — this is a community
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
 - Protocol tests: **27/27 passing**.
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `diag/` (pure-Python diag protocol stack), and `config/bands.json` (default band config).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), and `config/bands.json` (default band config).
 
 ## License
 
