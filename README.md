@@ -4,7 +4,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.2 release asset (recommended):**
+**v1.3 release asset (recommended):**
+
+- Direct download: [bandctl-v1.3.zip](https://github.com/raz123/bandctl/releases/download/v1.3/bandctl-v1.3.zip)
+- SHA-256: `d236052c03bf657415445574c9a80d65f03369a861dce7bae0def041959a2e4a`
+- Release page: [Band Controller v1.3 — UI redesign](https://github.com/raz123/bandctl/releases/tag/v1.3)
+
+**v1.2 release (still live):**
 
 - Direct download: [bandctl-v1.2.zip](https://github.com/raz123/bandctl/releases/download/v1.2/bandctl-v1.2.zip)
 - SHA-256: `8e581b995cbdf605aad66e373323a5c0ff699ce69e111bcbfa1579e30a43ce29`
@@ -33,14 +39,18 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Install
 
-1. Download [bandctl-v1.2.zip](https://github.com/raz123/bandctl/releases/download/v1.2/bandctl-v1.2.zip) to your device.
+1. Download [bandctl-v1.3.zip](https://github.com/raz123/bandctl/releases/download/v1.3/bandctl-v1.3.zip) to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.2.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-v1.3.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
+
+### What's new in v1.3
+
+- v1.3 — redesigned UI (blue-black theme, improved contrast, segmented tabs)
 
 ### What's new in v1.2
 
