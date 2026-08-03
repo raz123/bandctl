@@ -1,0 +1,6 @@
+id=bandctl
+name=Band Controller
+version=1.0
+versionCode=1
+author=ohmypi
+description=Standalone web UI for LTE/NR band control and modem diagnostics via direct /dev/diag access. No third-party apps required.

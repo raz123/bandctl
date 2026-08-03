@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>Band Controller</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 16px 16px 60px; max-width: 600px; margin: 0 auto; }
+h1 { color: #00d4ff; margin-bottom: 16px; font-size: 1.5em; }
+h2 { color: #00d4ff; font-size: 1.1em; }
+em { font-style: normal; color: #7a86b8; font-size: 0.8em; }
+
+/* Server banner */
+#server-banner { display: none; position: fixed; top: 0; left: 0; right: 0; background: #ff4757; color: #fff; padding: 10px 16px; text-align: center; font-size: 0.9em; z-index: 50; }
+#server-banner button { background: transparent; color: #fff; border: 1px solid #fff; border-radius: 6px; padding: 4px 14px; margin-left: 10px; font-size: 0.9em; font-weight: bold; cursor: pointer; }
+#server-banner button:hover { background: rgba(255,255,255,0.15); }
+
+/* Tabs */
+.tabbar { display: flex; gap: 8px; margin-bottom: 15px; }
+.tabbar button { flex: 1; background: #16213e; color: #8a93b8; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 12px 4px; font-size: 0.9em; cursor: pointer; min-height: 44px; }
+.tabbar button.active { background: #0f3460; color: #00d4ff; border-color: #00d4ff; font-weight: bold; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.section { background: #16213e; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
+.section-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+.section-head h2 { margin: 0; }
+.count { color: #7a86b8; font-size: 0.8em; }
+
+.band-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 8px; }
+.band { background: #0f3460; border: 2px solid #1a1a2e; border-radius: 6px; padding: 6px 4px; text-align: center; cursor: pointer; transition: all 0.2s; font-size: 0.9em; min-height: 48px; display: flex; flex-direction: column; align-items: center; justify-content: center; user-select: none; }
+.band.active { background: #00d4ff; color: #1a1a2e; border-color: #00d4ff; font-weight: bold; }
+.band:hover, .band:focus-visible { border-color: #00d4ff; outline: none; }
+.band .name { font-size: 1.1em; }
+.band .freq { font-size: 0.7em; opacity: 0.7; }
+.band.active .freq { opacity: 0.8; }
+
+.btn-row { display: flex; gap: 8px; margin-top: 10px; }
+.btn-row .btn { flex: 1; margin-top: 0; }
+.btn { background: #00d4ff; color: #1a1a2e; border: none; border-radius: 6px; padding: 12px 16px; font-size: 1em; font-weight: bold; cursor: pointer; width: 100%; margin-top: 10px; min-height: 44px; }
+.btn:hover { background: #00b8d4; }
+.btn.ghost { background: transparent; color: #00d4ff; border: 1px solid #00d4ff; }
+.btn.ghost:hover { background: rgba(0,212,255,0.12); }
+.btn.danger { background: #ff4757; }
+.btn.danger:hover { background: #e03d4c; }
+.btn.small { width: auto; padding: 6px 12px; font-size: 0.8em; min-height: 32px; margin: 0; }
+.btn.loading { opacity: 0.5; pointer-events: none; }
+
+.status { margin-top: 10px; padding: 10px; border-radius: 6px; display: none; font-size: 0.9em; }
+.status.ok { background: #2ed573; color: #1a1a2e; display: block; }
+.status.err { background: #ff4757; color: white; display: block; }
+
+/* Diagnostics */
+.canvas-wrap { position: relative; border-radius: 6px; overflow: hidden; background: #0f3460; }
+#signal-canvas { width: 100%; height: 240px; display: block; }
+.readouts { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 8px; margin-top: 10px; }
+.readout { background: #0f3460; border-radius: 6px; padding: 10px 6px; text-align: center; }
+.readout .label { font-size: 0.68em; color: #7a86b8; text-transform: uppercase; letter-spacing: 0.05em; }
+.readout .value { font-size: 1.25em; color: #00d4ff; font-weight: bold; margin-top: 2px; word-break: break-all; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { background: #0f3460; border-radius: 16px; padding: 6px 12px; font-size: 0.85em; min-height: 34px; display: inline-flex; align-items: center; gap: 6px; }
+.chip b { color: #00d4ff; font-size: 0.68em; text-transform: uppercase; letter-spacing: 0.05em; }
+.chip.good { background: #2ed573; color: #1a1a2e; font-weight: bold; }
+.chip.good b { color: #1a1a2e; }
+.chip.bad { background: #ff4757; color: #fff; font-weight: bold; }
+.chip.bad b { color: #fff; }
+.chip.amber { background: #ffa502; color: #1a1a2e; font-weight: bold; }
+.chip.amber b { color: #1a1a2e; }
+
+.hint { font-size: 0.8em; color: #7a86b8; margin-bottom: 8px; }
+.hist { max-height: 280px; overflow-y: auto; margin-top: 4px; }
+.hist-item { display: flex; gap: 8px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.85em; }
+.hist-time { color: #7a86b8; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.tag { font-size: 0.65em; font-weight: bold; padding: 2px 6px; border-radius: 4px; flex-shrink: 0; letter-spacing: 0.04em; }
+.tag.REG { background: rgba(0,212,255,0.15); color: #00d4ff; }
+.tag.DROP { background: rgba(255,71,87,0.2); color: #ff4757; }
+
+/* Settings */
+.set-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 0.92em; }
+.set-row:last-child { border-bottom: none; }
+.set-row b { color: #00d4ff; }
+.preset-item { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+.preset-name { flex: 1; font-size: 0.9em; }
+.preset-count { font-size: 0.72em; color: #7a86b8; }
+.empty { color: #7a86b8; padding: 10px 0; font-size: 0.9em; }
+
+.switch { position: relative; display: inline-block; width: 48px; height: 26px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; inset: 0; background: #0f3460; border-radius: 26px; transition: 0.2s; cursor: pointer; }
+.slider:before { content: ''; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: #8a93b8; border-radius: 50%; transition: 0.2s; }
+.switch input:checked + .slider { background: #00d4ff; }
+.switch input:checked + .slider:before { transform: translateX(22px); background: #1a1a2e; }
+
+/* Toast */
+#toast { position: fixed; bottom: 20px; left: 50%; transform: translate(-50%, 20px); background: #16213e; border: 1px solid #00d4ff; color: #00d4ff; padding: 10px 18px; border-radius: 8px; font-size: 0.9em; z-index: 60; opacity: 0; pointer-events: none; transition: all 0.25s; max-width: 90%; }
+#toast.show { opacity: 1; transform: translate(-50%, 0); }
+#toast.err { background: #ff4757; border-color: #ff4757; color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="server-banner">Server unreachable — polling paused. Polling resumes after a manual retry succeeds.<button id="retry-btn">Retry</button></div>
+<div id="toast"></div>
+
+<h1>📡 Band Controller</h1>
+
+<div class="tabbar">
+  <button data-tab="bands" class="active">Band Management</button>
+  <button data-tab="diag">Diagnostics</button>
+  <button data-tab="settings">Settings</button>
+</div>
+
+<!-- ============ BAND MANAGEMENT ============ -->
+<div id="panel-bands" class="tab-panel active">
+  <div class="section">
+    <div class="section-head"><h2>LTE Bands</h2><span class="count" id="lte-count"></span></div>
+    <div id="lte-bands" class="band-grid"></div>
+  </div>
+  <div class="section">
+    <div class="section-head"><h2>NR (5G) Bands</h2><span class="count" id="nr-count"></span></div>
+    <div id="nr-bands" class="band-grid"></div>
+  </div>
+  <div class="btn-row">
+    <button class="btn" id="save-btn">Save &amp; Apply</button>
+    <button class="btn ghost" id="reset-btn">Reset to defaults</button>
+  </div>
+  <div class="btn-row">
+    <button class="btn ghost" id="refresh-btn">Refresh from modem</button>
+  </div>
+  <div id="status" class="status"></div>
+</div>
+
+<!-- ============ DIAGNOSTICS ============ -->
+<div id="panel-diag" class="tab-panel">
+  <div class="section">
+    <h2>Signal — RSRP over time</h2>
+    <div class="canvas-wrap"><canvas id="signal-canvas"></canvas></div>
+    <div class="readouts">
+      <div class="readout"><div class="label">RSRP</div><div class="value" id="sig-rsrp">—</div></div>
+      <div class="readout"><div class="label">RSRQ</div><div class="value" id="sig-rsrq">—</div></div>
+      <div class="readout"><div class="label">Tech</div><div class="value" id="sig-tech">—</div></div>
+      <div class="readout"><div class="label">Level</div><div class="value" id="sig-level">—</div></div>
+      <div class="readout"><div class="label">Updated</div><div class="value" id="sig-time">—</div></div>
+    </div>
+  </div>
+  <div class="section">
+    <h2>Registration</h2>
+    <div class="chips" id="reg-chips">
+      <span class="chip" id="chip-svc"><b>Service</b><span class="chipval">—</span></span>
+      <span class="chip" id="chip-data"><b>Data</b><span class="chipval">—</span></span>
+      <span class="chip" id="chip-net"><b>Network</b><span class="chipval">—</span></span>
+      <span class="chip" id="chip-op"><b>Operator</b><span class="chipval">—</span></span>
+      <span class="chip" id="chip-roam"><b>Roaming</b><span class="chipval">—</span></span>
+    </div>
+    <button class="btn danger" id="modem-reset-btn">Reset Modem</button>
+  </div>
+  <div class="section">
+    <h2>Event History</h2>
+    <div class="hint">Service/network state changes are tagged REG; drops (out-of-service or signal fetch failure) are tagged DROP.</div>
+    <div class="hist" id="history-list"></div>
+  </div>
+</div>
+
+<!-- ============ SETTINGS ============ -->
+<div id="panel-settings" class="tab-panel">
+  <div class="section">
+    <h2>Config Summary</h2>
+    <div class="set-row"><span>LTE bands</span><b id="sum-lte">0</b></div>
+    <div class="set-row"><span>NR bands</span><b id="sum-nr">0</b></div>
+    <div class="set-row"><span>Source</span><b id="sum-source">—</b></div>
+  </div>
+  <div class="section">
+    <h2>Presets</h2>
+    <div class="btn-row">
+      <button class="btn" id="preset-save-btn">Save current as preset</button>
+    </div>
+    <div id="preset-list"></div>
+    <div class="empty" id="preset-empty">No presets yet — save one to quickly restore a band configuration.</div>
+  </div>
+  <div class="section">
+    <h2>Auto-disable bands on boot</h2>
+    <div class="set-row">
+      <span>Disable unselected bands at boot <em>(applied on next boot)</em></span>
+      <label class="switch"><input type="checkbox" id="boot-toggle"><span class="slider"></span></label>
+    </div>
+  </div>
+  <div class="section">
+    <h2>Export / Import</h2>
+    <div class="btn-row">
+      <button class="btn" id="export-btn">Export config (.json)</button>
+      <button class="btn ghost" id="import-btn">Import config</button>
+    </div>
+    <input type="file" id="import-file" accept=".json,application/json" hidden>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* ============ API contract (FIXED) ============ */
+var API_READ = '/api/read?action=read';
+var API_WRITE = '/api/write?action=write';
+var API_SIGNAL = '/api/signal?action=signal';
+var API_REG = '/api/registration?action=registration';
+var API_RESET = '/api/modem-reset?action=modem-reset';
+
+var SIGNAL_MS = 2000;   // poll /api/signal every 2s
+var REG_MS = 2000;      // poll /api/registration every 2s
+var GRAPH_POINTS = 120; // keep last ~120 points
+var GRAPH_WINDOW_MS = 240 * 1000;
+var HISTORY_MAX = 200;
+
+var PRESETS_KEY = 'bandController.presets.v1';
+var BOOT_KEY = 'bandController.autoDisableBoot';
+
+/* ============ Band catalogs (existing visual language) ============ */
+var LTE_BANDS = [
+  {n:1,f:'2100'},{n:2,f:'1900'},{n:3,f:'1800'},{n:4,f:'AWS'},{n:5,f:'850'},
+  {n:7,f:'2600'},{n:8,f:'900'},{n:12,f:'700a'},{n:13,f:'700c'},{n:14,f:'700p'},
+  {n:17,f:'700b'},{n:20,f:'800DD'},{n:25,f:'1900+'},{n:26,f:'850+'},
+  {n:28,f:'700A'},{n:29,f:'700e'},{n:30,f:'2300W'},{n:38,f:'2600T'},
+  {n:40,f:'2300C'},{n:41,f:'2500'},{n:42,f:'3500'},{n:43,f:'3700'},
+  {n:48,f:'3500B'},{n:66,f:'AWS+'},{n:71,f:'600'}
+];
+var NR_BANDS = [
+  {n:1,f:'2100'},{n:2,f:'1900'},{n:3,f:'1800'},{n:5,f:'850'},{n:7,f:'2600'},
+  {n:8,f:'900'},{n:20,f:'800DD'},{n:25,f:'1900+'},{n:28,f:'700A'},
+  {n:38,f:'2600T'},{n:40,f:'2300C'},{n:41,f:'2500'},{n:66,f:'AWS+'},
+  {n:71,f:'600'},{n:77,f:'3500+'},{n:78,f:'3500'},{n:79,f:'4700'}
+];
+
+/* Rogers defaults — also the fallback config when the server is absent */
+var DEFAULT_LTE = ['1','2','3','4','5','8','12','17','20','28','38','40','41'];
+var DEFAULT_NR = ['1','3','5','8','20','28','38','41','77','78'];
+
+/* ============ State ============ */
+var lteEnabled = new Set();
+var nrEnabled = new Set();
+var source = 'default';
+var serverDownReported = false;
+var signalTimer = null;
+var regTimer = null;
+var signalHistory = [];   // {t: epoch_ms, rsrp: number|null}
+var lastReg = null;       // {service, net}
+var toastTimer = null;
+
+/* ============ DOM helpers ============ */
+function $(id) { return document.getElementById(id); }
+function fmtClock() {
+  var d = new Date();
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(function (x) { return String(x).padStart(2, '0'); }).join(':');
+}
+function fmtTime(ts) { return new Date(ts).toLocaleTimeString(); }
+
+/* ============ Tabs ============ */
+var TABS = ['bands', 'diag', 'settings'];
+function switchTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(function (p) { p.classList.toggle('active', p.id === 'panel-' + name); });
+  document.querySelectorAll('.tabbar button').forEach(function (b) { b.classList.toggle('active', b.dataset.tab === name); });
+  if (name === 'diag') drawGraph();
+}
+function onHash() {
+  var t = (location.hash || '#bands').slice(1);
+  switchTab(TABS.indexOf(t) >= 0 ? t : 'bands');
+}
+
+/* ============ Band grids ============ */
+function renderBands() {
+  renderGrid('lte-bands', LTE_BANDS, lteEnabled, 'lte');
+  renderGrid('nr-bands', NR_BANDS, nrEnabled, 'nr');
+}
+function renderGrid(elId, catalog, enabled, type) {
+  var el = $(elId);
+  el.innerHTML = catalog.map(function (b) {
+    var on = enabled.has(String(b.n));
+    return '<div class="band' + (on ? ' active' : '') + '" role="button" tabindex="0" data-band="' + b.n + '" data-type="' + type + '" aria-pressed="' + on + '">' +
+      '<div class="name">B' + b.n + '</div><div class="freq">' + b.f + '</div></div>';
+  }).join('');
+}
+function toggleBand(n, type) {
+  var set = type === 'lte' ? lteEnabled : nrEnabled;
+  var sn = String(n);
+  if (set.has(sn)) { set.delete(sn); } else { set.add(sn); }
+  renderBands();
+}
+function setBands(lte, nr) {
+  lteEnabled = new Set((lte || []).map(String));
+  nrEnabled = new Set((nr || []).map(String));
+}
+function applyConfig(lte, nr, src) {
+  setBands(lte, nr);
+  source = src || source;
+  renderBands();
+  updateSummary();
+}
+function applyDefaults() {
+  applyConfig(DEFAULT_LTE, DEFAULT_NR, 'default');
+}
+
+/* ============ Band Management actions ============ */
+async function loadBands() {
+  var btn = $('refresh-btn');
+  if (btn) btn.classList.add('loading');
+  try {
+    var r = await fetch(API_READ);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    applyConfig(d.lte, d.nr, d.source);
+    if (serverDownReported) {
+      serverDownReported = false;
+      hideBanner();
+    }
+    startPolling();
+    showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
+  } catch (e) {
+    showStatus('Failed to load: ' + e.message, true);
+    serverDown(e);
+    applyDefaults();
+  } finally {
+    if (btn) btn.classList.remove('loading');
+  }
+}
+
+async function saveBands() {
+  var btn = $('save-btn');
+  btn.classList.add('loading');
+  var data = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
+  try {
+    var r = await fetch(API_WRITE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (d.ok) {
+      source = d.source || source;
+      showStatus('Saved & applied (source: ' + source + '). Reboot to apply.', false);
+      // Confirm applied state by polling /api/read once
+      try {
+        var r2 = await fetch(API_READ);
+        if (r2.ok) {
+          var d2 = await r2.json();
+          applyConfig(d2.lte, d2.nr, d2.source);
+        }
+      } catch (e2) { /* confirmation read is best-effort */ }
+    } else {
+      showStatus('Error: ' + (d.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showStatus('Failed to save: ' + e.message, true);
+    serverDown(e);
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+function resetDefaults() {
+  applyDefaults();
+  showStatus('Defaults loaded (' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR). Press Save & Apply to push to the modem.', false);
+  toast('Defaults loaded — press Save & Apply');
+}
+
+/* ============ Polling lifecycle ============ */
+function startPolling() {
+  if (serverDownReported) return;
+  if (signalTimer === null) {
+    signalTimer = setInterval(pollSignal, SIGNAL_MS);
+    pollSignal();
+  }
+  if (regTimer === null) {
+    regTimer = setInterval(pollRegistration, REG_MS);
+    pollRegistration();
+  }
+}
+function stopPolling() {
+  if (signalTimer !== null) { clearInterval(signalTimer); signalTimer = null; }
+  if (regTimer !== null) { clearInterval(regTimer); regTimer = null; }
+}
+function serverDown(err) {
+  if (serverDownReported) return;
+  serverDownReported = true;
+  stopPolling();
+  showBanner();
+  logDrop('Server unreachable — ' + (err && err.message ? err.message : String(err)));
+}
+function retryConnect() {
+  loadBands();
+}
+
+async function pollSignal() {
+  try {
+    var r = await fetch(API_SIGNAL);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    var now = Date.now();
+    signalHistory.push({ t: now, rsrp: (d.rsrp_dbm == null ? null : d.rsrp_dbm) });
+    if (signalHistory.length > GRAPH_POINTS) signalHistory.shift();
+    $('sig-rsrp').textContent = d.rsrp_dbm == null ? '—' : d.rsrp_dbm + ' dBm';
+    $('sig-rsrq').textContent = d.rsrq_db == null ? '—' : d.rsrq_db + ' dB';
+    $('sig-tech').textContent = d.tech || '—';
+    $('sig-level').textContent = d.level == null ? '—' : String(d.level);
+    $('sig-time').textContent = fmtTime(d.timestamp || now);
+    drawGraph();
+  } catch (e) {
+    serverDown(e);
+  }
+}
+
+async function pollRegistration() {
+  try {
+    var r = await fetch(API_REG);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    updateChips(d);
+    checkRegChange(d);
+  } catch (e) {
+    serverDown(e);
+  }
+}
+
+/* ============ Registration chips + history ============ */
+function setChip(id, txt, tone) {
+  var el = $(id);
+  el.querySelector('.chipval').textContent = txt;
+  el.classList.remove('good', 'bad', 'amber');
+  if (tone) el.classList.add(tone);
+}
+function updateChips(d) {
+  var svc = d.service_state || '—';
+  setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : 'bad');
+  setChip('chip-data', d.data_state || '—');
+  setChip('chip-net', d.network_type || '—');
+  setChip('chip-op', d.operator || '—');
+  setChip('chip-roam', d.roaming ? 'Roaming' : 'Home', d.roaming ? 'amber' : null);
+}
+function checkRegChange(d) {
+  var cur = { service: d.service_state, net: d.network_type };
+  if (!lastReg) {
+    logEntry('REG', 'Initial state: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+  } else if (cur.service !== lastReg.service || cur.net !== lastReg.net) {
+    var wasIn = lastReg.service === 'IN_SERVICE';
+    var isIn = cur.service === 'IN_SERVICE';
+    if (!isIn && wasIn) {
+      logDrop('Service lost: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+    } else {
+      logEntry('REG', 'Service state → ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+    }
+  }
+  lastReg = cur;
+}
+function logEntry(tag, text) {
+  var list = $('history-list');
+  var item = document.createElement('div');
+  item.className = 'hist-item';
+  var time = document.createElement('span');
+  time.className = 'hist-time';
+  time.textContent = fmtClock();
+  var tagEl = document.createElement('span');
+  tagEl.className = 'tag ' + tag;
+  tagEl.textContent = tag;
+  var txt = document.createElement('span');
+  txt.className = 'hist-text';
+  txt.textContent = text;
+  item.appendChild(time);
+  item.appendChild(tagEl);
+  item.appendChild(txt);
+  list.insertBefore(item, list.firstChild);
+  while (list.children.length > HISTORY_MAX) list.removeChild(list.lastChild);
+}
+function logDrop(text) { logEntry('DROP', text); }
+
+/* ============ Signal graph (plain canvas, auto-scale) ============ */
+function drawGraph() {
+  var canvas = $('signal-canvas');
+  var w = canvas.clientWidth;
+  if (w === 0) return; // hidden tab
+  var h = 240;
+  var dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  var ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  var padL = 46, padR = 10, padT = 12, padB = 22;
+  var pw = w - padL - padR, ph = h - padT - padB;
+
+  // plot background
+  ctx.fillStyle = '#0f3460';
+  ctx.fillRect(padL, padT, pw, ph);
+
+  var now = Date.now();
+  var tMin = now - GRAPH_WINDOW_MS;
+  if (signalHistory.length) tMin = Math.min(tMin, signalHistory[0].t);
+  var tMax = Math.max(now, signalHistory.length ? signalHistory[signalHistory.length - 1].t : now);
+  var spanT = Math.max(tMax - tMin, 1);
+
+  var vals = signalHistory.filter(function (p) { return p.rsrp != null; }).map(function (p) { return p.rsrp; });
+  var yMin, yMax;
+  if (vals.length) {
+    yMin = Math.min.apply(null, vals);
+    yMax = Math.max.apply(null, vals);
+    var pad = Math.max((yMax - yMin) * 0.15, 4);
+    yMin -= pad; yMax += pad;
+  } else {
+    yMin = -120; yMax = -80;
+  }
+  if (yMax - yMin < 8) { var mid = (yMax + yMin) / 2; yMin = mid - 4; yMax = mid + 4; }
+
+  function X(t) { return padL + ((t - tMin) / spanT) * pw; }
+  function Y(v) { return padT + ph - ((v - yMin) / (yMax - yMin)) * ph; }
+
+  ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+
+  // horizontal grid + Y labels
+  var TICKS = 4, i;
+  for (i = 0; i <= TICKS; i++) {
+    var v = yMin + (yMax - yMin) * i / TICKS;
+    var yy = Y(v);
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke();
+    ctx.fillStyle = '#7a86b8';
+    ctx.fillText(Math.round(v) + ' dBm', 2, yy + 3);
+  }
+
+  // vertical grid + X labels (relative seconds)
+  for (var s = 0; s <= 240; s += 60) {
+    var tt = now - s * 1000;
+    if (tt < tMin - 1000) continue;
+    var xx = X(tt);
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, h - padB); ctx.stroke();
+    ctx.fillStyle = '#7a86b8';
+    ctx.fillText(s === 0 ? 'now' : '-' + s + 's', xx - 10, h - 6);
+  }
+
+  if (vals.length) {
+    // signal line with gaps on null values
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    var pen = false;
+    for (var j = 0; j < signalHistory.length; j++) {
+      var p = signalHistory[j];
+      if (p.rsrp == null) { pen = false; continue; }
+      var x = X(p.t), y = Y(p.rsrp);
+      if (pen) { ctx.lineTo(x, y); } else { ctx.moveTo(x, y); pen = true; }
+    }
+    ctx.stroke();
+    // current-value dot
+    var last = signalHistory[signalHistory.length - 1];
+    if (last && last.rsrp != null) {
+      ctx.fillStyle = '#ffd166';
+      ctx.beginPath();
+      ctx.arc(X(last.t), Y(last.rsrp), 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    ctx.fillStyle = '#7a86b8';
+    ctx.fillText('No signal data yet — waiting for /api/signal…', padL + 10, padT + ph / 2);
+  }
+}
+
+/* ============ Modem reset ============ */
+async function modemReset() {
+  if (!confirm('Reset the modem? This may briefly drop the data connection.')) return;
+  var btn = $('modem-reset-btn');
+  btn.classList.add('loading');
+  try {
+    var r = await fetch(API_RESET, { method: 'POST' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (d.ok) {
+      toast('Modem reset sent');
+    } else {
+      toast('Modem reset failed: ' + (d.error || 'unknown'), true);
+    }
+  } catch (e) {
+    toast('Modem reset failed: ' + e.message, true);
+    serverDown(e);
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+/* ============ Settings: presets (localStorage) ============ */
+function getPresets() {
+  try { return JSON.parse(localStorage.getItem(PRESETS_KEY)) || []; }
+  catch (e) { return []; }
+}
+function savePresets(p) { localStorage.setItem(PRESETS_KEY, JSON.stringify(p)); }
+function renderPresets() {
+  var list = getPresets();
+  var wrap = $('preset-list');
+  wrap.innerHTML = list.map(function (p, i) {
+    return '<div class="preset-item">' +
+      '<span class="preset-name"></span>' +
+      '<span class="preset-count"></span>' +
+      '<button class="btn small" data-action="load" data-index="' + i + '">Load</button>' +
+      '<button class="btn small danger" data-action="del" data-index="' + i + '">Delete</button>' +
+      '</div>';
+  }).join('');
+  // fill text via textContent (safe against quotes in names)
+  wrap.querySelectorAll('.preset-item').forEach(function (row, i) {
+    var p = list[i];
+    if (!p) return;
+    row.querySelector('.preset-name').textContent = p.name;
+    row.querySelector('.preset-count').textContent = (p.lte || []).length + ' LTE / ' + (p.nr || []).length + ' NR';
+  });
+  $('preset-empty').style.display = list.length ? 'none' : 'block';
+}
+function savePreset() {
+  var name = (prompt('Preset name:') || '').trim();
+  if (!name) return;
+  var list = getPresets();
+  list.push({ name: name, lte: Array.from(lteEnabled), nr: Array.from(nrEnabled), savedAt: Date.now() });
+  savePresets(list);
+  renderPresets();
+  toast('Preset "' + name + '" saved');
+}
+function loadPreset(i) {
+  var p = getPresets()[i];
+  if (!p) return;
+  setBands(p.lte, p.nr);
+  renderBands();
+  updateSummary();
+  toast('Preset "' + p.name + '" loaded — press Save & Apply to push');
+}
+function deletePreset(i) {
+  var list = getPresets();
+  if (!list[i]) return;
+  var name = list[i].name;
+  list.splice(i, 1);
+  savePresets(list);
+  renderPresets();
+  toast('Preset "' + name + '" deleted');
+}
+
+/* ============ Settings: boot toggle, export/import ============ */
+function bindBootToggle() {
+  var t = $('boot-toggle');
+  t.checked = localStorage.getItem(BOOT_KEY) === '1';
+  t.addEventListener('change', function () {
+    localStorage.setItem(BOOT_KEY, t.checked ? '1' : '0');
+    toast(t.checked ? 'Auto-disable enabled (applied on next boot)' : 'Auto-disable disabled');
+  });
+}
+
+function exportConfig() {
+  var payload = {
+    app: 'band-controller',
+    exportedAt: new Date().toISOString(),
+    lte: Array.from(lteEnabled),
+    nr: Array.from(nrEnabled)
+  };
+  var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'band-config.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  toast('Config exported (' + payload.lte.length + ' LTE, ' + payload.nr.length + ' NR)');
+}
+
+function onImportFile(file) {
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function () {
+    try {
+      var d = JSON.parse(reader.result);
+      if (!d || !Array.isArray(d.lte) || !Array.isArray(d.nr)) throw new Error('expected { lte: [...], nr: [...] }');
+      var lte = d.lte.map(String).filter(function (v) { return /^\d+$/.test(v); });
+      var nr = d.nr.map(String).filter(function (v) { return /^\d+$/.test(v); });
+      setBands(lte, nr);
+      renderBands();
+      updateSummary();
+      toast('Config imported — ' + lte.length + ' LTE, ' + nr.length + ' NR bands. Press Save & Apply to push');
+    } catch (e) {
+      toast('Import failed: ' + e.message, true);
+    }
+  };
+  reader.onerror = function () { toast('Import failed: could not read file', true); };
+  reader.readAsText(file);
+  $('import-file').value = '';
+}
+
+/* ============ Summary ============ */
+function updateSummary() {
+  $('sum-lte').textContent = lteEnabled.size;
+  $('sum-nr').textContent = nrEnabled.size;
+  $('sum-source').textContent = source;
+  $('lte-count').textContent = lteEnabled.size + ' active';
+  $('nr-count').textContent = nrEnabled.size + ' active';
+}
+
+/* ============ Feedback UI ============ */
+function showStatus(msg, isErr) {
+  var el = $('status');
+  el.textContent = msg;
+  el.className = 'status ' + (isErr ? 'err' : 'ok');
+}
+function toast(msg, isErr) {
+  var el = $('toast');
+  el.textContent = msg;
+  el.className = 'toast ' + (isErr ? 'err' : 'ok') + ' show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { el.classList.remove('show'); }, 3500);
+}
+function showBanner() { $('server-banner').style.display = 'block'; }
+function hideBanner() { $('server-banner').style.display = 'none'; }
+
+/* ============ Delegated events ============ */
+document.addEventListener('click', function (e) {
+  var tab = e.target.closest('.tabbar button[data-tab]');
+  if (tab) { location.hash = tab.dataset.tab; return; }
+  var band = e.target.closest('[data-band]');
+  if (band) { toggleBand(band.dataset.band, band.dataset.type); return; }
+  var preset = e.target.closest('[data-action]');
+  if (preset) {
+    var i = parseInt(preset.dataset.index, 10);
+    if (preset.dataset.action === 'load') loadPreset(i); else deletePreset(i);
+  }
+});
+document.addEventListener('keydown', function (e) {
+  var band = e.target.closest('[data-band]');
+  if (band && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    toggleBand(band.dataset.band, band.dataset.type);
+  }
+});
+
+/* ============ Init ============ */
+function init() {
+  $('save-btn').addEventListener('click', saveBands);
+  $('reset-btn').addEventListener('click', resetDefaults);
+  $('refresh-btn').addEventListener('click', loadBands);
+  $('retry-btn').addEventListener('click', retryConnect);
+  $('modem-reset-btn').addEventListener('click', modemReset);
+  $('preset-save-btn').addEventListener('click', savePreset);
+  $('export-btn').addEventListener('click', exportConfig);
+  $('import-btn').addEventListener('click', function () { $('import-file').click(); });
+  $('import-file').addEventListener('change', function () { onImportFile($('import-file').files[0]); });
+  bindBootToggle();
+  window.addEventListener('hashchange', onHash);
+  window.addEventListener('resize', drawGraph);
+
+  onHash();
+  renderPresets();
+  updateSummary();
+  loadBands();
+  startPolling();
+}
+
+init();
+</script>
+</body>
+</html>
