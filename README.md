@@ -73,6 +73,14 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
 
+## Screenshots
+
+The v1.5.1 web UI: 13 LTE bands active, and live diagnostics (RSRP/RSRQ, registration chips, signal graph).
+
+![Bands tab - LTE band tiles with live count](bands.png)
+
+![Diagnostics tab - live signal and registration](diag.png)
+
 ### What's new in v1.5.1
 
 - **Install hardening.** On some KernelSU installs the QMI binary lost its exec bit (the metainstall pass runs customize.sh with a mangled MODDIR, and the extractor doesn't preserve Unix modes), which crashed the web server on first load. The service now re-asserts executable permissions at boot, and the server degrades gracefully instead of crashing if the binary still can't be executed.
