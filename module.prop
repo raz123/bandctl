@@ -1,6 +1,6 @@
 id=bandctl
 name=Band Controller
-version=1.3
-versionCode=4
+version=1.4
+versionCode=5
 author=ohmypi
-description=Standalone web UI for LTE/NR band control and modem diagnostics via direct /dev/diag access. No third-party apps required. KernelSU Manager WebUI works, redesigned UI.
+description=Standalone web UI for LTE/NR band control and modem diagnostics. Direct QMI band apply (QRTR), no third-party apps. KernelSU Manager WebUI works, redesigned UI.

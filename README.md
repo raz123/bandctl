@@ -4,7 +4,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.3 release asset (recommended):**
+**v1.4 release asset (recommended):**
+
+- Direct download: [bandctl-v1.4.zip](https://github.com/raz123/bandctl/releases/download/v1.4/bandctl-v1.4.zip)
+- SHA-256: `8bc6921fc45a30415ba91069c663d0682abd4616f95653c8ebf023c431684e11`
+- Release page: [Band Controller v1.4 — real band apply via QMI](https://github.com/raz123/bandctl/releases/tag/v1.4)
+
+**v1.3 release (still live):**
 
 - Direct download: [bandctl-v1.3.zip](https://github.com/raz123/bandctl/releases/download/v1.3/bandctl-v1.3.zip)
 - SHA-256: `d236052c03bf657415445574c9a80d65f03369a861dce7bae0def041959a2e4a`
@@ -39,18 +45,18 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Install
 
-1. Download [bandctl-v1.3.zip](https://github.com/raz123/bandctl/releases/download/v1.3/bandctl-v1.3.zip) to your device.
+1. Download [bandctl-v1.4.zip](https://github.com/raz123/bandctl/releases/download/v1.4/bandctl-v1.4.zip) to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.3.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-v1.4.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
 
-### What's new in v1.3
+### What's new in v1.4
 
-- v1.3 — redesigned UI (blue-black theme, improved contrast, segmented tabs)
+- **Real band apply via QRTR QMI.** Save & Apply now talks to the modem over Qualcomm's QRTR transport with a bundled static `qmi_band` client — no more NACKed diag writes. Proven on this device: forcing bands moved camping from band 4 (EARFCN 2050) to band 12 (EARFCN 5060) in ~40s and back. `/api/read` reports the live modem state with `source: "qmi"`; diag remains the fallback transport where it works, and the config file still persists intent.
 
 ### What's new in v1.2
 
@@ -59,11 +65,11 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 ## Features
 
 - **7 API endpoints**:
-  - `GET  /api/read` — current LTE/NR band configuration (from diag, config file, or default)
-  - `POST /api/write` — write LTE/NR band configuration to the modem
+  - `GET  /api/read` — current LTE/NR band configuration (from QMI, diag, config file, or default)
+  - `POST /api/write` — write LTE/NR band configuration to the modem (QMI first, diag fallback)
   - `GET  /api/signal` — current signal strength (RSRP/RSRQ/level) from `dumpsys telephony.registry`
   - `GET  /api/registration` — service/data state, network type, operator, roaming
-  - `GET  /api/health` — transport status (diag device, band counts, diag session owner)
+  - `GET  /api/health` — transport status (QMI or diag, band counts, diag session owner)
   - `POST /api/modem-reset` — soft modem reset (`cmd phone radio power` off/on, with fallback)
   - `GET  /api/band-camping` — live band-camping log: last N serving-cell EARFCN/band samples
 - **Live band-camping log** — the module records serving-cell EARFCN/band samples so you can see whether a forced band actually stuck.
@@ -73,13 +79,16 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## How it works
 
-- **Direct /dev/diag access** via the bundled pure-Python protocol stack (kernel-verified: the diag kernel driver, feature masks, and NV/band-mask commands are exercised without any third-party binaries or libraries).
-- **Telephony-framework monitoring** via `dumpsys telephony.registry` — signal strength, registration state, and band camping are reported even when the diag transport is unavailable.
-- **Graceful degraded mode** — if diag is down, reads fall back to the config file and monitoring keeps working.
+- **Direct QMI band apply over QRTR** via the bundled static `qmi_band` client (source in `qmi/`). It discovers the live NAS endpoint at runtime (service/node/port are probed, not hardcoded), reads the current band configuration, and applies LTE/NR band preference changes — the modem camps per the applied list.
+- **`/dev/diag` fallback** via the bundled pure-Python protocol stack (the diag kernel driver, feature masks, and NV/band-mask commands) for devices where diag works.
+- **Telephony-framework monitoring** via `dumpsys telephony.registry` — signal strength, registration state, and band camping are reported regardless of transport.
+- **Graceful fallback chain** — reads try QMI, then diag, then the config file; writes try QMI, then diag, and always mirror intent to `config/bands.json`.
 
 ## Status and honest limitations
 
-On some kernels/boots, the modem never completes the diag feature-mask handshake, so band **writes** may be NACKed (kernel `0x13`) until modem bring-up completes. The UI reports transport status clearly, band intent is still saved to the config file, and monitoring keeps working. **Band locking is best-effort on the device's current kernel/modem combo** — if the write is NACKed, the modem ignores it; a modem reset or reboot may help complete bring-up.
+**QMI band apply works on this device (Poco F3 / alioth).** Forcing bands via the web UI moved camping off band 4 (EARFCN 2050) onto band 12 (EARFCN 5060) in ~40s, and restoring the Rogers config moved it back toward band 4 with registration IN_SERVICE. `/api/read` reports the live QMI band state with `source: "qmi"`.
+
+Where the QRTR QMI service is unavailable, the module falls back to `/dev/diag` — on kernels where the diag feature-mask handshake never completes, band **writes** may be NACKed. In every case band intent is mirrored to the config file and monitoring keeps working.
 
 ## Band configuration
 
@@ -98,7 +107,7 @@ Bands **6, 7, and 66 are intentionally absent/disabled** — this is a community
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
 - Protocol tests: **27/27 passing**.
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), and `config/bands.json` (default band config).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), and `config/bands.json` (default band config).
 
 ## License
 

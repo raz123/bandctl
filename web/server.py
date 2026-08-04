@@ -1,20 +1,21 @@
 #!/data/data/com.termux/files/usr/bin/python3
-"""Band Controller HTTP server with direct diag interface.
+"""Band Controller HTTP server with QMI-first transport.
 
-No NSG dependency - communicates directly with /dev/diag.
+No NSG dependency - band apply goes over QRTR QMI (the bundled static
+qmi_band client), with /dev/diag and the config file as fallbacks.
 
 HTTP API (all responses are JSON, served from the phone's web root):
 
   GET  /api/read?action=read
        -> {"lte": ["1", ...], "nr": ["77", ...],
-           "source": "diag" | "config_file" | "default"}
-       LTE/NR band configuration. Tries the modem via diag first, then the
-       fallback config file, then a default all-bands list.
+           "source": "qmi" | "diag" | "config_file" | "default"}
+       LTE/NR band configuration. Tries QMI (QRTR) first, then diag, then
+       the fallback config file, then a default all-bands list.
 
   POST /api/write?action=write   body {"lte": [...], "nr": [...]}
        -> {"ok": bool, "source": ..., "error": ...?}
-       Writes the band configuration to the modem via diag and mirrors it
-       to the fallback config file.
+       Writes the band configuration to the modem via QMI (QRTR) first,
+       falling back to diag, and mirrors it to the fallback config file.
 
   GET  /api/signal?action=signal
        -> {"rsrp_dbm": int|null, "rsrq_db": int|null, "level": int|null,
@@ -34,11 +35,13 @@ HTTP API (all responses are JSON, served from the phone's web root):
        flat format handled as best-effort). Missing fields are null.
 
   GET  /api/health?action=health
-       -> {"status": "ok" | "degraded" | "error", "diag_device": ...,
+       -> {"status": "ok" | "degraded" | "error",
+           "transport": "qmi" | "diag", "diag_device": ...,
            "lte_bands": n, "nr_bands": n, "md_session_owner": pid|null,
            "error": ...?}
-       Diag liveness via a band read plus an optional ioctl 41
-       (DIAG_IOCTL_QUERY_MD_PID) probe for the modem MD session owner.
+       Transport liveness via a QMI band read (preferred) with a diag band
+       read as fallback, plus an optional ioctl 41 (DIAG_IOCTL_QUERY_MD_PID)
+       probe for the modem MD session owner on the diag path.
        Never 500s: any failure is reported as a status field.
 
   POST /api/modem-reset?action=modem-reset
@@ -82,6 +85,15 @@ from protocol import band_bitmask_to_list, band_list_to_bitmask
 PORT = 8080
 WEB_DIR = "/data/adb/modules/bandctl/web"
 DIAG_DEVICE = "/dev/diag"
+
+# QMI band-apply client (QRTR transport). Resolved relative to the module
+# dir like DIAG_DIR; falls back to /data/local/tmp/qmi_band for dev use.
+# The module zip ships the static binary at qmi/qmi_band.
+QMI_BIN = Path(__file__).parent.parent / "qmi" / "qmi_band"
+if not QMI_BIN.exists():
+    QMI_BIN = Path("/data/local/tmp/qmi_band")
+QMI_GET_TIMEOUT = 5
+QMI_SET_TIMEOUT = 8
 
 # Fallback config file for persistence
 CONFIG_FILE = "/data/adb/modules/bandctl/config/bands.json"
@@ -135,6 +147,47 @@ def _run_cmd(args, timeout=5):
 def _run_dumpsys(service="telephony.registry"):
     """Run `dumpsys <service>` with a short timeout, returning stdout."""
     return _run_cmd(["/system/bin/dumpsys", service], timeout=5)
+
+
+def _run_qmi(args, timeout):
+    """Run the QMI band client; return (returncode, combined output).
+
+    Returns (None, "") when the binary is missing or the call times out -
+    callers treat that as "QMI unavailable" and fall back.
+    """
+    try:
+        proc = subprocess.run([str(QMI_BIN)] + args, capture_output=True,
+                              text=True, timeout=timeout)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, ""
+
+
+def _parse_qmi_get(output):
+    """Parse `qmi_band --get` output into {"lte": [...], "nr": [...]}.
+
+    The client prints one `LTE bands:` / `NR5G SA bands:` / `NR5G NSA
+    bands:` line per mask (band numbers space-separated, "(none)" when
+    empty). NR bands are the union of the SA and NSA lists. Returns None
+    when no band lists could be parsed (transport unavailable).
+    """
+    lte = sa = nsa = None
+    for line in output.splitlines():
+        m = re.match(r"\s*(LTE|NR5G SA|NR5G NSA) bands:\s*(.*)$", line)
+        if not m:
+            continue
+        tag, rest = m.group(1), m.group(2).strip()
+        bands = [] if rest in ("", "(none)") else rest.split()
+        if tag == "LTE":
+            lte = bands
+        elif tag == "NR5G SA":
+            sa = bands
+        else:
+            nsa = bands
+    if lte is None:
+        return None
+    nr = sorted(set(sa or []) | set(nsa or []))
+    return {"lte": [str(b) for b in lte], "nr": [str(b) for b in nr]}
 
 
 def _cmd_available(service, subcommand):
@@ -528,9 +581,13 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json({"error": "unknown action"})
 
     def read_config(self):
-        """Read band configuration from modem via diag."""
+        """Read band configuration: QMI (QRTR) first, then diag, then the
+        fallback config file."""
+        qmi_cfg = self._read_qmi_config()
+        if qmi_cfg is not None:
+            return qmi_cfg
         try:
-            # Try direct diag read first
+            # Try direct diag read next
             bands = read_bands(DIAG_DEVICE)
             return {
                 "lte": [str(b) for b in bands['lte_bands']],
@@ -541,6 +598,15 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             # Fallback to config file
             print(f"Diag read failed: {e}, trying config file")
             return self._read_config_file()
+
+    def _read_qmi_config(self):
+        """Read bands via the QMI client; None when QMI is unavailable."""
+        _rc, out = _run_qmi(["--get"], QMI_GET_TIMEOUT)
+        parsed = _parse_qmi_get(out)
+        if parsed is None:
+            return None
+        parsed["source"] = "qmi"
+        return parsed
 
     def _read_config_file(self):
         """Read from fallback config file."""
@@ -561,23 +627,41 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         }
 
     def write_config(self, data):
-        """Write band configuration to modem via diag."""
+        """Write band configuration to the modem: QMI (QRTR) first, then
+        diag. The config file is always mirrored so intent persists."""
         try:
             lte_bands = [int(b) for b in data.get('lte', [])]
             nr_bands = [int(b) for b in data.get('nr', [])]
+        except (TypeError, ValueError) as e:
+            return {"ok": False, "error": f"invalid band list: {e}"}
 
-            # Write via diag
+        # QMI write first (real band apply via QRTR)
+        if self._write_qmi_config(lte_bands, nr_bands):
+            self._save_config_file(data)
+            return {"ok": True, "source": "qmi"}
+
+        # Fallback: diag write
+        try:
             success = write_bands(lte_bands, nr_bands, DIAG_DEVICE)
-
             if success:
-                # Also save to config file for persistence
                 self._save_config_file(data)
                 return {"ok": True, "source": "diag"}
-            else:
-                return {"ok": False, "error": "diag write failed"}
-
+            self._save_config_file(data)
+            return {"ok": False, "error": "diag write failed"}
         except Exception as e:
+            self._save_config_file(data)
             return {"ok": False, "error": str(e)}
+
+    def _write_qmi_config(self, lte_bands, nr_bands):
+        """Apply bands via the QMI client. True on QMI status 0 - the client
+        prints `result: status=0`; the exit code alone is not sufficient
+        (it returns 0 as long as the QMI exchange completed)."""
+        lte_csv = ",".join(str(b) for b in lte_bands)
+        nr_csv = ",".join(str(b) for b in nr_bands)
+        rc, out = _run_qmi(["--set", lte_csv, nr_csv], QMI_SET_TIMEOUT)
+        if rc is None or not out:
+            return False
+        return re.search(r"result: status=0", out) is not None
 
     def _save_config_file(self, data):
         """Save config to file as fallback."""
@@ -691,10 +775,27 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         """Get modem health status. Never raises - always returns a
         JSON-ready dict.
 
-        status is "ok" when the band read succeeds with bands present,
-        "degraded" when diag responds but no bands are configured, and
-        "error" when the diag read itself fails (message included).
+        status is "ok" when a transport reads bands, "degraded" when the
+        transport answers but no bands are configured, and "error" when
+        nothing is readable (message included). transport is "qmi" when
+        the QRTR client works, "diag" otherwise.
         """
+        rc, out = _run_qmi(["--get"], QMI_GET_TIMEOUT)
+        parsed = _parse_qmi_get(out) if rc is not None else None
+        if parsed is not None:
+            lte_bands = parsed["lte"]
+            nr_bands = parsed["nr"]
+            status = "ok" if (lte_bands or nr_bands) else "degraded"
+            result = {
+                "status": status,
+                "transport": "qmi",
+                "lte_bands": len(lte_bands),
+                "nr_bands": len(nr_bands),
+                "md_session_owner": None,
+            }
+            if status == "degraded":
+                result["error"] = "QMI responded but no bands are configured"
+            return result
         try:
             bands = read_bands(DIAG_DEVICE)
             lte_bands = bands.get('lte_bands', []) or []
@@ -705,6 +806,7 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
                 status = "degraded"
             result = {
                 "status": status,
+                "transport": "diag",
                 "diag_device": DIAG_DEVICE,
                 "lte_bands": len(lte_bands),
                 "nr_bands": len(nr_bands),
@@ -716,6 +818,7 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             return {
                 "status": "error",
+                "transport": "diag",
                 "diag_device": DIAG_DEVICE,
                 "lte_bands": 0,
                 "nr_bands": 0,
@@ -748,5 +851,6 @@ if __name__ == '__main__':
 
     server = http.server.HTTPServer(('0.0.0.0', PORT), BandHandler)
     print(f"Band Controller server running on http://localhost:{PORT}")
+    print(f"QMI binary: {QMI_BIN}")
     print(f"Diag device: {DIAG_DEVICE or 'disabled'}")
     server.serve_forever()

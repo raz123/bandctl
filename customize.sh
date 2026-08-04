@@ -36,10 +36,11 @@ else
 fi
 
 # Fix permissions: 755 dirs, 644 files, scripts executable
-chmod 755 "$MODDIR" "$CONFIG_DIR" "$MODDIR/web" "$MODDIR/diag" 2>/dev/null
+chmod 755 "$MODDIR" "$CONFIG_DIR" "$MODDIR/web" "$MODDIR/diag" "$MODDIR/qmi" 2>/dev/null
 chmod 644 "$MODDIR/module.prop" "$MODDIR/web/index.html" 2>/dev/null
 chmod 644 "$MODDIR/diag/__init__.py" "$MODDIR/diag/protocol.py" "$MODDIR/diag/diag_client.py" 2>/dev/null
 chmod 755 "$MODDIR/customize.sh" "$MODDIR/service.sh" "$MODDIR/web/server.py" 2>/dev/null
+chmod 755 "$MODDIR/qmi/qmi_band" 2>/dev/null
 
 echo "[bandctl] Install complete."
 echo "[bandctl] After boot: open http://localhost:8080"
