@@ -4,7 +4,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.4 release asset (recommended):**
+**v1.4.1 release asset (recommended):**
+
+- Direct download: [bandctl-v1.4.1.zip](https://github.com/raz123/bandctl/releases/download/v1.4.1/bandctl-v1.4.1.zip)
+- SHA-256: `3611794b549f79fdcb9cd3fac9e244a2429a9c231c23782b1289c1f330ed4d8b`
+- Release page: [Band Controller v1.4.1 — boot auto-start fix](https://github.com/raz123/bandctl/releases/tag/v1.4.1)
+
+**v1.4 release (still live):**
 
 - Direct download: [bandctl-v1.4.zip](https://github.com/raz123/bandctl/releases/download/v1.4/bandctl-v1.4.zip)
 - SHA-256: `8bc6921fc45a30415ba91069c663d0682abd4616f95653c8ebf023c431684e11`
@@ -42,17 +48,22 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
   pkg install python
   ```
   On boot, the module waits up to 60 seconds for python3 to become available.
+  If Termux is missing, the service falls back to the portable Python runtime at `/data/local/tmp/pyroot` (v1.4.1+).
 
 ## Install
 
-1. Download [bandctl-v1.4.zip](https://github.com/raz123/bandctl/releases/download/v1.4/bandctl-v1.4.zip) to your device.
+1. Download [bandctl-v1.4.1.zip](https://github.com/raz123/bandctl/releases/download/v1.4.1/bandctl-v1.4.1.zip) to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.4.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-v1.4.1.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
+
+### What's new in v1.4.1
+
+- **Boot auto-start fix for devices without Termux python.** If Termux python3 is missing at boot, the service now falls back to the portable Python runtime at `/data/local/tmp/pyroot` (`python3.14` with its bundled `lib/` via `LD_LIBRARY_PATH`), so the web server comes up on its own after every reboot. Proven on this device: after a reboot with no manual server start, the server is running with the pyroot fallback logged in `/sdcard/modem_watch_sessions.log` and `/api/read` reports the live QMI band state.
 
 ### What's new in v1.4
 

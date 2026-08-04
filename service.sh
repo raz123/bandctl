@@ -6,6 +6,10 @@ MODDIR=${0%/*}
 WEB_DIR="$MODDIR/web"
 PORT=8080
 PYTHON="/data/data/com.termux/files/usr/bin/python3"
+# Fallback: portable Python runtime (Termux .debs unpacked to /data/local/tmp)
+# used when Termux is missing/unavailable on the device.
+PYROOT_PYTHON="/data/local/tmp/pyroot/usr/bin/python3.14"
+PYROOT_LD="/data/local/tmp/pyroot/usr/lib"
 
 # Wait for boot to complete
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
@@ -18,6 +22,12 @@ while [ ! -f "$PYTHON" ] && [ "$i" -lt 30 ]; do
   sleep 2
   i=$((i+1))
 done
+
+if [ ! -f "$PYTHON" ] && [ -f "$PYROOT_PYTHON" ]; then
+  echo "$(date) bandctl: Termux python missing, using pyroot fallback" >> /sdcard/modem_watch_sessions.log
+  PYTHON="$PYROOT_PYTHON"
+  export LD_LIBRARY_PATH="$PYROOT_LD"
+fi
 
 if [ ! -f "$PYTHON" ]; then
   echo "$(date) bandctl: Python not found, aborting" >> /sdcard/modem_watch_sessions.log
