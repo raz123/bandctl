@@ -42,6 +42,12 @@ chmod 644 "$MODDIR/diag/__init__.py" "$MODDIR/diag/protocol.py" "$MODDIR/diag/di
 chmod 755 "$MODDIR/customize.sh" "$MODDIR/service.sh" "$MODDIR/web/server.py" 2>/dev/null
 chmod 755 "$MODDIR/qmi/qmi_band" 2>/dev/null
 
+# Bundled Python runtime: the interpreter must be executable. No recursive
+# chmod over the ~21MB stdlib — zip entries carry correct 755/644 modes and
+# KernelSU preserves them; only the entry point needs re-asserting here.
+chmod 755 "$MODDIR/python" "$MODDIR/python/bin" "$MODDIR/python/bin/python3.14" 2>/dev/null
+chmod 755 "$MODDIR/python/usr/lib" 2>/dev/null
+
 echo "[bandctl] Install complete."
 echo "[bandctl] After boot: open http://localhost:8080"
 echo "=========================================="
