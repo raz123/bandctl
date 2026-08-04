@@ -4,7 +4,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.4.1 release asset (recommended):**
+**v1.5 release asset (recommended):**
+
+- Direct download: [bandctl-v1.5.zip](https://github.com/raz123/bandctl/releases/download/v1.5/bandctl-v1.5.zip)
+- SHA-256: `c941b882d4a55e5c5fc7487082d92a4203d12ca85cc1a18430ed107c41208de8`
+- Release page: [Band Controller v1.5 — QA fixes](https://github.com/raz123/bandctl/releases/tag/v1.5)
+
+**v1.4.1 release asset (still live):**
 
 - Direct download: [bandctl-v1.4.1.zip](https://github.com/raz123/bandctl/releases/download/v1.4.1/bandctl-v1.4.1.zip)
 - SHA-256: `3611794b549f79fdcb9cd3fac9e244a2429a9c231c23782b1289c1f330ed4d8b`
@@ -60,6 +66,10 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
+
+### What's new in v1.5
+
+- **QA fixes: live band counts, working export, retry, sticky tabs.** Band count chips and the Settings config summary now update immediately when you toggle bands; Export config (.json) works inside the Manager WebView (the server writes the file on-device and the UI shows its path); the Retry button retries up to 3 times before giving up; and the tab bar stays pinned below the header while scrolling.
 
 ### What's new in v1.4.1
 

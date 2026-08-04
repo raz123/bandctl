@@ -61,6 +61,13 @@ HTTP API (all responses are JSON, served from the phone's web root):
        has no samples yet, "samples" is an empty list - the sampler
        only writes a line when an LTE cell identity is present.
 
+  POST /api/export?action=export  body {"lte": [...], "nr": [...]}
+       -> {"ok": bool, "path": str, "error": ...?}
+       Writes the submitted band config to a timestamped JSON file in
+       the module config dir. WebView-compatible export: the Manager
+       WebView drops blob downloads, so the server delivers the file
+       on-device and the UI toasts the path.
+
   Anything else -> {"error": "unknown action"}
 """
 import http.server
@@ -97,6 +104,10 @@ QMI_SET_TIMEOUT = 8
 
 # Fallback config file for persistence
 CONFIG_FILE = "/data/adb/modules/bandctl/config/bands.json"
+
+# Export dir for WebView-compatible config export (the Manager WebView
+# drops blob downloads, so export writes a timestamped file on-device).
+EXPORT_DIR = "/data/adb/modules/bandctl/config"
 
 # Band-camping sampler (findings 5c): append `timestamp,earfcn,band` CSV
 # lines every BAND_CAMPING_INTERVAL seconds so a band force can be
@@ -559,6 +570,14 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode()
             self.send_json(self.write_config(json.loads(body)))
+        elif action == 'export':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode()
+            try:
+                payload = json.loads(body)
+            except (ValueError, TypeError):
+                payload = {}
+            self.send_json(self.export_config(payload))
         elif action == 'signal':
             self.send_json(self.read_signal())
         elif action == 'registration':
@@ -671,6 +690,22 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"Config save error: {e}")
+
+    def export_config(self, data):
+        """Write a submitted band config to a timestamped JSON file in the
+        config dir. WebView-compatible export: the Manager WebView drops
+        blob downloads, so the server delivers the file on-device and the
+        UI toasts the path. Returns {"ok": true, "path": ...} or
+        {"ok": false, "error": ...} - never raises."""
+        try:
+            os.makedirs(EXPORT_DIR, exist_ok=True)
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            path = os.path.join(EXPORT_DIR, "bandctl-export-{}.json".format(stamp))
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            return {"ok": True, "path": path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def read_signal(self):
         """Read current signal strength from `dumpsys telephony.registry`.

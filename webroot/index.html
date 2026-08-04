@@ -31,6 +31,10 @@
   --z-sticky: 10;
   --z-overlay: 20;
   --z-toast: 30;
+  /* Sticky app-header height: 18px pad-top + 27px wordmark (1.125rem x 1.5)
+     + 2px subline margin + 18px subline (0.75rem x 1.5) + 10px pad-bottom
+     + 1px border-bottom. The sticky tabbar sits exactly below it. */
+  --header-h: 76px;
 }
 
 /* ============ RESET & BASE ============ */
@@ -42,8 +46,7 @@ body {
   color: var(--ink);
   max-width: 640px;
   margin: 0 auto;
-  padding: 0 16px 60px;
-  font-size: 1rem;
+  padding: 0 16px calc(60px + env(safe-area-inset-bottom, 0px));
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -115,9 +118,15 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
 
 /* ============ TABS (segmented control) ============ */
 .tabbar {
+  position: sticky;
+  top: var(--header-h);
+  z-index: var(--z-sticky);
+  background: var(--bg);
+  margin: 16px 0;
+}
+.tabbar-inner {
   display: flex;
   gap: 3px;
-  margin: 16px 0;
   background: var(--surface-2);
   border-radius: var(--r-md);
   padding: 3px;
@@ -148,8 +157,8 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   outline-offset: -2px;
 }
 .tab-panel { display: none; }
-.tab-panel.active { display: block; }
-
+.tab-panel.active { display: block; animation: tabIn 150ms cubic-bezier(0.22, 1, 0.36, 1); }
+@keyframes tabIn { from { opacity: 0; } to { opacity: 1; } }
 /* ============ PANELS (cards) ============ */
 .section {
   background: var(--surface);
@@ -227,6 +236,7 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
+.band:active { transform: scale(0.95); transition: transform 100ms ease-out; }
 
 /* ============ BUTTONS ============ */
 .btn-row {
@@ -250,7 +260,8 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   min-height: 44px;
   transition: background 150ms ease-out, opacity 150ms ease-out;
 }
-.btn:hover { background: #3ab4d4; }
+.btn:hover { background: color-mix(in srgb, var(--accent) 85%, black); }
+.btn:active { transform: scale(0.98); }
 .btn:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
@@ -263,11 +274,12 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
 }
 .btn.ghost:hover { background: rgba(255,255,255,0.06); }
 
+.btn.ghost:active { background: rgba(255,255,255,0.10); }
 .btn.danger {
   background: var(--danger);
   color: var(--danger-ink);
 }
-.btn.danger:hover { background: #e04a4f; }
+.btn.danger:hover { background: color-mix(in srgb, var(--danger) 85%, black); }
 
 .btn.small {
   width: auto;
@@ -527,8 +539,7 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
 /* ============ TOAST ============ */
 #toast {
   position: fixed;
-  bottom: 20px;
-  left: 50%;
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
   transform: translate(-50%, 20px);
   background: var(--surface-2);
   border: 1px solid var(--line-strong);
@@ -575,14 +586,16 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
   <div class="subline">LTE/NR band control &middot; kernel module</div>
 </header>
 
-<div class="tabbar">
-  <button data-tab="bands" class="active">Bands</button>
-  <button data-tab="diag">Diagnostics</button>
-  <button data-tab="settings">Settings</button>
+<div class="tabbar" role="tablist">
+  <div class="tabbar-inner">
+    <button id="tab-bands" data-tab="bands" class="active" role="tab" aria-selected="true" aria-controls="panel-bands">Bands</button>
+    <button id="tab-diag" data-tab="diag" role="tab" aria-selected="false" aria-controls="panel-diag">Diagnostics</button>
+    <button id="tab-settings" data-tab="settings" role="tab" aria-selected="false" aria-controls="panel-settings">Settings</button>
+  </div>
 </div>
 
 <!-- ============ BAND MANAGEMENT ============ -->
-<div id="panel-bands" class="tab-panel active">
+<div id="panel-bands" class="tab-panel active" role="tabpanel" aria-labelledby="tab-bands">
   <div class="section">
     <div class="section-head"><h2>LTE Bands</h2><span class="count" id="lte-count"></span></div>
     <div id="lte-bands" class="band-grid"></div>
@@ -602,7 +615,7 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
 </div>
 
 <!-- ============ DIAGNOSTICS ============ -->
-<div id="panel-diag" class="tab-panel">
+<div id="panel-diag" class="tab-panel" role="tabpanel" aria-labelledby="tab-diag">
   <div class="section">
     <div class="canvas-label-row">
       <h2>Signal — RSRP over time</h2>
@@ -635,7 +648,7 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
 </div>
 
 <!-- ============ SETTINGS ============ -->
-<div id="panel-settings" class="tab-panel">
+<div id="panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings">
   <div class="section">
     <h2>Config Summary</h2>
     <div class="set-row"><span>LTE bands</span><b id="sum-lte">0</b></div>
@@ -682,6 +695,7 @@ var API_WRITE = API_BASE + '/api/write?action=write';
 var API_SIGNAL = API_BASE + '/api/signal?action=signal';
 var API_REG = API_BASE + '/api/registration?action=registration';
 var API_RESET = API_BASE + '/api/modem-reset?action=modem-reset';
+var API_EXPORT = API_BASE + '/api/export?action=export';
 
 var SIGNAL_MS = 2000;   // poll /api/signal every 2s
 var REG_MS = 2000;      // poll /api/registration every 2s
@@ -735,7 +749,11 @@ function fmtTime(ts) { return new Date(ts).toLocaleTimeString(); }
 var TABS = ['bands', 'diag', 'settings'];
 function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach(function (p) { p.classList.toggle('active', p.id === 'panel-' + name); });
-  document.querySelectorAll('.tabbar button').forEach(function (b) { b.classList.toggle('active', b.dataset.tab === name); });
+  document.querySelectorAll('.tabbar button').forEach(function (b) {
+    var isActive = b.dataset.tab === name;
+    b.classList.toggle('active', isActive);
+    b.setAttribute('aria-selected', String(isActive));
+  });
   if (name === 'diag') drawGraph();
 }
 function onHash() {
@@ -761,6 +779,7 @@ function toggleBand(n, type) {
   var sn = String(n);
   if (set.has(sn)) { set.delete(sn); } else { set.add(sn); }
   renderBands();
+  updateSummary();
 }
 function setBands(lte, nr) {
   lteEnabled = new Set((lte || []).map(String));
@@ -779,7 +798,8 @@ function applyDefaults() {
 /* ============ Band Management actions ============ */
 async function loadBands() {
   var btn = $('refresh-btn');
-  if (btn) btn.classList.add('loading');
+  var origText = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = 'Loading\u2026'; btn.classList.add('loading'); }
   try {
     var r = await fetch(API_READ);
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -791,17 +811,22 @@ async function loadBands() {
     }
     startPolling();
     showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
+    return true;
   } catch (e) {
     showStatus('Failed to load: ' + e.message, true);
     serverDown(e);
     applyDefaults();
+    return false;
   } finally {
-    if (btn) btn.classList.remove('loading');
+    if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
   }
 }
 
 async function saveBands() {
   var btn = $('save-btn');
+  if (!btn) return;
+  var origText = btn.textContent;
+  btn.textContent = 'Saving\u2026';
   btn.classList.add('loading');
   var data = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
   try {
@@ -831,6 +856,7 @@ async function saveBands() {
     serverDown(e);
   } finally {
     btn.classList.remove('loading');
+    btn.textContent = origText;
   }
 }
 
@@ -864,7 +890,27 @@ function serverDown(err) {
   logDrop('Server unreachable — ' + (err && err.message ? err.message : String(err)));
 }
 function retryConnect() {
-  loadBands();
+  var btn = $('retry-btn');
+  var origText = btn ? btn.textContent : '';
+  var attempts = 0;
+  var MAX_ATTEMPTS = 3; // initial try + 2 retries (~1.5s apart)
+  if (btn) { btn.textContent = 'Retrying\u2026'; btn.classList.add('loading'); }
+  function attempt() {
+    loadBands().then(function (ok) {
+      if (ok) {
+        if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+        return;
+      }
+      attempts += 1;
+      if (attempts < MAX_ATTEMPTS) {
+        setTimeout(attempt, 1500);
+      } else {
+        // Still unreachable — the server-down banner stays up.
+        if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+      }
+    });
+  }
+  attempt();
 }
 
 async function pollSignal() {
@@ -1048,6 +1094,9 @@ function drawGraph() {
 async function modemReset() {
   if (!confirm('Reset the modem? This may briefly drop the data connection.')) return;
   var btn = $('modem-reset-btn');
+  if (!btn) return;
+  var origText = btn.textContent;
+  btn.textContent = 'Resetting\u2026';
   btn.classList.add('loading');
   try {
     var r = await fetch(API_RESET, { method: 'POST' });
@@ -1063,6 +1112,7 @@ async function modemReset() {
     serverDown(e);
   } finally {
     btn.classList.remove('loading');
+    btn.textContent = origText;
   }
 }
 
@@ -1136,6 +1186,27 @@ function exportConfig() {
     lte: Array.from(lteEnabled),
     nr: Array.from(nrEnabled)
   };
+  if (typeof window.ksu !== 'undefined') {
+    // Manager WebView drops blob downloads — have the server write the
+    // file on-device and toast the path instead.
+    fetch(API_EXPORT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function (r) {
+      return r.json().then(function (d) { return { status: r.status, data: d }; });
+    }).then(function (res) {
+      if (res.data.ok) {
+        toast('Exported to ' + res.data.path);
+      } else {
+        toast('Export failed: ' + (res.data.error || 'HTTP ' + res.status), true);
+      }
+    }).catch(function (e) {
+      toast('Export failed: ' + e.message, true);
+      serverDown(e);
+    });
+    return;
+  }
   var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   var a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1148,6 +1219,9 @@ function exportConfig() {
 
 function onImportFile(file) {
   if (!file) return;
+  var btn = $('import-btn');
+  var origText = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = 'Importing\u2026'; btn.classList.add('loading'); }
   var reader = new FileReader();
   reader.onload = function () {
     try {
@@ -1162,8 +1236,12 @@ function onImportFile(file) {
     } catch (e) {
       toast('Import failed: ' + e.message, true);
     }
+    if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
   };
-  reader.onerror = function () { toast('Import failed: could not read file', true); };
+  reader.onerror = function () {
+    toast('Import failed: could not read file', true);
+    if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+  };
   reader.readAsText(file);
   $('import-file').value = '';
 }
@@ -1186,7 +1264,7 @@ function showStatus(msg, isErr) {
 function toast(msg, isErr) {
   var el = $('toast');
   el.textContent = msg;
-  el.className = 'toast ' + (isErr ? 'err' : 'ok') + ' show';
+  el.className = isErr ? 'err show' : 'show';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(function () { el.classList.remove('show'); }, 3500);
 }
