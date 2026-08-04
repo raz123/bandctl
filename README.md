@@ -2,19 +2,6 @@
 
 A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qualcomm devices — no third-party apps required (Network Signal Guru is not needed).
 
-## Download
-
-**v1.6 release asset (recommended):**
-
-- Direct download: [bandctl-v1.6.zip](https://github.com/raz123/bandctl/releases/download/v1.6/bandctl-v1.6.zip)
-- SHA-256: `53d9ce054b176a96b9702ccea2e2f676d224fec3acc1146a92a48ede3288c499`
-- Size: ~6.5 MB
-- Release page: [Band Controller v1.6 — bundled Python runtime, no Termux](https://github.com/raz123/bandctl/releases/tag/v1.6)
-
-**What's new in v1.6:** bundled Python runtime (no Termux needed) and boot auto-start before first unlock.
-
-Older versions: see [GitHub Releases](https://github.com/raz123/bandctl/releases).
-
 ## Requirements
 
 - **Root**: KernelSU (or KernelSU-compatible) root.
@@ -23,9 +10,9 @@ Older versions: see [GitHub Releases](https://github.com/raz123/bandctl/releases
 
 ## Install
 
-1. Download [bandctl-v1.6.zip](https://github.com/raz123/bandctl/releases/download/v1.6/bandctl-v1.6.zip) to your device.
+1. Download the latest `bandctl-*.zip` from the [Releases](https://github.com/raz123/bandctl/releases) page to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.6.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-*.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
@@ -34,7 +21,7 @@ Older versions: see [GitHub Releases](https://github.com/raz123/bandctl/releases
 
 ## Screenshots
 
-The v1.6 web UI: 13 LTE bands active, and live diagnostics (RSRP/RSRQ, registration chips, signal graph).
+The web UI: LTE band tiles with live counts, and live diagnostics (RSRP/RSRQ, registration chips, signal graph).
 
 ![Bands tab - LTE band tiles with live count](bands.png)
 
