@@ -1,6 +1,6 @@
 id=bandctl
 name=Band Controller
-version=1.5
-versionCode=7
+version=1.5.1
+versionCode=8
 author=ohmypi
 description=Standalone web UI for LTE/NR band control and modem diagnostics. Direct QMI band apply (QRTR), no third-party apps. KernelSU Manager WebUI works, redesigned UI.

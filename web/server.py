@@ -163,14 +163,20 @@ def _run_dumpsys(service="telephony.registry"):
 def _run_qmi(args, timeout):
     """Run the QMI band client; return (returncode, combined output).
 
-    Returns (None, "") when the binary is missing or the call times out -
-    callers treat that as "QMI unavailable" and fall back.
+    Returns (None, "") when the binary is missing, not executable (e.g.
+    the exec bit was lost during install), or the call times out - callers
+    treat that as "QMI unavailable" and fall back. Catching OSError keeps
+    a PermissionError from killing the single-threaded HTTP server.
     """
     try:
         proc = subprocess.run([str(QMI_BIN)] + args, capture_output=True,
                               text=True, timeout=timeout)
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except OSError:
+        # FileNotFoundError (missing binary) and PermissionError (exec bit
+        # lost during install) both land here.
+        return None, ""
+    except subprocess.TimeoutExpired:
         return None, ""
 
 

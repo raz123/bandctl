@@ -41,6 +41,12 @@ sleep 1
 # Ensure config dir exists (customize.sh may be skipped on manual installs)
 mkdir -p "$MODDIR/config"
 
+# Self-heal exec bits: KernelSU's extractor may not preserve Unix modes and
+# the metainstall pass of customize.sh can run with a mangled MODDIR, leaving
+# qmi_band without +x. MODDIR is reliable here (service.sh runs by absolute
+# path at boot), so re-assert 755 before anything executes the binaries.
+chmod 755 "$MODDIR/qmi/qmi_band" "$MODDIR/web/server.py" "$MODDIR/customize.sh" "$MODDIR/service.sh" 2>/dev/null
+
 # Start Python HTTP server
 nohup "$PYTHON" "$WEB_DIR/server.py" > /dev/null 2>&1 &
 

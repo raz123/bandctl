@@ -4,7 +4,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Download
 
-**v1.5 release asset (recommended):**
+**v1.5.1 release asset (recommended):**
+
+- Direct download: [bandctl-v1.5.1.zip](https://github.com/raz123/bandctl/releases/download/v1.5.1/bandctl-v1.5.1.zip)
+- SHA-256: `a83a62b1e8037f8a958e421e6789359ff63e7ce9849f7bd25bf495881e4d06ca`
+- Release page: [Band Controller v1.5.1 — install hardening](https://github.com/raz123/bandctl/releases/tag/v1.5.1)
+
+**v1.5 release asset (still live):**
 
 - Direct download: [bandctl-v1.5.zip](https://github.com/raz123/bandctl/releases/download/v1.5/bandctl-v1.5.zip)
 - SHA-256: `c941b882d4a55e5c5fc7487082d92a4203d12ca85cc1a18430ed107c41208de8`
@@ -66,6 +72,10 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
+
+### What's new in v1.5.1
+
+- **Install hardening.** On some KernelSU installs the QMI binary lost its exec bit (the metainstall pass runs customize.sh with a mangled MODDIR, and the extractor doesn't preserve Unix modes), which crashed the web server on first load. The service now re-asserts executable permissions at boot, and the server degrades gracefully instead of crashing if the binary still can't be executed.
 
 ### What's new in v1.5
 
