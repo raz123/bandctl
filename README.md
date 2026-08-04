@@ -79,7 +79,7 @@ Default config (`config/bands.json`):
 }
 ```
 
-Bands **6, 7, and 66 are intentionally absent/disabled** — this is a community-validated fix for Canadian carriers: enabling them causes Telus/Koodo/Rogers to drop network reports. Edit `/data/adb/modules/bandctl/config/bands.json` (or use the web UI) to customize.
+LTE bands **7 and 66 are intentionally disabled** — a community-validated fix for Canadian carriers: the SM8250 modem can crash during 66↔7 handover. Other bands (including 6, a Japan-only 850 MHz variant of band 5) are simply not part of the Rogers whitelist; the modem only scans the listed bands. Edit `/data/adb/modules/bandctl/config/bands.json` (or use the web UI) to customize.
 
 ## Development / testing
 
