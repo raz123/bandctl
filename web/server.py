@@ -10,7 +10,15 @@ HTTP API (all responses are JSON, served from the phone's web root):
        -> {"lte": ["1", ...], "nr": ["77", ...],
            "source": "qmi" | "diag" | "config_file" | "default"}
        LTE/NR band configuration. Tries QMI (QRTR) first, then diag, then
-       the fallback config file, then a default all-bands list.
+       the fallback config file, then a carrier-aware default list.
+
+  GET  /api/defaults?action=defaults
+       -> {"carrier": "rogers" | "other", "mccmnc": "302720" | null,
+           "operator": "ROGERS" | null, "lte": [...], "nr": [...]}
+       Carrier-aware default band lists. Carrier is detected from
+       `getprop gsm.operator.numeric` (Rogers and Fido share 302720);
+       "rogers" returns the community-validated curated whitelist, any
+       other carrier the unrestricted all-bands list. Never 500s.
 
   POST /api/write?action=write   body {"lte": [...], "nr": [...]}
        -> {"ok": bool, "source": ..., "error": ...?}
@@ -143,6 +151,22 @@ _NETWORK_TYPE_NAMES = {
 # AOSP-style LTE RSRP thresholds for the legacy-format level fallback.
 _LTE_RSRP_THRESHOLDS = (-140, -128, -118, -108)
 
+# Carrier-aware default bands (bandctl product plan, Approach 1): Rogers
+# (MCC/MNC 302720; Fido shares it) gets the community-validated curated
+# whitelist - bands 7 and 66 omitted per the SM8250 66<->7 handover crash
+# fix. Every other carrier gets the unrestricted all-bands defaults.
+ROGERS_MCCMNC = "302720"
+
+_ROGERS_BANDS = {
+    "lte": ["1", "2", "3", "4", "5", "8", "12", "17", "20", "28", "38", "40", "41"],
+    "nr": ["1", "3", "5", "8", "20", "28", "38", "41", "77", "78"],
+}
+
+_ALL_BANDS = {
+    "lte": ["1","2","3","4","5","7","8","12","13","14","17","20","25","26","28","29","30","38","40","41","42","43","48","66","71"],
+    "nr": ["1","2","3","5","7","8","20","25","28","38","40","41","66","71","77","78","79"],
+}
+
 
 def _run_cmd(args, timeout=5):
     """Run a command and return combined stdout+stderr.
@@ -158,6 +182,34 @@ def _run_cmd(args, timeout=5):
 def _run_dumpsys(service="telephony.registry"):
     """Run `dumpsys <service>` with a short timeout, returning stdout."""
     return _run_cmd(["/system/bin/dumpsys", service], timeout=5)
+
+
+def _get_prop(name):
+    """Read an Android system property via `getprop`; "" on failure."""
+    try:
+        return _run_cmd(["/system/bin/getprop", name], timeout=5).strip()
+    except Exception:
+        return ""
+
+
+def carrier_for_mccmnc(mccmnc):
+    """"rogers" when any SIM slot's operator numeric is Rogers/Fido
+    (302720), else "other" (including empty/missing values).
+
+    `gsm.operator.numeric` is comma-joined per SIM slot (e.g. "302720,"
+    or "302720,302220"), so normalize by splitting on ","."""
+    if not mccmnc:
+        return "other"
+    slots = [s.strip() for s in str(mccmnc).split(",")]
+    return "rogers" if ROGERS_MCCMNC in slots else "other"
+
+
+def defaults_for_carrier(carrier):
+    """Default {"lte": [...], "nr": [...]} for a carrier: the curated
+    Rogers whitelist, or unrestricted all-bands for anything else.
+    Returns fresh copies so callers can stamp extra keys."""
+    src = _ROGERS_BANDS if carrier == "rogers" else _ALL_BANDS
+    return {"lte": list(src["lte"]), "nr": list(src["nr"])}
 
 
 def _run_qmi(args, timeout):
@@ -572,6 +624,8 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
 
         if action == 'read':
             self.send_json(self.read_config())
+        elif action == 'defaults':
+            self.send_json(self.read_defaults())
         elif action == 'write':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode()
@@ -604,6 +658,30 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json(self.read_band_camping(limit))
         else:
             self.send_json({"error": "unknown action"})
+
+    def read_defaults(self):
+        """Carrier-aware default band lists (GET /api/defaults).
+
+        Carrier is detected from `getprop gsm.operator.numeric` (Rogers
+        and Fido share 302720); the operator name comes from
+        `getprop gsm.operator.alpha`. Never raises: on any failure the
+        response degrades to carrier "other" with unrestricted defaults.
+        """
+        try:
+            mccmnc = (_get_prop("gsm.operator.numeric") or "").strip(" ,") or None
+            carrier = carrier_for_mccmnc(mccmnc)
+            operator = (_get_prop("gsm.operator.alpha") or "").strip(" ,") or None
+        except Exception as e:
+            print(f"Carrier detection failed: {e}")
+            mccmnc, carrier, operator = None, "other", None
+        defaults = defaults_for_carrier(carrier)
+        return {
+            "carrier": carrier,
+            "mccmnc": mccmnc or None,
+            "operator": operator,
+            "lte": defaults["lte"],
+            "nr": defaults["nr"],
+        }
 
     def read_config(self):
         """Read band configuration: QMI (QRTR) first, then diag, then the
@@ -644,12 +722,13 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             print(f"Config file read error: {e}")
 
-        # Default: all bands enabled
-        return {
-            "lte": ["1","2","3","4","5","7","8","12","13","14","17","20","25","26","28","29","30","38","40","41","42","43","48","66","71"],
-            "nr": ["1","2","3","5","7","8","20","25","28","38","40","41","66","71","77","78","79"],
-            "source": "default"
-        }
+        # Default: carrier-aware. Rogers devices (MCC/MNC 302720) fall
+        # back to the curated whitelist; all other carriers get the
+        # unrestricted all-bands defaults.
+        defaults = defaults_for_carrier(
+            carrier_for_mccmnc(_get_prop("gsm.operator.numeric")))
+        defaults["source"] = "default"
+        return defaults
 
     def write_config(self, data):
         """Write band configuration to the modem: QMI (QRTR) first, then
@@ -890,7 +969,11 @@ if __name__ == '__main__':
     # server; never blocks shutdown.
     threading.Thread(target=_band_camping_loop, daemon=True).start()
 
-    server = http.server.HTTPServer(('0.0.0.0', PORT), BandHandler)
+    # Threaded: the 2s signal/registration polling (each dumpsys call takes
+    # seconds on this device) must not starve other requests — a single-
+    # threaded server stalls /api/defaults, /api/read, and button actions
+    # behind an endless polling queue.
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), BandHandler)
     print(f"Band Controller server running on http://localhost:{PORT}")
     print(f"QMI binary: {QMI_BIN}")
     print(f"Diag device: {DIAG_DEVICE or 'disabled'}")

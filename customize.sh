@@ -1,22 +1,27 @@
 #!/system/bin/sh
-# Band Controller v1.0 — KernelSU install-time hook.
-# Creates the config dir with a default bands.json, fixes file permissions,
-# and prints an install banner (KernelSU shows this in the install log).
+# Band Controller v1.9 — KernelSU install-time hook.
+# Creates the config dir with a carrier-aware default bands.json, fixes
+# file permissions, and prints an install banner (KernelSU shows this in
+# the install log).
 
 MODDIR=${MODDIR:-${0%/*}}
 CONFIG_DIR="$MODDIR/config"
 CONFIG_FILE="$CONFIG_DIR/bands.json"
 
-# Default Rogers band config. Community-validated for Canadian carriers:
-# LTE bands 6, 7 and 66 (and NR 66) are intentionally DISABLED — they are
-# simply omitted from the enabled lists below.
-DEFAULT_BANDS='{
+# Carrier-aware default band config. Bands 7 and 66 are omitted from the
+# Rogers default (SM8250 66<->7 handover crash fix, community-validated);
+# the curated list applies to Rogers (MCC/MNC 302720) only. Any other
+# carrier gets no seeded file: the server's carrier-aware unrestricted
+# all-bands defaults apply, and bands.json is created on first Save &
+# Apply via the server's mirror logic.
+ROGERS_MCCMNC="302720"
+ROGERS_BANDS='{
   "lte": ["1", "2", "3", "4", "5", "8", "12", "17", "20", "28", "38", "40", "41"],
   "nr": ["1", "3", "5", "8", "20", "28", "38", "41", "77", "78"]
 }'
 
 echo "=========================================="
-echo "  Band Controller v1.0"
+echo "  Band Controller v1.9"
 echo "  Standalone LTE/NR band control + modem"
 echo "  diagnostics web UI (no NSG required)"
 echo "=========================================="
@@ -27,10 +32,22 @@ mkdir -p "$CONFIG_DIR" || {
   exit 1
 }
 
-# Seed default band config only if none exists (respect user overrides)
+# Seed a Rogers default band config only if none exists (respect user
+# overrides). Other carriers get no file: the server's carrier-aware
+# all-bands fallback applies until the first Save & Apply mirrors one.
 if [ ! -f "$CONFIG_FILE" ]; then
-  echo "$DEFAULT_BANDS" > "$CONFIG_FILE"
-  echo "[bandctl] Wrote default band config: $CONFIG_FILE"
+  # gsm.operator.numeric is comma-joined per SIM slot ("302720," or
+  # "302720,302220") — match the Rogers token, not the whole string.
+  MCCMNC=$(getprop gsm.operator.numeric)
+  case ",${MCCMNC}," in
+    *,302720,*)
+      echo "$ROGERS_BANDS" > "$CONFIG_FILE"
+      echo "[bandctl] Wrote Rogers default band config: $CONFIG_FILE"
+      ;;
+    *)
+      echo "[bandctl] Non-Rogers carrier: no default seeded (server all-bands fallback applies)"
+      ;;
+  esac
 else
   echo "[bandctl] Existing config found, keeping: $CONFIG_FILE"
 fi
