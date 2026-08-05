@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Band Controller v1.9 — KernelSU install-time hook.
+# Band Controller v2.0 — KernelSU install-time hook.
 # Creates the config dir with a carrier-aware default bands.json, fixes
 # file permissions, and prints an install banner (KernelSU shows this in
 # the install log).
@@ -21,7 +21,7 @@ ROGERS_BANDS='{
 }'
 
 echo "=========================================="
-echo "  Band Controller v1.9"
+echo "  Band Controller v2.0"
 echo "  Standalone LTE/NR band control + modem"
 echo "  diagnostics web UI (no NSG required)"
 echo "=========================================="
