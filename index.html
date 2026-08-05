@@ -480,6 +480,30 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
+.lan-token-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.lan-token-display {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#lan-token-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  color: var(--ink);
+  padding: 8px 10px;
+  font-size: 0.875rem;
+}
+#lan-token-input:focus { border-color: var(--focus); }
 
 .preset-item {
   display: flex;
@@ -675,6 +699,32 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
     </div>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
   </div>
+  <div class="section">
+    <h2>Network access</h2>
+    <div class="set-row">
+      <span>Allow access from other devices on your network (LAN)</span>
+      <label class="switch">
+        <input type="checkbox" id="lan-toggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div id="lan-token-section" style="display:none">
+      <div class="set-row">
+        <span>Access token</span>
+        <span class="lan-token-wrap"><b id="lan-token" class="lan-token-display"></b><button class="btn small ghost" id="lan-token-show" style="display:none">Show</button></span>
+      </div>
+      <div class="set-row" id="lan-token-entry" style="display:none">
+        <input type="text" id="lan-token-input" placeholder="Paste the access token" autocomplete="off" spellcheck="false">
+        <button class="btn small" id="lan-token-save">Save token</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn ghost" id="lan-regenerate">Regenerate token</button>
+        <button class="btn ghost" id="lan-restart">Restart server</button>
+      </div>
+      <div class="hint">Restarting the server is needed for the change to take effect.</div>
+      <div class="hint">LAN mode protects the API with the token above; the phone itself never needs it.</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -695,6 +745,9 @@ var API_RESET = API_BASE + '/api/modem-reset?action=modem-reset';
 var API_EXPORT = API_BASE + '/api/export?action=export';
 var API_DEFAULTS = API_BASE + '/api/defaults?action=defaults';
 var API_CAMPING = API_BASE + '/api/band-camping?action=band-camping';
+var API_SETTINGS = API_BASE + '/api/settings?action=settings';
+var API_RESTART = API_BASE + '/api/restart?action=restart';
+var API_HEALTH = API_BASE + '/api/health?action=health';
 
 var SIGNAL_MS = 2000;   // poll /api/signal every 2s
 var REG_MS = 2000;      // poll /api/registration every 2s
@@ -704,6 +757,7 @@ var GRAPH_WINDOW_MS = 240 * 1000;
 var HISTORY_MAX = 200;
 
 var PRESETS_KEY = 'bandController.presets.v1';
+var TOKEN_KEY = 'bandController.token.v1';
 
 /* ============ Band catalogs (existing visual language) ============ */
 var LTE_BANDS = [
@@ -805,7 +859,7 @@ async function loadBands() {
   var origText = btn ? btn.textContent : '';
   if (btn) { btn.textContent = 'Loading\u2026'; btn.classList.add('loading'); }
   try {
-    var r = await fetch(API_READ);
+    var r = await apiFetch(API_READ);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     applyConfig(d.lte, d.nr, d.source);
@@ -834,7 +888,7 @@ async function saveBands() {
   btn.classList.add('loading');
   var data = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
   try {
-    var r = await fetch(API_WRITE, {
+    var r = await apiFetch(API_WRITE, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -846,7 +900,7 @@ async function saveBands() {
       showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
       // Confirm applied state by polling /api/read once
       try {
-        var r2 = await fetch(API_READ);
+        var r2 = await apiFetch(API_READ);
         if (r2.ok) {
           var d2 = await r2.json();
           applyConfig(d2.lte, d2.nr, d2.source);
@@ -925,7 +979,7 @@ function retryConnect() {
 
 async function pollSignal() {
   try {
-    var r = await fetch(API_SIGNAL);
+    var r = await apiFetch(API_SIGNAL);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     var now = Date.now();
@@ -944,7 +998,7 @@ async function pollSignal() {
 
 async function pollRegistration() {
   try {
-    var r = await fetch(API_REG);
+    var r = await apiFetch(API_REG);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     updateChips(d);
@@ -971,7 +1025,7 @@ function updateChips(d) {
 }
 async function updateCamping() {
   try {
-    var r = await fetch(API_CAMPING);
+    var r = await apiFetch(API_CAMPING);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     var s = (d && d.samples && d.samples.length) ? d.samples[d.samples.length - 1] : null;
@@ -1124,7 +1178,7 @@ async function modemReset() {
   btn.textContent = 'Resetting\u2026';
   btn.classList.add('loading');
   try {
-    var r = await fetch(API_RESET, { method: 'POST' });
+    var r = await apiFetch(API_RESET, { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     if (d.ok) {
@@ -1207,7 +1261,7 @@ function exportConfig() {
   if (typeof window.ksu !== 'undefined') {
     // Manager WebView drops blob downloads — have the server write the
     // file on-device and toast the path instead.
-    fetch(API_EXPORT, {
+    apiFetch(API_EXPORT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -1265,6 +1319,152 @@ function onImportFile(file) {
   $('import-file').value = '';
 }
 
+/* ============ Settings: network access (LAN) ============ */
+function getStoredToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || null; }
+  catch (e) { return null; }
+}
+function setStoredToken(t) {
+  if (!t) return;
+  try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* ignore */ }
+}
+// Routes every API call through the bearer token when one is stored, and
+// surfaces 401s as a re-auth prompt instead of a generic failure.
+function apiFetch(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  var token = getStoredToken();
+  if (token) opts.headers.Authorization = 'Bearer ' + token;
+  return fetch(path, opts).then(function (r) {
+    if (r.status === 401) showReAuth();
+    return r;
+  });
+}
+
+var lanEnabled = false;   // server-side LAN setting, refreshed from /api/settings
+var lanTokenShown = false; // whether the stored token is unmasked in the UI
+
+function renderSettings(d) {
+  lanEnabled = !!d.lan_enabled;
+  $('lan-toggle').checked = lanEnabled;
+  var sec = $('lan-token-section');
+  sec.style.display = lanEnabled ? 'block' : 'none';
+  if (!lanEnabled) return;
+  var token = getStoredToken();
+  if (token) {
+    $('lan-token-entry').style.display = 'none';
+    renderTokenDisplay(token);
+  } else {
+    $('lan-token-show').style.display = 'none';
+    $('lan-token').textContent = '';
+    $('lan-token-entry').style.display = 'flex';
+  }
+}
+function renderTokenDisplay(token) {
+  $('lan-token').textContent = lanTokenShown ? token : token.slice(0, 6) + '\u2026';
+  $('lan-token-show').textContent = lanTokenShown ? 'Hide' : 'Show';
+  $('lan-token-show').style.display = 'inline-block';
+}
+function toggleTokenShown() {
+  lanTokenShown = !lanTokenShown;
+  var token = getStoredToken();
+  if (token) renderTokenDisplay(token);
+}
+function showReAuth() {
+  var entry = $('lan-token-entry');
+  var wasVisible = entry && entry.style.display !== 'none';
+  var sec = $('lan-token-section');
+  if (sec) sec.style.display = 'block';
+  if (entry) entry.style.display = 'flex';
+  var show = $('lan-token-show');
+  if (show) show.style.display = 'none';
+  var tok = $('lan-token');
+  if (tok) tok.textContent = '';
+  if (!wasVisible) toast('Token required — enter it below', true);
+}
+function saveLanToken() {
+  var val = $('lan-token-input').value.trim();
+  if (!val) { toast('Paste the access token first', true); return; }
+  setStoredToken(val);
+  $('lan-token-input').value = '';
+  lanTokenShown = false;
+  renderTokenDisplay(val);
+  // The page may have stopped polling on the pre-token 401s — resume now.
+  if (serverDownReported) {
+    serverDownReported = false;
+    hideBanner();
+  }
+  startPolling();
+  toast('Token saved');
+}
+// Best-effort: never blocks init; on failure leave the panel at its last state.
+function fetchSettings() {
+  apiFetch(API_SETTINGS).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (d) {
+    renderSettings(d);
+  }).catch(function () {
+    // 401s are already surfaced by apiFetch (showReAuth); network errors
+    // leave the panel untouched.
+  });
+}
+async function toggleLan() {
+  var checked = $('lan-toggle').checked;
+  try {
+    var r = await apiFetch(API_SETTINGS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lan_enabled: checked, regenerate: false })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (d.token) setStoredToken(d.token);
+    renderSettings(d);
+    toast('Network access changed — restart the server to apply');
+  } catch (e) {
+    toast('Failed to change network access: ' + e.message, true);
+  }
+}
+async function regenerateToken() {
+  try {
+    var r = await apiFetch(API_SETTINGS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lan_enabled: true, regenerate: true })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (d.token) setStoredToken(d.token);
+    renderSettings(d);
+    toast('New token generated');
+  } catch (e) {
+    toast('Failed to regenerate token: ' + e.message, true);
+  }
+}
+function sleep(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
+async function waitForHealth() {
+  var deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    try {
+      var r = await apiFetch(API_HEALTH);
+      if (r.ok) return true;
+    } catch (e) { /* server bouncing — retry */ }
+    await sleep(2000);
+  }
+  return false;
+}
+async function restartServer() {
+  try {
+    var r = await apiFetch(API_RESTART, { method: 'POST' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  } catch (e) {
+    // The server may already be tearing down — the health poll below decides.
+  }
+  var ok = await waitForHealth();
+  toast(ok ? 'Server restarted' : 'Server restarted — health check timed out', !ok);
+}
+
 /* ============ Summary ============ */
 function updateSummary() {
   $('sum-lte').textContent = lteEnabled.size;
@@ -1288,7 +1488,7 @@ function updateCarrierRow() {
 /* ============ Carrier-aware defaults ============ */
 // Best-effort: never blocks/blocks init; on failure keep the DEFAULT_* fallback.
 function fetchDefaults() {
-  fetch(API_DEFAULTS).then(function (r) {
+  apiFetch(API_DEFAULTS).then(function (r) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).then(function (d) {
@@ -1348,6 +1548,11 @@ function init() {
   $('export-btn').addEventListener('click', exportConfig);
   $('import-btn').addEventListener('click', function () { $('import-file').click(); });
   $('import-file').addEventListener('change', function () { onImportFile($('import-file').files[0]); });
+  $('lan-toggle').addEventListener('change', toggleLan);
+  $('lan-regenerate').addEventListener('click', regenerateToken);
+  $('lan-restart').addEventListener('click', restartServer);
+  $('lan-token-save').addEventListener('click', saveLanToken);
+  $('lan-token-show').addEventListener('click', toggleTokenShown);
   window.addEventListener('hashchange', onHash);
   window.addEventListener('resize', drawGraph);
 
@@ -1357,6 +1562,7 @@ function init() {
   loadBands();
   startPolling();
   fetchDefaults(); // parallel, best-effort; populates defaultsLte/NR + carrier row
+  fetchSettings(); // parallel, best-effort; populates LAN toggle + token state
 }
 
 init();

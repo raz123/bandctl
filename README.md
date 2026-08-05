@@ -2,94 +2,68 @@
 
 A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qualcomm devices — no third-party apps required (Network Signal Guru is not needed).
 
-## Download
-
-**v1.4.1 release asset (recommended):**
-
-- Direct download: [bandctl-v1.4.1.zip](https://github.com/raz123/bandctl/releases/download/v1.4.1/bandctl-v1.4.1.zip)
-- SHA-256: `3611794b549f79fdcb9cd3fac9e244a2429a9c231c23782b1289c1f330ed4d8b`
-- Release page: [Band Controller v1.4.1 — boot auto-start fix](https://github.com/raz123/bandctl/releases/tag/v1.4.1)
-
-**v1.4 release (still live):**
-
-- Direct download: [bandctl-v1.4.zip](https://github.com/raz123/bandctl/releases/download/v1.4/bandctl-v1.4.zip)
-- SHA-256: `8bc6921fc45a30415ba91069c663d0682abd4616f95653c8ebf023c431684e11`
-- Release page: [Band Controller v1.4 — real band apply via QMI](https://github.com/raz123/bandctl/releases/tag/v1.4)
-
-**v1.3 release (still live):**
-
-- Direct download: [bandctl-v1.3.zip](https://github.com/raz123/bandctl/releases/download/v1.3/bandctl-v1.3.zip)
-- SHA-256: `d236052c03bf657415445574c9a80d65f03369a861dce7bae0def041959a2e4a`
-- Release page: [Band Controller v1.3 — UI redesign](https://github.com/raz123/bandctl/releases/tag/v1.3)
-
-**v1.2 release (still live):**
-
-- Direct download: [bandctl-v1.2.zip](https://github.com/raz123/bandctl/releases/download/v1.2/bandctl-v1.2.zip)
-- SHA-256: `8e581b995cbdf605aad66e373323a5c0ff699ce69e111bcbfa1579e30a43ce29`
-- Release page: [Band Controller v1.2 — Manager WebUI fix](https://github.com/raz123/bandctl/releases/tag/v1.2)
-
-**v1.1 release (still live):**
-
-- Direct download: [bandctl-v1.1.zip](https://github.com/raz123/bandctl/releases/download/v1.1/bandctl-v1.1.zip)
-- SHA-256: `87269da4b1ff1a9cc5cd57f583156e269042e8234233e6becb96b69749fcc8a9`
-- Release page: [Band Controller v1.1 — Manager WebUI](https://github.com/raz123/bandctl/releases/tag/v1.1)
-
-**v1.0 release (still live):**
-
-- Direct download: [bandctl-v1.0.zip](https://github.com/raz123/bandctl/releases/download/v1.0/bandctl-v1.0.zip)
-- SHA-256: `6ce0d9dc5cbe8084f133aef547e29b90851edb0c43a04b35f43f3a7164d7862b`
-
 ## Requirements
 
 - **Root**: KernelSU (or KernelSU-compatible) root.
 - **Device**: A Qualcomm modem device (tested on Poco F3 / alioth).
-- **Termux python3**: installed at `/data/data/com.termux/files/usr/bin/python3` — this is the web server engine. Install with:
-  ```
-  pkg install python
-  ```
-  On boot, the module waits up to 60 seconds for python3 to become available.
-  If Termux is missing, the service falls back to the portable Python runtime at `/data/local/tmp/pyroot` (v1.4.1+).
+- **No dependencies** — the module ships a bundled Python runtime; Termux is not required.
 
 ## Install
 
-1. Download [bandctl-v1.4.1.zip](https://github.com/raz123/bandctl/releases/download/v1.4.1/bandctl-v1.4.1.zip) to your device.
+1. Download the latest `bandctl-*.zip` from the [Releases](https://github.com/raz123/bandctl/releases) page to your device.
 2. Open the **KernelSU app** → **Modules** → **Install from storage** and pick the zip.
-   - Alternatively, from a root shell: `ksud module install bandctl-v1.4.1.zip`
+   - Alternatively, from a root shell: `ksud module install bandctl-*.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
    - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
 
-### What's new in v1.4.1
+## Screenshots
 
-- **Boot auto-start fix for devices without Termux python.** If Termux python3 is missing at boot, the service now falls back to the portable Python runtime at `/data/local/tmp/pyroot` (`python3.14` with its bundled `lib/` via `LD_LIBRARY_PATH`), so the web server comes up on its own after every reboot. Proven on this device: after a reboot with no manual server start, the server is running with the pyroot fallback logged in `/sdcard/modem_watch_sessions.log` and `/api/read` reports the live QMI band state.
+<p align="center">
+  <img src="bands.png" alt="Bands tab" width="180" />
+  <br />
+  <em>Bands tab — LTE/NR band tiles with live active counts</em>
+</p>
 
-### What's new in v1.4
+<p align="center">
+  <img src="diag.png" alt="Diagnostics tab" width="180" />
+  <br />
+  <em>Diagnostics tab — live signal graph, RSRP/RSRQ, registration chips</em>
+</p>
 
-- **Real band apply via QRTR QMI.** Save & Apply now talks to the modem over Qualcomm's QRTR transport with a bundled static `qmi_band` client — no more NACKed diag writes. Proven on this device: forcing bands moved camping from band 4 (EARFCN 2050) to band 12 (EARFCN 5060) in ~40s and back. `/api/read` reports the live modem state with `source: "qmi"`; diag remains the fallback transport where it works, and the config file still persists intent.
-
-### What's new in v1.2
-
-- **Manager WebUI now works.** v1.1's WebView pages resolved the API base relative to the Manager's `https://mui.kernelsu.org` origin, so API calls were intercepted by the WebViewAssetLoader and 404'd. The API base is now unconditional (`http://127.0.0.1:8080`), which is correct whether the page is served by the Manager or by the python server itself. Desktop use at http://localhost:8080 is unchanged.
+<p align="center">
+  <img src="settings.png" alt="Settings tab" width="180" />
+  <br />
+  <em>Settings tab — config summary, presets, export/import, network access</em>
+</p>
 
 ## Features
 
-- **7 API endpoints**:
+- **12 API endpoints**:
   - `GET  /api/read` — current LTE/NR band configuration (from QMI, diag, config file, or default)
   - `POST /api/write` — write LTE/NR band configuration to the modem (QMI first, diag fallback)
+  - `GET  /api/defaults` — carrier-aware defaults (Rogers 302720 curated, others unrestricted)
+  - `POST /api/boot-apply` — re-apply the persisted config at boot (config-file gated)
+  - `GET  /api/settings` — network-access settings (LAN mode, token required?)
+  - `POST /api/settings` — enable/disable LAN mode, (re)generate the access token
+  - `POST /api/restart` — restart the server (needed after changing network access)
   - `GET  /api/signal` — current signal strength (RSRP/RSRQ/level) from `dumpsys telephony.registry`
   - `GET  /api/registration` — service/data state, network type, operator, roaming
   - `GET  /api/health` — transport status (QMI or diag, band counts, diag session owner)
   - `POST /api/modem-reset` — soft modem reset (`cmd phone radio power` off/on, with fallback)
   - `GET  /api/band-camping` — live band-camping log: last N serving-cell EARFCN/band samples
-- **Live band-camping readout** — the module records serving-cell EARFCN/band samples, and the Diagnostics tab shows the current camped band live, so you can see whether a forced band actually stuck.
+- **Live band-camping readout** — the Diagnostics tab shows the current camped band (band + EARFCN) live, so you can see whether a forced band actually stuck.
+- **Boot-time band re-apply** — the persisted config is re-applied automatically at every boot (pre-unlock, no app needed); config-file absent = no-op.
+- **Carrier-aware defaults** — Rogers (302720) gets a curated whitelist; other carriers get unrestricted defaults until you lock bands.
 - **RSRP graph UI** — the web UI plots signal strength over time.
 - **Config persistence** — band settings are mirrored to `/data/adb/modules/bandctl/config/bands.json` and survive reboots.
 - **KernelSU Manager WebUI** — after install, open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl`); the UI also still works at http://localhost:8080.
 
 ## How it works
 
+- **Bundled Python runtime** — the web server runs on the Python interpreter shipped inside the module (`python/bin/python3.14` with its stdlib and shared libraries under `python/`), so no Termux install is needed and the service starts before first unlock.
 - **Direct QMI band apply over QRTR** via the bundled static `qmi_band` client (source in `qmi/`). It discovers the live NAS endpoint at runtime (service/node/port are probed, not hardcoded), reads the current band configuration, and applies LTE/NR band preference changes — the modem camps per the applied list.
 - **`/dev/diag` fallback** via the bundled pure-Python protocol stack (the diag kernel driver, feature masks, and NV/band-mask commands) for devices where diag works.
 - **Telephony-framework monitoring** via `dumpsys telephony.registry` — signal strength, registration state, and band camping are reported regardless of transport.
@@ -101,9 +75,13 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 Where the QRTR QMI service is unavailable, the module falls back to `/dev/diag` — on kernels where the diag feature-mask handshake never completes, band **writes** may be NACKed. In every case band intent is mirrored to the config file and monitoring keeps working.
 
+## Network access
+
+By default the server listens on **127.0.0.1 only** — reachable from the phone itself (Manager WebUI, device browser, `adb forward`), never from the network. To control the module from a computer on the same Wi-Fi, enable **Network access → Allow access from other devices** in the Settings tab: the server then binds all interfaces and **every API call from a non-loopback client requires the access token** shown in the UI (regenerate it anytime). The phone itself never needs the token. This is plain HTTP on your LAN — fine for home use, but treat the token like a password.
+
 ## Band configuration
 
-Default config (`config/bands.json`):
+Default config on Rogers (MCC/MNC 302720), seeded at install (`config/bands.json`):
 
 ```json
 {
@@ -112,13 +90,13 @@ Default config (`config/bands.json`):
 }
 ```
 
-Bands **6, 7, and 66 are intentionally absent/disabled** — this is a community-validated fix for Canadian carriers: enabling them causes Telus/Koodo/Rogers to drop network reports. Edit `/data/adb/modules/bandctl/config/bands.json` (or use the web UI) to customize.
+LTE bands **7 and 66 are intentionally disabled** — a community-validated fix for Canadian carriers: the SM8250 modem can crash during 66↔7 handover. Other bands (including 6, a Japan-only 850 MHz variant of band 5) are simply not part of the Rogers whitelist; the modem only scans the listed bands. Defaults are carrier-aware: on any other carrier no config file is seeded and defaults are unrestricted (all bands) until you lock bands from the UI or a preset. Edit `/data/adb/modules/bandctl/config/bands.json` (or use the web UI) to customize.
 
 ## Development / testing
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
 - Protocol tests: **27/27 passing**.
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), and `config/bands.json` (default band config).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), and `config/bands.json` (default band config).
 
 ## License
 
