@@ -25,6 +25,14 @@ HTTP API (all responses are JSON, served from the phone's web root):
        Writes the band configuration to the modem via QMI (QRTR) first,
        falling back to diag, and mirrors it to the fallback config file.
 
+  POST /api/boot-apply?action=boot-apply  (no body)
+       -> {"ok": true, "skipped": true} | {"ok": true,
+           "source": "qmi" | "diag", "lte": [...], "nr": [...]}
+           | {"ok": false, "error": ...}
+       Re-applies the persisted config file (config/bands.json) through
+       the same QMI->diag chain. Missing/unreadable config or empty
+       lte+nr is a skip; the config file is never rewritten. Never 500s.
+
   GET  /api/signal?action=signal
        -> {"rsrp_dbm": int|null, "rsrq_db": int|null, "level": int|null,
            "tech": "LTE" | "NR" | ..., "timestamp": epoch_ms}
@@ -630,6 +638,8 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode()
             self.send_json(self.write_config(json.loads(body)))
+        elif action == 'boot-apply':
+            self.send_json(self.boot_apply())
         elif action == 'export':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode()
@@ -739,22 +749,81 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         except (TypeError, ValueError) as e:
             return {"ok": False, "error": f"invalid band list: {e}"}
 
+        ok, source, error = self._apply_bands(lte_bands, nr_bands)
+        # Mirror intent regardless of outcome (matches historical
+        # behavior: the file is saved on success AND on failure).
+        self._save_config_file(data)
+        if ok:
+            return {"ok": True, "source": source}
+        return {"ok": False, "error": error}
+
+    def _apply_bands(self, lte_bands, nr_bands):
+        """Apply bands to the modem: QMI (QRTR) first, then diag.
+
+        Returns (ok, source, error) with error None on success. QMI
+        success means the client printed `result: status=0`; diag success
+        means write_bands() returned True. Never raises: QMI failure
+        falls through to diag, and any diag exception is reported as
+        (False, "diag", str(e)).
+        """
         # QMI write first (real band apply via QRTR)
         if self._write_qmi_config(lte_bands, nr_bands):
-            self._save_config_file(data)
-            return {"ok": True, "source": "qmi"}
+            return True, "qmi", None
 
         # Fallback: diag write
         try:
-            success = write_bands(lte_bands, nr_bands, DIAG_DEVICE)
-            if success:
-                self._save_config_file(data)
-                return {"ok": True, "source": "diag"}
-            self._save_config_file(data)
-            return {"ok": False, "error": "diag write failed"}
+            if write_bands(lte_bands, nr_bands, DIAG_DEVICE):
+                return True, "diag", None
+            return False, "diag", "diag write failed"
         except Exception as e:
-            self._save_config_file(data)
+            return False, "diag", str(e)
+
+    def boot_apply(self):
+        """Re-apply the persisted band config (config/bands.json) at boot.
+
+        Reads the config file written by /api/write and runs it through
+        the same QMI->diag apply chain. The config file is the source of
+        truth here - it is NEVER rewritten. Missing or unreadable config
+        and empty lte+nr are skips ({"ok": true, "skipped": true});
+        malformed JSON or an apply failure returns ok:false with a short
+        error. Never raises - any exception becomes {"ok": false,
+        "error": ...}.
+        """
+        try:
+            if not os.path.exists(CONFIG_FILE):
+                return {"ok": True, "skipped": True}
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+        except (OSError, IOError):
+            # Missing/unreadable config file -> nothing to re-apply.
+            return {"ok": True, "skipped": True}
+        except Exception:
+            # File exists but is not valid JSON -> report it.
+            return {"ok": False, "error": "invalid config"}
+
+        try:
+            lte_bands = [int(b) for b in data.get('lte', [])]
+            nr_bands = [int(b) for b in data.get('nr', [])]
+        except (TypeError, ValueError, AttributeError):
+            return {"ok": False, "error": "invalid config"}
+
+        if not lte_bands and not nr_bands:
+            return {"ok": True, "skipped": True}
+
+        try:
+            ok, source, error = self._apply_bands(lte_bands, nr_bands)
+        except Exception as e:
             return {"ok": False, "error": str(e)}
+        if not ok:
+            return {"ok": False, "error": error or "band apply failed"}
+        # Bands as reported to the modem (ints normalized to strings,
+        # same shape as the rest of the API).
+        return {
+            "ok": True,
+            "source": source,
+            "lte": [str(b) for b in lte_bands],
+            "nr": [str(b) for b in nr_bands],
+        }
 
     def _write_qmi_config(self, lte_bands, nr_bands):
         """Apply bands via the QMI client. True on QMI status 0 - the client

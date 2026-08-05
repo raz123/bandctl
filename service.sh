@@ -1,6 +1,8 @@
 #!/system/bin/sh
 # Band Controller — web UI for LTE/NR band locking
 # Starts Python HTTP server on localhost:8080 after boot
+# Re-applies the persisted band preference at boot: waits for the server +
+# radio, then POSTs /api/boot-apply (best-effort — the UI can apply later)
 
 MODDIR=${0%/*}
 WEB_DIR="$MODDIR/web"
@@ -58,4 +60,56 @@ chmod 755 "$MODDIR/qmi/qmi_band" "$MODDIR/web/server.py" "$MODDIR/customize.sh" 
 # Start Python HTTP server
 nohup "$PYTHON" "$WEB_DIR/server.py" > /dev/null 2>&1 &
 
+# Boot-time band re-apply: wait for the server + radio, then apply the
+# persisted band preference so it survives reboots. Best-effort — any failure
+# is logged and skipped; the UI can still apply the config later. The log
+# lives in the module dir (DE-accessible at boot) rather than /sdcard, which
+# is not reliably writable before the user unlocks.
+LOG="$MODDIR/config/bandctl.log"
+
+# Bounded wait for the HTTP server to answer /api/health (~60s max).
+wait_server() {
+  command -v curl >/dev/null 2>&1 || return 1
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health?action=health"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+  return 1
+}
+
+# Bounded wait for the radio to leave POWER_OFF (~180s max, 3s between polls).
+# IN_SERVICE and OUT_OF_SERVICE both count as ready — the preference is
+# applied even when out of coverage.
+wait_radio() {
+  command -v curl >/dev/null 2>&1 || return 1
+  i=0
+  while [ "$i" -lt 60 ]; do
+    resp=$(curl -s "http://127.0.0.1:$PORT/api/registration?action=registration")
+    case "$resp" in
+      *'"service_state": "POWER_OFF"'*) ;;
+      *) return 0 ;;
+    esac
+    i=$((i + 1))
+    sleep 3
+  done
+  return 1
+}
+
+if wait_server; then
+  if wait_radio; then
+    resp=$(curl -s -X POST "http://127.0.0.1:$PORT/api/boot-apply?action=boot-apply")
+    echo "$(date) bandctl: boot-apply -> $resp" >> "$LOG"
+  else
+    echo "$(date) bandctl: boot-apply skipped (radio not ready after 180s)" >> "$LOG"
+  fi
+else
+  echo "$(date) bandctl: boot-apply skipped (server not ready after 60s)" >> "$LOG"
+fi
+
 echo "$(date) bandctl: server started on port $PORT" >> /sdcard/modem_watch_sessions.log
+# Boot apply is best-effort: never fail the boot-time script over it.
+exit 0
