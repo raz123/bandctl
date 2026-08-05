@@ -71,9 +71,9 @@ nohup "$PYTHON" "$WEB_DIR/server.py" > /dev/null 2>&1 &
 wait_server() {
   i=0
   while [ "$i" -lt 30 ]; do
-    if "$PYTHON" -c 'import sys, urllib.request
+        if "$PYTHON" -c 'import sys, urllib.request
 try:
-    with urllib.request.urlopen(sys.argv[1], timeout=2) as r:
+    with urllib.request.urlopen(sys.argv[1], timeout=10) as r:
         sys.exit(0 if r.status == 200 else 1)
 except Exception:
     sys.exit(1)' "http://127.0.0.1:$PORT/api/health?action=health"; then
@@ -93,7 +93,7 @@ wait_radio() {
   while [ "$i" -lt 60 ]; do
     if "$PYTHON" -c 'import sys, json, urllib.request
 try:
-    with urllib.request.urlopen(sys.argv[1], timeout=2) as r:
+    with urllib.request.urlopen(sys.argv[1], timeout=10) as r:
         state = json.load(r).get("service_state")
         sys.exit(0 if r.status == 200 and state != "POWER_OFF" else 1)
 except Exception:
@@ -111,17 +111,17 @@ if wait_server; then
     resp=$("$PYTHON" -c 'import sys, urllib.request
 try:
     req = urllib.request.Request(sys.argv[1], method="POST")
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=10) as r:
         sys.stdout.write(r.read().decode("utf-8", "replace"))
         sys.exit(0 if r.status == 200 else 1)
 except Exception:
     sys.exit(1)' "http://127.0.0.1:$PORT/api/boot-apply?action=boot-apply")
     echo "$(date) bandctl: boot-apply -> $resp" >> "$LOG"
   else
-    echo "$(date) bandctl: boot-apply skipped (radio not ready after 180s)" >> "$LOG"
+    echo "$(date) bandctl: boot-apply skipped (radio not ready)" >> "$LOG"
   fi
 else
-  echo "$(date) bandctl: boot-apply skipped (server not ready after 60s)" >> "$LOG"
+  echo "$(date) bandctl: boot-apply skipped (server not ready)" >> "$LOG"
 fi
 
 echo "$(date) bandctl: server started on port $PORT" >> "$LOG"

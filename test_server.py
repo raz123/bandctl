@@ -513,6 +513,20 @@ class TestGuardedParse(unittest.TestCase):
 class TestStaticServing(unittest.TestCase):
     """SRV-07: only index.html is served; everything else 404s."""
 
+    def setUp(self):
+        # The server resolves WEB_DIR from its own file location, which in
+        # this repo layout (server.py at the root, not module/web/) points
+        # outside the checkout. Patch it to a temp dir so the static-serving
+        # contract is exercised deterministically.
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_web_dir = server.WEB_DIR
+        server.WEB_DIR = Path(self._tmp.name)
+        (server.WEB_DIR / "index.html").write_bytes(b"<html>bandctl test</html>")
+
+    def tearDown(self):
+        server.WEB_DIR = self._orig_web_dir
+        self._tmp.cleanup()
+
     def serve(self, path):
         h = make_handler(path, 'GET')
         h._serve_static()

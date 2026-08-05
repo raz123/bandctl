@@ -5,6 +5,26 @@
 # the install log).
 
 MODDIR=${MODDIR:-${0%/*}}
+
+# KernelSU's metainstall pass can run customize.sh with $0="sh" and no
+# MODDIR env, leaving MODDIR="sh" — which previously seeded a stray
+# bands.json into the CWD and skipped the real config dir entirely.
+# Resolve the real module root (the dir containing module.prop); if it
+# can't be found, skip the seed + permission fixes (the server's
+# carrier-aware fallback covers band selection until the first Save).
+if [ ! -f "$MODDIR/module.prop" ]; then
+  CAND="$PWD"
+  while [ -n "$CAND" ] && [ "$CAND" != "/" ] && [ ! -f "$CAND/module.prop" ]; do
+    CAND=${CAND%/*}
+  done
+  if [ -f "$CAND/module.prop" ]; then
+    MODDIR="$CAND"
+    echo "[bandctl] Resolved module root: $MODDIR"
+  else
+    echo "[bandctl] WARNING: module root not found (MODDIR=$MODDIR); config seed + permission fixes skipped"
+    exit 0
+  fi
+fi
 CONFIG_DIR="$MODDIR/config"
 CONFIG_FILE="$CONFIG_DIR/bands.json"
 
@@ -20,8 +40,9 @@ ROGERS_BANDS='{
   "nr": ["1", "3", "5", "8", "20", "28", "38", "41", "77", "78"]
 }'
 
+VERSION=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null)
 echo "=========================================="
-echo "  Band Controller v2.2"
+echo "  Band Controller v${VERSION:-?}"
 echo "  Standalone LTE/NR band control + modem"
 echo "  diagnostics web UI (no NSG required)"
 echo "=========================================="

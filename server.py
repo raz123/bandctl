@@ -328,6 +328,30 @@ def defaults_for_carrier(carrier):
     return {"lte": list(src["lte"]), "nr": list(src["nr"])}
 
 
+def seed_config_if_absent():
+    """Persist the carrier-aware default to config/bands.json when absent.
+
+    customize.sh's install-time seed is lost in KernelSU's metainstall
+    staging (its writes go to an ephemeral dir, not the final module), so
+    fresh installs land with no persisted preference and boot-apply would
+    skip forever. Seeding here — the runtime MODDIR/config is
+    authoritative — restores the documented boot re-apply. Rogers (302720)
+    gets the curated whitelist; any other carrier gets no file (the
+    server's carrier-aware all-bands fallback applies until the first
+    Save & Apply mirrors one). If the operator prop is empty (mid-radio-
+    drop), nothing is seeded — never raises."""
+    if os.path.exists(CONFIG_FILE):
+        return
+    try:
+        mccmnc = (_get_prop("gsm.operator.numeric") or "").strip(" ,")
+        if carrier_for_mccmnc(mccmnc) != "rogers":
+            return
+        _atomic_write_json(CONFIG_FILE, defaults_for_carrier("rogers"))
+        print(f"Seeded Rogers default band config: {CONFIG_FILE}")
+    except Exception as e:
+        print(f"Config seed skipped: {e}")
+
+
 def _run_qmi(args, timeout):
     """Run the QMI band client; return (returncode, combined output).
 
@@ -1120,6 +1144,7 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         apply failure return ok:false with a short error. Never raises -
         any exception becomes {"ok": false, "error": ...}.
         """
+        seed_config_if_absent()
         try:
             if not os.path.exists(CONFIG_FILE):
                 return {"ok": True, "skipped": True}
@@ -1364,6 +1389,12 @@ if __name__ == '__main__':
     # band force can be validated offline. Daemon thread - dies with the
     # server; never blocks shutdown.
     threading.Thread(target=_band_camping_loop, daemon=True).start()
+
+    # Persist the carrier-aware default when a fresh install has no
+    # config/bands.json (customize.sh's install-time seed is lost in the
+    # metainstall staging). Runs here AND lazily in boot_apply so the
+    # config_file read-fallback and the boot re-apply both see it.
+    seed_config_if_absent()
 
     # Threaded: the 2s signal/registration polling (each dumpsys call takes
     # seconds on this device) must not starve other requests — a single-

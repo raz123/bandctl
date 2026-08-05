@@ -586,6 +586,50 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   color: var(--danger-ink);
 }
 
+/* ============ MODALS (in-page, WebView-safe) ============ */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0,0,0,0.55);
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  width: 100%;
+  max-width: 360px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  padding: 20px;
+}
+.modal h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--ink-strong);
+  margin-bottom: 8px;
+}
+.modal p {
+  color: var(--muted);
+  font-size: 0.875rem;
+  margin-bottom: 14px;
+}
+.modal input[type="text"] {
+  width: 100%;
+  background: var(--surface-2);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+  font-size: 1rem;
+  margin-bottom: 16px;
+}
+.modal .btn-row { margin-top: 0; }
+
 /* ============ FOCUS-VISIBLE GLOBAL ============ */
 button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
   outline: 2px solid var(--focus);
@@ -727,6 +771,30 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
   </div>
 </div>
 
+<!-- ============ In-page modals (WebView-safe; no alert/confirm/prompt) ============ -->
+<div class="modal-overlay" id="preset-modal" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">
+  <div class="modal">
+    <h3 id="preset-modal-title">Save preset</h3>
+    <p>Name this band configuration so you can restore it later.</p>
+    <input type="text" id="preset-name-input" placeholder="Preset name" maxlength="40" autocomplete="off">
+    <div class="btn-row">
+      <button class="btn" id="preset-modal-save">Save</button>
+      <button class="btn ghost" id="preset-modal-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="reset-modal" role="dialog" aria-modal="true" aria-labelledby="reset-modal-title">
+  <div class="modal">
+    <h3 id="reset-modal-title">Reset modem?</h3>
+    <p>This may briefly drop the data connection.</p>
+    <div class="btn-row">
+      <button class="btn ghost" id="reset-modal-cancel">Cancel</button>
+      <button class="btn danger" id="reset-modal-confirm">Reset</button>
+    </div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -787,6 +855,7 @@ var source = 'default';
 var defaultsLte = DEFAULT_LTE;
 var defaultsNr = DEFAULT_NR;
 var carrierInfo = null; // {carrier:'rogers'|'other', operator?, lte?, nr?} from /api/defaults
+var userTouched = false; // true once the user changes the selection; guards refreshes from clobbering it
 var serverDownReported = false;
 var signalTimer = null;
 var regTimer = null;
@@ -836,6 +905,7 @@ function toggleBand(n, type) {
   var set = type === 'lte' ? lteEnabled : nrEnabled;
   var sn = String(n);
   if (set.has(sn)) { set.delete(sn); } else { set.add(sn); }
+  userTouched = true;
   renderBands();
   updateSummary();
 }
@@ -862,7 +932,14 @@ async function loadBands() {
     var r = await apiFetch(API_READ);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
-    applyConfig(d.lte, d.nr, d.source);
+    if (userTouched) {
+      // Never clobber an in-progress selection: keep the user's bands, but
+      // still reflect the live source/summary.
+      source = d.source || source;
+      updateSummary();
+    } else {
+      applyConfig(d.lte, d.nr, d.source);
+    }
     if (serverDownReported) {
       serverDownReported = false;
       hideBanner();
@@ -871,9 +948,13 @@ async function loadBands() {
     showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
     return true;
   } catch (e) {
-    showStatus('Failed to load: ' + e.message, true);
     serverDown(e);
-    applyDefaults();
+    if (userTouched) {
+      showStatus('Failed to load: ' + e.message + ' — your selection was kept', true);
+    } else {
+      showStatus('Failed to load: ' + e.message, true);
+      applyDefaults();
+    }
     return false;
   } finally {
     if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
@@ -918,7 +999,15 @@ async function saveBands() {
   }
 }
 
-function resetDefaults() {
+async function resetDefaults() {
+  // Re-fetch first so we never apply the unrestricted fallback on a
+  // carrier-aware device; abort cleanly when carrier data is unavailable.
+  var ok = await fetchDefaults();
+  if (!ok || !defaultsLte.length) {
+    showStatus('Carrier defaults unavailable — reset aborted; nothing was changed', true);
+    toast('Carrier defaults unavailable — reset aborted', true);
+    return;
+  }
   applyDefaults();
   showStatus('Defaults loaded (' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR). Press Save & Apply to push to the modem.', false);
   toast('Defaults loaded — press Save & Apply');
@@ -1015,9 +1104,11 @@ function setChip(id, txt, tone) {
   el.classList.remove('good', 'bad', 'amber');
   if (tone) el.classList.add(tone);
 }
+var SVC_BAD = { POWER_OFF: 1, OUT_OF_SERVICE: 1, EMERGENCY_ONLY: 1, SERVICE_EMERGENCY: 1 };
 function updateChips(d) {
   var svc = d.service_state || '—';
-  setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : 'bad');
+  // Only explicit service-loss states are 'bad'; unknown/'—' stays neutral, never red.
+  setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : (SVC_BAD[svc] ? 'bad' : null));
   setChip('chip-data', d.data_state || '—');
   setChip('chip-net', d.network_type || '—');
   setChip('chip-op', d.operator || '—');
@@ -1170,8 +1261,12 @@ function drawGraph() {
 }
 
 /* ============ Modem reset ============ */
-async function modemReset() {
-  if (!confirm('Reset the modem? This may briefly drop the data connection.')) return;
+function modemReset() {
+  // In-page confirm modal — window.confirm() is unreliable in the Manager WebView.
+  openModal('reset-modal');
+}
+async function confirmModemReset() {
+  closeModal('reset-modal');
   var btn = $('modem-reset-btn');
   if (!btn) return;
   var origText = btn.textContent;
@@ -1197,8 +1292,12 @@ async function modemReset() {
 
 /* ============ Settings: presets (localStorage) ============ */
 function getPresets() {
-  try { return JSON.parse(localStorage.getItem(PRESETS_KEY)) || []; }
-  catch (e) { return []; }
+  var raw = localStorage.getItem(PRESETS_KEY);
+  if (!raw) return [];
+  try {
+    var p = JSON.parse(raw);
+    return Array.isArray(p) ? p : [];
+  } catch (e) { return []; }
 }
 function savePresets(p) { localStorage.setItem(PRESETS_KEY, JSON.stringify(p)); }
 function renderPresets() {
@@ -1222,8 +1321,16 @@ function renderPresets() {
   $('preset-empty').style.display = list.length ? 'none' : 'block';
 }
 function savePreset() {
-  var name = (prompt('Preset name:') || '').trim();
+  // In-page modal — window.prompt() returns null in the Manager WebView.
+  var input = $('preset-name-input');
+  input.value = '';
+  openModal('preset-modal');
+  input.focus();
+}
+function confirmSavePreset() {
+  var name = ($('preset-name-input').value || '').trim();
   if (!name) return;
+  closeModal('preset-modal');
   var list = getPresets();
   list.push({ name: name, lte: Array.from(lteEnabled), nr: Array.from(nrEnabled), savedAt: Date.now() });
   savePresets(list);
@@ -1234,6 +1341,7 @@ function loadPreset(i) {
   var p = getPresets()[i];
   if (!p) return;
   setBands(p.lte, p.nr);
+  userTouched = true;
   renderBands();
   updateSummary();
   switchTab('bands');
@@ -1487,8 +1595,9 @@ function updateCarrierRow() {
 
 /* ============ Carrier-aware defaults ============ */
 // Best-effort: never blocks/blocks init; on failure keep the DEFAULT_* fallback.
+// Resolves true when carrier-aware defaults are in hand, false on failure.
 function fetchDefaults() {
-  apiFetch(API_DEFAULTS).then(function (r) {
+  return apiFetch(API_DEFAULTS).then(function (r) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).then(function (d) {
@@ -1496,8 +1605,10 @@ function fetchDefaults() {
     if (d.nr && d.nr.length) defaultsNr = d.nr.map(String);
     carrierInfo = d;
     updateCarrierRow();
+    return true;
   }).catch(function () {
     // server unreachable — keep DEFAULT_* fallback, carrier row stays "—"
+    return false;
   });
 }
 
@@ -1517,6 +1628,13 @@ function toast(msg, isErr) {
 function showBanner() { $('server-banner').style.display = 'block'; }
 function hideBanner() { $('server-banner').style.display = 'none'; }
 
+/* ============ In-page modals (WebView-safe) ============ */
+function openModal(id) { $(id).classList.add('open'); }
+function closeModal(id) { $(id).classList.remove('open'); }
+function closeModals() {
+  ['preset-modal', 'reset-modal'].forEach(function (id) { closeModal(id); });
+}
+
 /* ============ Delegated events ============ */
 document.addEventListener('click', function (e) {
   var tab = e.target.closest('.tabbar button[data-tab]');
@@ -1535,6 +1653,11 @@ document.addEventListener('keydown', function (e) {
     e.preventDefault();
     toggleBand(band.dataset.band, band.dataset.type);
   }
+  if (e.key === 'Escape') closeModals();
+  if (e.key === 'Enter' && $('preset-modal').classList.contains('open') && e.target === $('preset-name-input')) {
+    e.preventDefault();
+    confirmSavePreset();
+  }
 });
 
 /* ============ Init ============ */
@@ -1544,7 +1667,11 @@ function init() {
   $('refresh-btn').addEventListener('click', loadBands);
   $('retry-btn').addEventListener('click', retryConnect);
   $('modem-reset-btn').addEventListener('click', modemReset);
+  $('reset-modal-confirm').addEventListener('click', confirmModemReset);
+  $('reset-modal-cancel').addEventListener('click', function () { closeModal('reset-modal'); });
   $('preset-save-btn').addEventListener('click', savePreset);
+  $('preset-modal-save').addEventListener('click', confirmSavePreset);
+  $('preset-modal-cancel').addEventListener('click', function () { closeModal('preset-modal'); });
   $('export-btn').addEventListener('click', exportConfig);
   $('import-btn').addEventListener('click', function () { $('import-file').click(); });
   $('import-file').addEventListener('change', function () { onImportFile($('import-file').files[0]); });

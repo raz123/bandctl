@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/python3
+#!/usr/bin/env python3
 """Band Controller HTTP server with QMI-first transport.
 
 No NSG dependency - band apply goes over QRTR QMI (the bundled static
@@ -84,13 +84,37 @@ HTTP API (all responses are JSON, served from the phone's web root):
        WebView drops blob downloads, so the server delivers the file
        on-device and the UI toasts the path.
 
+  GET  /api/settings?action=settings
+       -> {"ok": true, "lan_enabled": bool, "token_required": bool}
+       Current LAN/token state from config/settings.json. Exempt from
+       the LAN auth gate (returns no token material) so a fresh laptop
+       page can learn whether a token is required before storing one.
+
+  POST /api/settings?action=settings  body {"lan_enabled": bool,
+                                            "regenerate": bool}
+       -> {"ok": true, "lan_enabled": bool, "token_required": bool,
+           "token": str|null}
+       Enables/disables LAN access (server bind). Enabling with no token
+       set, or passing regenerate=true, creates a fresh bearer token
+       (secrets.token_urlsafe(24)); the token is returned only when it
+       was created in THIS call, otherwise null. Settings are persisted
+       atomically to config/settings.json.
+
+  POST /api/restart?action=restart
+       -> {"ok": true}
+       Schedules a detached module-service restart ~1s later (service.sh
+       kills the old server and starts a fresh one) from a background
+       thread so the response is delivered first.
+
   Anything else -> {"error": "unknown action"}
 """
 import http.server
 import fcntl
+import hmac
 import json
 import os
 import re
+import secrets
 import struct
 import subprocess
 import sys
@@ -98,16 +122,100 @@ import threading
 import time
 from pathlib import Path
 
+# Module root: server.py lives in MODDIR/web/, so MODDIR is the module
+# directory (KernelSU mounts it at /data/adb/modules/bandctl on-device;
+# resolving from __file__ keeps dev/test checkouts working identically).
+MODDIR = Path(__file__).resolve().parent.parent
+
 # Add diag module to path
-DIAG_DIR = Path(__file__).parent.parent / "diag"
+DIAG_DIR = MODDIR / "diag"
 sys.path.insert(0, str(DIAG_DIR))
 
 from diag_client import DiagClient, read_bands, write_bands
 from protocol import band_bitmask_to_list, band_list_to_bitmask
 
 PORT = 8080
-WEB_DIR = "/data/adb/modules/bandctl/web"
+WEB_DIR = MODDIR / "web"
 DIAG_DEVICE = "/dev/diag"
+
+# Settings file (v2.2 LAN-access feature): serialized bind + bearer token.
+# Absent/invalid file -> DEFAULT_SETTINGS. The bind is the listen address
+# (127.0.0.1 = local-only, 0.0.0.0 = LAN); the token gates /api/* from
+# non-loopback clients while LAN is enabled.
+SETTINGS_FILE = MODDIR / "config" / "settings.json"
+DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None}
+
+# Serialize config/settings writes so concurrent saves cannot interleave
+# (each save is temp-file + os.replace, atomic per write).
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+# Request bodies are clamped to 1 MiB before parsing (M6 guard).
+MAX_BODY_BYTES = 1 * 1024 * 1024
+
+
+def _load_settings():
+    """Load config/settings.json, falling back to defaults.
+
+    Absent file, malformed JSON, or invalid fields all yield
+    {"bind": "127.0.0.1", "token": None} — never raises."""
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return settings
+        if data.get("bind") in ("127.0.0.1", "0.0.0.0"):
+            settings["bind"] = data["bind"]
+        token = data.get("token")
+        settings["token"] = token if isinstance(token, str) and token else None
+    except (OSError, ValueError):
+        pass
+    return settings
+
+
+# In-memory settings snapshot, loaded once at startup. The restart endpoint
+# re-runs service.sh so a bind/token change takes effect on the fresh process.
+SETTINGS = _load_settings()
+
+
+def _atomic_write_json(path, data):
+    """Persist `data` as JSON to `path` atomically (M7).
+
+    Writes to a temp file in the same directory, fsyncs, then
+    os.replace()s it over the target so readers never observe a
+    partially-written file. The temp file is opened with O_NOFOLLOW so a
+    symlink planted at the temp name cannot redirect the write; the
+    replace itself swaps the target name outright (a pre-existing symlink
+    at the target is replaced, not followed). Writes are serialized by
+    _CONFIG_WRITE_LOCK. Raises on failure; callers turn exceptions into
+    JSON error responses."""
+    path = Path(path)
+    os.makedirs(str(path.parent), exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    tmp = os.path.join(str(path.parent),
+                       ".{}.{}.tmp".format(path.name, os.getpid()))
+    with _CONFIG_WRITE_LOCK:
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(path))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def _save_settings():
+    """Atomically persist the in-memory SETTINGS snapshot."""
+    _atomic_write_json(SETTINGS_FILE, SETTINGS)
+
 
 # QMI band-apply client (QRTR transport). Resolved relative to the module
 # dir like DIAG_DIR; falls back to /data/local/tmp/qmi_band for dev use.
@@ -119,16 +227,16 @@ QMI_GET_TIMEOUT = 5
 QMI_SET_TIMEOUT = 8
 
 # Fallback config file for persistence
-CONFIG_FILE = "/data/adb/modules/bandctl/config/bands.json"
+CONFIG_FILE = MODDIR / "config" / "bands.json"
 
 # Export dir for WebView-compatible config export (the Manager WebView
 # drops blob downloads, so export writes a timestamped file on-device).
-EXPORT_DIR = "/data/adb/modules/bandctl/config"
+EXPORT_DIR = MODDIR / "config"
 
 # Band-camping sampler (findings 5c): append `timestamp,earfcn,band` CSV
 # lines every BAND_CAMPING_INTERVAL seconds so a band force can be
 # validated offline (does the modem ever camp on a banned band?).
-BAND_CAMPING_LOG = "/data/adb/modules/bandctl/config/band_camping.log"
+BAND_CAMPING_LOG = MODDIR / "config" / "band_camping.log"
 BAND_CAMPING_INTERVAL = 5
 
 # Plain ioctl number (include/linux/diagchar.h) - NOT _IO-encoded, same
@@ -218,6 +326,30 @@ def defaults_for_carrier(carrier):
     Returns fresh copies so callers can stamp extra keys."""
     src = _ROGERS_BANDS if carrier == "rogers" else _ALL_BANDS
     return {"lte": list(src["lte"]), "nr": list(src["nr"])}
+
+
+def seed_config_if_absent():
+    """Persist the carrier-aware default to config/bands.json when absent.
+
+    customize.sh's install-time seed is lost in KernelSU's metainstall
+    staging (its writes go to an ephemeral dir, not the final module), so
+    fresh installs land with no persisted preference and boot-apply would
+    skip forever. Seeding here — the runtime MODDIR/config is
+    authoritative — restores the documented boot re-apply. Rogers (302720)
+    gets the curated whitelist; any other carrier gets no file (the
+    server's carrier-aware all-bands fallback applies until the first
+    Save & Apply mirrors one). If the operator prop is empty (mid-radio-
+    drop), nothing is seeded — never raises."""
+    if os.path.exists(CONFIG_FILE):
+        return
+    try:
+        mccmnc = (_get_prop("gsm.operator.numeric") or "").strip(" ,")
+        if carrier_for_mccmnc(mccmnc) != "rogers":
+            return
+        _atomic_write_json(CONFIG_FILE, defaults_for_carrier("rogers"))
+        print(f"Seeded Rogers default band config: {CONFIG_FILE}")
+    except Exception as e:
+        print(f"Config seed skipped: {e}")
 
 
 def _run_qmi(args, timeout):
@@ -551,18 +683,18 @@ def _query_md_pid(device):
 def _parse_band_camping(text):
     """Parse serving EARFCN and band from `dumpsys telephony.registry`.
 
-    Scans CellIdentityLte objects (`mEarfcn=<n>`, `mBands=[<n>,...]`)
-    and returns (earfcn, band) for the first one carrying an EARFCN.
-    band is the first entry of the mBands list (the convention used in
-    findings 5c: `mEarfcn=2050 mBands=[4]` -> band 4). Returns
-    (None, None) when no LTE cell identity is present (radio off, or the
-    device is camped on another RAT).
+    Prefers the LTE identity from an mCellInfo entry marked mRegistered=YES
+    (the cell actually camped on — e.g. Rogers EARFCN 2050 reports
+    mBands=[4] there, while the registered-identity block can carry a
+    misleading mBands list). Falls back to the registered-identity block
+    (mCellIdentity=CellIdentityLte). band is the first entry of the
+    mBands list. Returns (None, None) when no LTE cell identity with an
+    EARFCN is present (radio off, or camped on another RAT).
     """
-    for m in re.finditer(r'CellIdentityLte:\s*\{([^}]*)\}', text):
-        identity = m.group(1)
+    def _earfcn_band(identity):
         em = re.search(r'mEarfcn=(\d+)', identity)
         if not em:
-            continue
+            return None
         earfcn = _parse_int(em.group(1))
         band = None
         bm = re.search(r'mBands=\[?([0-9,\s]*)\]?', identity)
@@ -571,6 +703,19 @@ def _parse_band_camping(text):
             if bands:
                 band = bands[0]
         return earfcn, band
+
+    # 1) The camped-on cell: CellInfoLte entries marked mRegistered=YES.
+    for m in re.finditer(
+            r'CellInfoLte:\{mRegistered=YES[^}]*?CellIdentityLte:\{([^}]*)\}',
+            text):
+        hit = _earfcn_band(m.group(1))
+        if hit:
+            return hit
+    # 2) Registered-identity block (mCellIdentity=CellIdentityLte).
+    for m in re.finditer(r'mCellIdentity=CellIdentityLte:\s*\{([^}]*)\}', text):
+        hit = _earfcn_band(m.group(1))
+        if hit:
+            return hit
     return None, None
 
 
@@ -580,9 +725,9 @@ def _band_camping_loop():
     a `timestamp,earfcn,band` CSV line to BAND_CAMPING_LOG. Lines are
     written only when an EARFCN is present; failures are logged and
     skipped, never fatal."""
-    os.makedirs(os.path.dirname(BAND_CAMPING_LOG), exist_ok=True)
     while True:
         try:
+            os.makedirs(os.path.dirname(BAND_CAMPING_LOG), exist_ok=True)
             earfcn, band = _parse_band_camping(
                 _run_dumpsys("telephony.registry"))
             if earfcn is not None:
@@ -596,15 +741,12 @@ def _band_camping_loop():
         time.sleep(BAND_CAMPING_INTERVAL)
 
 
-class BandHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=WEB_DIR, **kwargs)
-
+class BandHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/api/'):
             self.handle_api()
         else:
-            super().do_GET()
+            self._serve_static()
 
     def do_POST(self):
         if self.path.startswith('/api/'):
@@ -612,62 +754,278 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _serve_static(self):
+        """Serve only web/index.html for / and /index.html (SRV-07).
+
+        Everything else 404s — no directory listing, no server.py/
+        __pycache__ exposure. Query strings are stripped before the path
+        match."""
+        path = self.path.split('?', 1)[0]
+        if path not in ("/", "/index.html"):
+            self.send_error(404)
+            return
+        try:
+            with open(WEB_DIR / "index.html", 'rb') as f:
+                body = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _is_loopback(self):
+        """True when the client connected via a loopback address."""
+        host = self.client_address[0]
+        return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _auth_required(self, action):
+        """LAN auth gate (batch contract + bootstrap amendment).
+
+        A bearer token is required iff LAN is enabled AND the client is
+        not loopback — except GET /api/settings, which returns no token
+        material and must stay readable so a fresh laptop page can learn
+        that a token is required before it can store one."""
+        if SETTINGS["bind"] != "0.0.0.0":
+            return False
+        if self._is_loopback():
+            return False
+        if action == "settings" and self.command == "GET":
+            return False
+        return True
+
+    def _check_auth(self):
+        """Validate the bearer token against SETTINGS["token"].
+
+        Returns None when allowed, else the 401 error dict. Missing or
+        wrong token both fail; the compare is constant-time
+        (hmac.compare_digest)."""
+        token = None
+        auth = self.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            token = auth[len('Bearer '):]
+        # Bytes compare: compare_digest raises TypeError on non-ASCII str,
+        # which must not turn into a 500 (handled -> plain 401 instead).
+        try:
+            match = (bool(SETTINGS["token"]) and bool(token)
+                     and hmac.compare_digest(token.encode('utf-8'),
+                                             SETTINGS["token"].encode('utf-8')))
+        except Exception:
+            match = False
+        if not match:
+            return {"ok": False, "error": "unauthorized"}
+        return None
+
+    def _read_json_body(self):
+        """Read and parse the request body (M6 guards).
+
+        Content-Length is clamped to MAX_BODY_BYTES and the JSON parse is
+        guarded — malformed input raises ValueError, which handle_api's
+        guard turns into {"ok": false, "error": ...} (never a 500)."""
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (TypeError, ValueError):
+            raise ValueError("invalid Content-Length")
+        if length < 0 or length > MAX_BODY_BYTES:
+            raise ValueError("request body exceeds {} bytes".format(
+                MAX_BODY_BYTES))
+        body = self.rfile.read(length).decode()
+        try:
+            return json.loads(body)
+        except (ValueError, TypeError) as e:
+            raise ValueError("invalid JSON body: {}".format(e))
+
     def do_OPTIONS(self):
         # CORS preflight for cross-origin POSTs from the KernelSU WebUI
-        # origin (ksu://webui/bandctl/ or appassets://...).
+        # origin (ksu://webui/bandctl/ or appassets://...) and LAN-mode
+        # browser clients. Authorization must be allowed so a laptop page
+        # can send the bearer token on POST /api/settings. Preflights
+        # carry no Authorization header, so OPTIONS stays ungated.
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers',
+                         'Content-Type, Authorization')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
     def handle_api(self):
-        query = self.path.split('?', 1)[1] if '?' in self.path else ''
-        action = ''
-        for part in query.split('&'):
-            if part.startswith('action='):
-                action = part.split('=', 1)[1]
-                break
+        """Dispatch /api/* requests (M6-guarded, never 500s).
 
-        if action == 'read':
-            self.send_json(self.read_config())
-        elif action == 'defaults':
-            self.send_json(self.read_defaults())
-        elif action == 'write':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            self.send_json(self.write_config(json.loads(body)))
-        elif action == 'boot-apply':
-            self.send_json(self.boot_apply())
-        elif action == 'export':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
+        Order: reject non-/api/ paths, apply the LAN auth gate (except
+        GET /api/settings), then per-action dispatch. The whole body is
+        wrapped in try/except so any exception becomes
+        {"ok": false, "error": str(e)} instead of a 500."""
+        try:
+            if not self.path.startswith('/api/'):
+                self.send_json({"error": "unknown action"})
+                return
+
+            query = self.path.split('?', 1)[1] if '?' in self.path else ''
+            action = ''
+            for part in query.split('&'):
+                if part.startswith('action='):
+                    action = part.split('=', 1)[1]
+                    break
+
+            if self._auth_required(action):
+                auth_error = self._check_auth()
+                if auth_error is not None:
+                    self.send_json(auth_error, status=401)
+                    return
+
+            if action == 'read':
+                self.send_json(self.read_config())
+            elif action == 'defaults':
+                self.send_json(self.read_defaults())
+            elif action == 'settings':
+                if self.command == 'POST':
+                    self.send_json(self.update_settings(self._read_json_body()))
+                else:
+                    self.send_json(self.read_settings())
+            elif action == 'restart':
+                self.send_json(self.restart_service())
+            elif action == 'write':
+                self.send_json(self.write_config(self._read_json_body()))
+            elif action == 'boot-apply':
+                self.send_json(self.boot_apply())
+            elif action == 'export':
+                self.send_json(self.export_config(self._read_json_body()))
+            elif action == 'signal':
+                self.send_json(self.read_signal())
+            elif action == 'registration':
+                self.send_json(self.read_registration())
+            elif action == 'health':
+                self.send_json(self.modem_health())
+            elif action == 'modem-reset':
+                self.send_json(self.modem_reset())
+            elif action == 'band-camping':
+                limit = 50
+                if '?' in self.path:
+                    for part in self.path.split('?', 1)[1].split('&'):
+                        if part.startswith('limit='):
+                            try:
+                                limit = max(1, int(part.split('=', 1)[1]))
+                            except (TypeError, ValueError):
+                                pass
+                self.send_json(self.read_band_camping(limit))
+            else:
+                self.send_json({"error": "unknown action"})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)})
+
+    def _normalize_bands(self, bands):
+        """Coerce a raw band list to deduped ints 1..79, order preserved.
+
+        Accepts ints and plain numeric strings; rejects bools, non-integer
+        floats, and anything else. Floats like Infinity (json.loads accepts
+        them) fail via OverflowError/ValueError handling instead of
+        crashing. Returns None on the first invalid entry."""
+        out = []
+        seen = set()
+        for b in bands:
+            if isinstance(b, bool):
+                return None
             try:
-                payload = json.loads(body)
-            except (ValueError, TypeError):
-                payload = {}
-            self.send_json(self.export_config(payload))
-        elif action == 'signal':
-            self.send_json(self.read_signal())
-        elif action == 'registration':
-            self.send_json(self.read_registration())
-        elif action == 'health':
-            self.send_json(self.modem_health())
-        elif action == 'modem-reset':
-            self.send_json(self.modem_reset())
-        elif action == 'band-camping':
-            limit = 50
-            if '?' in self.path:
-                for part in self.path.split('?', 1)[1].split('&'):
-                    if part.startswith('limit='):
-                        try:
-                            limit = max(1, int(part.split('=', 1)[1]))
-                        except (TypeError, ValueError):
-                            pass
-            self.send_json(self.read_band_camping(limit))
-        else:
-            self.send_json({"error": "unknown action"})
+                if isinstance(b, str):
+                    b = int(b.strip())
+                elif isinstance(b, float):
+                    if b != b or not b.is_integer():  # NaN / non-integral
+                        return None
+                    b = int(b)
+                elif not isinstance(b, int):
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not (1 <= b <= 79):
+                return None
+            if b not in seen:
+                seen.add(b)
+                out.append(b)
+        return out
+
+    def _validate_bands(self, data):
+        """Validate lte/nr band lists (M8), returning (bands, error).
+
+        Each band must be an int 1..79 (numeric strings accepted), lists
+        are deduped preserving order, and LTE must be non-empty. Returns
+        ({"lte": [...], "nr": [...]}, None) on success or (None, msg) on
+        violation — never raises."""
+        if not isinstance(data, dict):
+            return None, "request body must be a JSON object"
+        lte_raw = data.get('lte', [])
+        nr_raw = data.get('nr', [])
+        if not isinstance(lte_raw, list) or not isinstance(nr_raw, list):
+            return None, "lte and nr must be lists"
+        lte = self._normalize_bands(lte_raw)
+        if lte is None:
+            return None, "invalid lte band list: each band must be an integer 1-79"
+        nr = self._normalize_bands(nr_raw)
+        if nr is None:
+            return None, "invalid nr band list: each band must be an integer 1-79"
+        if not lte:
+            return None, "lte must contain at least one band"
+        return {"lte": lte, "nr": nr}, None
+
+    def read_settings(self):
+        """GET /api/settings — current LAN/token state (no token value)."""
+        return {
+            "ok": True,
+            "lan_enabled": SETTINGS["bind"] == "0.0.0.0",
+            "token_required": SETTINGS["token"] is not None,
+        }
+
+    def update_settings(self, data):
+        """POST /api/settings — set lan_enabled, optionally regenerate the
+        bearer token.
+
+        lan_enabled must be a bool. The token is created when enabling
+        with no token set or when regenerate=true, and is returned ONLY
+        when it was created/regenerated in this call (otherwise null).
+        Settings are persisted atomically; a save failure is reported as
+        ok:false."""
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "request body must be a JSON object"}
+        lan_enabled = data.get("lan_enabled")
+        if not isinstance(lan_enabled, bool):
+            return {"ok": False, "error": "lan_enabled must be a bool"}
+        regenerate = data.get("regenerate") is True
+
+        created = False
+        if (lan_enabled and SETTINGS["token"] is None) or regenerate:
+            SETTINGS["token"] = secrets.token_urlsafe(24)
+            created = True
+        SETTINGS["bind"] = "0.0.0.0" if lan_enabled else "127.0.0.1"
+        try:
+            _save_settings()
+        except Exception as e:
+            return {"ok": False, "error": "settings save failed: {}".format(e)}
+        return {
+            "ok": True,
+            "lan_enabled": lan_enabled,
+            "token_required": SETTINGS["token"] is not None,
+            "token": SETTINGS["token"] if created else None,
+        }
+
+    def restart_service(self):
+        """POST /api/restart — schedule a detached module-service restart.
+
+        service.sh kills the old server and starts a fresh one; it is
+        launched ~1s later from a background thread so the {"ok": true}
+        response is delivered first. Returns immediately."""
+        def _do_restart():
+            time.sleep(1)
+            try:
+                subprocess.Popen(["sh", str(MODDIR / "service.sh")],
+                                 start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print("Service restart failed: {}".format(e))
+        threading.Thread(target=_do_restart, daemon=True).start()
+        return {"ok": True}
 
     def read_defaults(self):
         """Carrier-aware default band lists (GET /api/defaults).
@@ -743,16 +1101,13 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
     def write_config(self, data):
         """Write band configuration to the modem: QMI (QRTR) first, then
         diag. The config file is always mirrored so intent persists."""
-        try:
-            lte_bands = [int(b) for b in data.get('lte', [])]
-            nr_bands = [int(b) for b in data.get('nr', [])]
-        except (TypeError, ValueError) as e:
-            return {"ok": False, "error": f"invalid band list: {e}"}
-
-        ok, source, error = self._apply_bands(lte_bands, nr_bands)
+        bands, err = self._validate_bands(data)
+        if bands is None:
+            return {"ok": False, "error": err}
+        ok, source, error = self._apply_bands(bands["lte"], bands["nr"])
         # Mirror intent regardless of outcome (matches historical
         # behavior: the file is saved on success AND on failure).
-        self._save_config_file(data)
+        self._save_config_file(bands)
         if ok:
             return {"ok": True, "source": source}
         return {"ok": False, "error": error}
@@ -783,12 +1138,13 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
 
         Reads the config file written by /api/write and runs it through
         the same QMI->diag apply chain. The config file is the source of
-        truth here - it is NEVER rewritten. Missing or unreadable config
-        and empty lte+nr are skips ({"ok": true, "skipped": true});
-        malformed JSON or an apply failure returns ok:false with a short
-        error. Never raises - any exception becomes {"ok": false,
-        "error": ...}.
+        truth here - it is NEVER rewritten. A missing or unreadable config
+        is a skip ({"ok": true, "skipped": true}); malformed JSON,
+        invalid bands (each must be an int 1..79, LTE non-empty), or an
+        apply failure return ok:false with a short error. Never raises -
+        any exception becomes {"ok": false, "error": ...}.
         """
+        seed_config_if_absent()
         try:
             if not os.path.exists(CONFIG_FILE):
                 return {"ok": True, "skipped": True}
@@ -801,14 +1157,11 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             # File exists but is not valid JSON -> report it.
             return {"ok": False, "error": "invalid config"}
 
-        try:
-            lte_bands = [int(b) for b in data.get('lte', [])]
-            nr_bands = [int(b) for b in data.get('nr', [])]
-        except (TypeError, ValueError, AttributeError):
-            return {"ok": False, "error": "invalid config"}
-
-        if not lte_bands and not nr_bands:
-            return {"ok": True, "skipped": True}
+        bands, err = self._validate_bands(data)
+        if bands is None:
+            return {"ok": False, "error": err}
+        lte_bands = bands["lte"]
+        nr_bands = bands["nr"]
 
         try:
             ok, source, error = self._apply_bands(lte_bands, nr_bands)
@@ -837,11 +1190,9 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         return re.search(r"result: status=0", out) is not None
 
     def _save_config_file(self, data):
-        """Save config to file as fallback."""
+        """Save config to file as fallback (atomic temp+replace, M7)."""
         try:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_json(CONFIG_FILE, data)
         except Exception as e:
             print(f"Config save error: {e}")
 
@@ -853,7 +1204,8 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
         {"ok": false, "error": ...} - never raises."""
         try:
             os.makedirs(EXPORT_DIR, exist_ok=True)
-            stamp = time.strftime('%Y%m%d-%H%M%S')
+            stamp = time.strftime('%Y%m%d-%H%M%S') + '.{:03d}'.format(
+                int(time.time() * 1000) % 1000)
             path = os.path.join(EXPORT_DIR, "bandctl-export-{}.json".format(stamp))
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -899,9 +1251,9 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
     def read_band_camping(self, limit=50):
         """Return the last `limit` lines of the band camping log as JSON.
 
-        Each CSV line is `timestamp,earfcn,band` (epoch ms; band empty
-        when the mBands list was absent). Never raises - an absent or
-        unreadable log yields an empty sample list with ok:true.
+        Each CSV line is `timestamp,earfcn,band` (epoch ms ints; band
+        empty when the mBands list was absent). Never raises - an absent
+        or unreadable log yields an empty sample list with ok:true.
         """
         try:
             if not os.path.exists(BAND_CAMPING_LOG):
@@ -911,7 +1263,7 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
             samples = []
             for ln in lines[-limit:]:
                 parts = ln.split(',')
-                sample = {"timestamp": parts[0] if parts else ""}
+                sample = {"timestamp": _parse_int(parts[0]) if parts else None}
                 if len(parts) > 1:
                     sample["earfcn"] = _parse_int(parts[1])
                 if len(parts) > 2:
@@ -1015,9 +1367,9 @@ class BandHandler(http.server.SimpleHTTPRequestHandler):
                 "error": str(e),
             }
 
-    def send_json(self, data):
+    def send_json(self, data, status=200):
         body = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -1038,12 +1390,20 @@ if __name__ == '__main__':
     # server; never blocks shutdown.
     threading.Thread(target=_band_camping_loop, daemon=True).start()
 
+    # Persist the carrier-aware default when a fresh install has no
+    # config/bands.json (customize.sh's install-time seed is lost in the
+    # metainstall staging). Runs here AND lazily in boot_apply so the
+    # config_file read-fallback and the boot re-apply both see it.
+    seed_config_if_absent()
+
     # Threaded: the 2s signal/registration polling (each dumpsys call takes
     # seconds on this device) must not starve other requests — a single-
     # threaded server stalls /api/defaults, /api/read, and button actions
     # behind an endless polling queue.
-    server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), BandHandler)
-    print(f"Band Controller server running on http://localhost:{PORT}")
+    # Bind comes from settings.json (default 127.0.0.1; 0.0.0.0 = LAN).
+    bind = SETTINGS.get("bind", "127.0.0.1")
+    server = http.server.ThreadingHTTPServer((bind, PORT), BandHandler)
+    print(f"Band Controller server running on http://{bind}:{PORT}")
     print(f"QMI binary: {QMI_BIN}")
     print(f"Diag device: {DIAG_DEVICE or 'disabled'}")
     server.serve_forever()

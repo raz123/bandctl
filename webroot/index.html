@@ -480,6 +480,30 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
+.lan-token-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.lan-token-display {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#lan-token-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  color: var(--ink);
+  padding: 8px 10px;
+  font-size: 0.875rem;
+}
+#lan-token-input:focus { border-color: var(--focus); }
 
 .preset-item {
   display: flex;
@@ -562,6 +586,50 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   color: var(--danger-ink);
 }
 
+/* ============ MODALS (in-page, WebView-safe) ============ */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0,0,0,0.55);
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  width: 100%;
+  max-width: 360px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  padding: 20px;
+}
+.modal h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--ink-strong);
+  margin-bottom: 8px;
+}
+.modal p {
+  color: var(--muted);
+  font-size: 0.875rem;
+  margin-bottom: 14px;
+}
+.modal input[type="text"] {
+  width: 100%;
+  background: var(--surface-2);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+  font-size: 1rem;
+  margin-bottom: 16px;
+}
+.modal .btn-row { margin-top: 0; }
+
 /* ============ FOCUS-VISIBLE GLOBAL ============ */
 button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
   outline: 2px solid var(--focus);
@@ -638,8 +706,10 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
       <span class="chip" id="chip-net"><b>Network</b><span class="chipval">—</span></span>
       <span class="chip" id="chip-op"><b>Operator</b><span class="chipval">—</span></span>
       <span class="chip" id="chip-roam"><b>Roaming</b><span class="chipval">—</span></span>
+      <span class="chip" id="chip-camped"><b>Camped</b><span class="chipval">—</span></span>
     </div>
     <button class="btn danger" id="modem-reset-btn" style="margin-top:12px">Reset Modem</button>
+    <div class="hint">Camped band = the LTE cell your phone is listening to right now. If you ban a band and it camps there anyway, the ban didn't stick.</div>
   </div>
   <div class="section">
     <h2>Event History</h2>
@@ -673,6 +743,56 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
     </div>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
   </div>
+  <div class="section">
+    <h2>Network access</h2>
+    <div class="set-row">
+      <span>Allow access from other devices on your network (LAN)</span>
+      <label class="switch">
+        <input type="checkbox" id="lan-toggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div id="lan-token-section" style="display:none">
+      <div class="set-row">
+        <span>Access token</span>
+        <span class="lan-token-wrap"><b id="lan-token" class="lan-token-display"></b><button class="btn small ghost" id="lan-token-show" style="display:none">Show</button></span>
+      </div>
+      <div class="set-row" id="lan-token-entry" style="display:none">
+        <input type="text" id="lan-token-input" placeholder="Paste the access token" autocomplete="off" spellcheck="false">
+        <button class="btn small" id="lan-token-save">Save token</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn ghost" id="lan-regenerate">Regenerate token</button>
+        <button class="btn ghost" id="lan-restart">Restart server</button>
+      </div>
+      <div class="hint">Restarting the server is needed for the change to take effect.</div>
+      <div class="hint">LAN mode protects the API with the token above; the phone itself never needs it.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ In-page modals (WebView-safe; no alert/confirm/prompt) ============ -->
+<div class="modal-overlay" id="preset-modal" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">
+  <div class="modal">
+    <h3 id="preset-modal-title">Save preset</h3>
+    <p>Name this band configuration so you can restore it later.</p>
+    <input type="text" id="preset-name-input" placeholder="Preset name" maxlength="40" autocomplete="off">
+    <div class="btn-row">
+      <button class="btn" id="preset-modal-save">Save</button>
+      <button class="btn ghost" id="preset-modal-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="reset-modal" role="dialog" aria-modal="true" aria-labelledby="reset-modal-title">
+  <div class="modal">
+    <h3 id="reset-modal-title">Reset modem?</h3>
+    <p>This may briefly drop the data connection.</p>
+    <div class="btn-row">
+      <button class="btn ghost" id="reset-modal-cancel">Cancel</button>
+      <button class="btn danger" id="reset-modal-confirm">Reset</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -692,14 +812,20 @@ var API_REG = API_BASE + '/api/registration?action=registration';
 var API_RESET = API_BASE + '/api/modem-reset?action=modem-reset';
 var API_EXPORT = API_BASE + '/api/export?action=export';
 var API_DEFAULTS = API_BASE + '/api/defaults?action=defaults';
+var API_CAMPING = API_BASE + '/api/band-camping?action=band-camping';
+var API_SETTINGS = API_BASE + '/api/settings?action=settings';
+var API_RESTART = API_BASE + '/api/restart?action=restart';
+var API_HEALTH = API_BASE + '/api/health?action=health';
 
 var SIGNAL_MS = 2000;   // poll /api/signal every 2s
 var REG_MS = 2000;      // poll /api/registration every 2s
+var CAMP_MS = 5000;     // poll /api/band-camping every 5s (sampler writes every 5s)
 var GRAPH_POINTS = 120; // keep last ~120 points
 var GRAPH_WINDOW_MS = 240 * 1000;
 var HISTORY_MAX = 200;
 
 var PRESETS_KEY = 'bandController.presets.v1';
+var TOKEN_KEY = 'bandController.token.v1';
 
 /* ============ Band catalogs (existing visual language) ============ */
 var LTE_BANDS = [
@@ -729,9 +855,11 @@ var source = 'default';
 var defaultsLte = DEFAULT_LTE;
 var defaultsNr = DEFAULT_NR;
 var carrierInfo = null; // {carrier:'rogers'|'other', operator?, lte?, nr?} from /api/defaults
+var userTouched = false; // true once the user changes the selection; guards refreshes from clobbering it
 var serverDownReported = false;
 var signalTimer = null;
 var regTimer = null;
+var campTimer = null;
 var signalHistory = [];   // {t: epoch_ms, rsrp: number|null}
 var lastReg = null;       // {service, net}
 var toastTimer = null;
@@ -777,6 +905,7 @@ function toggleBand(n, type) {
   var set = type === 'lte' ? lteEnabled : nrEnabled;
   var sn = String(n);
   if (set.has(sn)) { set.delete(sn); } else { set.add(sn); }
+  userTouched = true;
   renderBands();
   updateSummary();
 }
@@ -800,10 +929,17 @@ async function loadBands() {
   var origText = btn ? btn.textContent : '';
   if (btn) { btn.textContent = 'Loading\u2026'; btn.classList.add('loading'); }
   try {
-    var r = await fetch(API_READ);
+    var r = await apiFetch(API_READ);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
-    applyConfig(d.lte, d.nr, d.source);
+    if (userTouched) {
+      // Never clobber an in-progress selection: keep the user's bands, but
+      // still reflect the live source/summary.
+      source = d.source || source;
+      updateSummary();
+    } else {
+      applyConfig(d.lte, d.nr, d.source);
+    }
     if (serverDownReported) {
       serverDownReported = false;
       hideBanner();
@@ -812,9 +948,13 @@ async function loadBands() {
     showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
     return true;
   } catch (e) {
-    showStatus('Failed to load: ' + e.message, true);
     serverDown(e);
-    applyDefaults();
+    if (userTouched) {
+      showStatus('Failed to load: ' + e.message + ' — your selection was kept', true);
+    } else {
+      showStatus('Failed to load: ' + e.message, true);
+      applyDefaults();
+    }
     return false;
   } finally {
     if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
@@ -829,7 +969,7 @@ async function saveBands() {
   btn.classList.add('loading');
   var data = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
   try {
-    var r = await fetch(API_WRITE, {
+    var r = await apiFetch(API_WRITE, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -841,7 +981,7 @@ async function saveBands() {
       showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
       // Confirm applied state by polling /api/read once
       try {
-        var r2 = await fetch(API_READ);
+        var r2 = await apiFetch(API_READ);
         if (r2.ok) {
           var d2 = await r2.json();
           applyConfig(d2.lte, d2.nr, d2.source);
@@ -859,7 +999,15 @@ async function saveBands() {
   }
 }
 
-function resetDefaults() {
+async function resetDefaults() {
+  // Re-fetch first so we never apply the unrestricted fallback on a
+  // carrier-aware device; abort cleanly when carrier data is unavailable.
+  var ok = await fetchDefaults();
+  if (!ok || !defaultsLte.length) {
+    showStatus('Carrier defaults unavailable — reset aborted; nothing was changed', true);
+    toast('Carrier defaults unavailable — reset aborted', true);
+    return;
+  }
   applyDefaults();
   showStatus('Defaults loaded (' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR). Press Save & Apply to push to the modem.', false);
   toast('Defaults loaded — press Save & Apply');
@@ -876,10 +1024,15 @@ function startPolling() {
     regTimer = setInterval(pollRegistration, REG_MS);
     pollRegistration();
   }
+  if (campTimer === null) {
+    campTimer = setInterval(updateCamping, CAMP_MS);
+    updateCamping();
+  }
 }
 function stopPolling() {
   if (signalTimer !== null) { clearInterval(signalTimer); signalTimer = null; }
   if (regTimer !== null) { clearInterval(regTimer); regTimer = null; }
+  if (campTimer !== null) { clearInterval(campTimer); campTimer = null; }
 }
 function serverDown(err) {
   if (serverDownReported) return;
@@ -897,6 +1050,7 @@ function retryConnect() {
   function attempt() {
     loadBands().then(function (ok) {
       if (ok) {
+        startPolling(); // timers were stopped by serverDown — resume them
         if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
         return;
       }
@@ -914,7 +1068,7 @@ function retryConnect() {
 
 async function pollSignal() {
   try {
-    var r = await fetch(API_SIGNAL);
+    var r = await apiFetch(API_SIGNAL);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     var now = Date.now();
@@ -933,7 +1087,7 @@ async function pollSignal() {
 
 async function pollRegistration() {
   try {
-    var r = await fetch(API_REG);
+    var r = await apiFetch(API_REG);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     updateChips(d);
@@ -950,13 +1104,30 @@ function setChip(id, txt, tone) {
   el.classList.remove('good', 'bad', 'amber');
   if (tone) el.classList.add(tone);
 }
+var SVC_BAD = { POWER_OFF: 1, OUT_OF_SERVICE: 1, EMERGENCY_ONLY: 1, SERVICE_EMERGENCY: 1 };
 function updateChips(d) {
   var svc = d.service_state || '—';
-  setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : 'bad');
+  // Only explicit service-loss states are 'bad'; unknown/'—' stays neutral, never red.
+  setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : (SVC_BAD[svc] ? 'bad' : null));
   setChip('chip-data', d.data_state || '—');
   setChip('chip-net', d.network_type || '—');
   setChip('chip-op', d.operator || '—');
   setChip('chip-roam', d.roaming ? 'Roaming' : 'Home', d.roaming ? 'amber' : null);
+}
+async function updateCamping() {
+  try {
+    var r = await apiFetch(API_CAMPING);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    var s = (d && d.samples && d.samples.length) ? d.samples[d.samples.length - 1] : null;
+    if (!s || s.earfcn === null || s.earfcn === undefined) {
+      setChip('chip-camped', '—');
+      return;
+    }
+    setChip('chip-camped', s.band ? 'B' + s.band + ' · ' + s.earfcn : 'EARFCN ' + s.earfcn);
+  } catch (e) {
+    // Camping is best-effort; the registration poll owns server-down handling.
+  }
 }
 function checkRegChange(d) {
   var cur = { service: d.service_state, net: d.network_type };
@@ -1090,15 +1261,19 @@ function drawGraph() {
 }
 
 /* ============ Modem reset ============ */
-async function modemReset() {
-  if (!confirm('Reset the modem? This may briefly drop the data connection.')) return;
+function modemReset() {
+  // In-page confirm modal — window.confirm() is unreliable in the Manager WebView.
+  openModal('reset-modal');
+}
+async function confirmModemReset() {
+  closeModal('reset-modal');
   var btn = $('modem-reset-btn');
   if (!btn) return;
   var origText = btn.textContent;
   btn.textContent = 'Resetting\u2026';
   btn.classList.add('loading');
   try {
-    var r = await fetch(API_RESET, { method: 'POST' });
+    var r = await apiFetch(API_RESET, { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     if (d.ok) {
@@ -1117,8 +1292,12 @@ async function modemReset() {
 
 /* ============ Settings: presets (localStorage) ============ */
 function getPresets() {
-  try { return JSON.parse(localStorage.getItem(PRESETS_KEY)) || []; }
-  catch (e) { return []; }
+  var raw = localStorage.getItem(PRESETS_KEY);
+  if (!raw) return [];
+  try {
+    var p = JSON.parse(raw);
+    return Array.isArray(p) ? p : [];
+  } catch (e) { return []; }
 }
 function savePresets(p) { localStorage.setItem(PRESETS_KEY, JSON.stringify(p)); }
 function renderPresets() {
@@ -1142,8 +1321,16 @@ function renderPresets() {
   $('preset-empty').style.display = list.length ? 'none' : 'block';
 }
 function savePreset() {
-  var name = (prompt('Preset name:') || '').trim();
+  // In-page modal — window.prompt() returns null in the Manager WebView.
+  var input = $('preset-name-input');
+  input.value = '';
+  openModal('preset-modal');
+  input.focus();
+}
+function confirmSavePreset() {
+  var name = ($('preset-name-input').value || '').trim();
   if (!name) return;
+  closeModal('preset-modal');
   var list = getPresets();
   list.push({ name: name, lte: Array.from(lteEnabled), nr: Array.from(nrEnabled), savedAt: Date.now() });
   savePresets(list);
@@ -1154,6 +1341,7 @@ function loadPreset(i) {
   var p = getPresets()[i];
   if (!p) return;
   setBands(p.lte, p.nr);
+  userTouched = true;
   renderBands();
   updateSummary();
   switchTab('bands');
@@ -1181,7 +1369,7 @@ function exportConfig() {
   if (typeof window.ksu !== 'undefined') {
     // Manager WebView drops blob downloads — have the server write the
     // file on-device and toast the path instead.
-    fetch(API_EXPORT, {
+    apiFetch(API_EXPORT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -1239,6 +1427,152 @@ function onImportFile(file) {
   $('import-file').value = '';
 }
 
+/* ============ Settings: network access (LAN) ============ */
+function getStoredToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || null; }
+  catch (e) { return null; }
+}
+function setStoredToken(t) {
+  if (!t) return;
+  try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* ignore */ }
+}
+// Routes every API call through the bearer token when one is stored, and
+// surfaces 401s as a re-auth prompt instead of a generic failure.
+function apiFetch(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  var token = getStoredToken();
+  if (token) opts.headers.Authorization = 'Bearer ' + token;
+  return fetch(path, opts).then(function (r) {
+    if (r.status === 401) showReAuth();
+    return r;
+  });
+}
+
+var lanEnabled = false;   // server-side LAN setting, refreshed from /api/settings
+var lanTokenShown = false; // whether the stored token is unmasked in the UI
+
+function renderSettings(d) {
+  lanEnabled = !!d.lan_enabled;
+  $('lan-toggle').checked = lanEnabled;
+  var sec = $('lan-token-section');
+  sec.style.display = lanEnabled ? 'block' : 'none';
+  if (!lanEnabled) return;
+  var token = getStoredToken();
+  if (token) {
+    $('lan-token-entry').style.display = 'none';
+    renderTokenDisplay(token);
+  } else {
+    $('lan-token-show').style.display = 'none';
+    $('lan-token').textContent = '';
+    $('lan-token-entry').style.display = 'flex';
+  }
+}
+function renderTokenDisplay(token) {
+  $('lan-token').textContent = lanTokenShown ? token : token.slice(0, 6) + '\u2026';
+  $('lan-token-show').textContent = lanTokenShown ? 'Hide' : 'Show';
+  $('lan-token-show').style.display = 'inline-block';
+}
+function toggleTokenShown() {
+  lanTokenShown = !lanTokenShown;
+  var token = getStoredToken();
+  if (token) renderTokenDisplay(token);
+}
+function showReAuth() {
+  var entry = $('lan-token-entry');
+  var wasVisible = entry && entry.style.display !== 'none';
+  var sec = $('lan-token-section');
+  if (sec) sec.style.display = 'block';
+  if (entry) entry.style.display = 'flex';
+  var show = $('lan-token-show');
+  if (show) show.style.display = 'none';
+  var tok = $('lan-token');
+  if (tok) tok.textContent = '';
+  if (!wasVisible) toast('Token required — enter it below', true);
+}
+function saveLanToken() {
+  var val = $('lan-token-input').value.trim();
+  if (!val) { toast('Paste the access token first', true); return; }
+  setStoredToken(val);
+  $('lan-token-input').value = '';
+  lanTokenShown = false;
+  renderTokenDisplay(val);
+  // The page may have stopped polling on the pre-token 401s — resume now.
+  if (serverDownReported) {
+    serverDownReported = false;
+    hideBanner();
+  }
+  startPolling();
+  toast('Token saved');
+}
+// Best-effort: never blocks init; on failure leave the panel at its last state.
+function fetchSettings() {
+  apiFetch(API_SETTINGS).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (d) {
+    renderSettings(d);
+  }).catch(function () {
+    // 401s are already surfaced by apiFetch (showReAuth); network errors
+    // leave the panel untouched.
+  });
+}
+async function toggleLan() {
+  var checked = $('lan-toggle').checked;
+  try {
+    var r = await apiFetch(API_SETTINGS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lan_enabled: checked, regenerate: false })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (d.token) setStoredToken(d.token);
+    renderSettings(d);
+    toast('Network access changed — restart the server to apply');
+  } catch (e) {
+    toast('Failed to change network access: ' + e.message, true);
+  }
+}
+async function regenerateToken() {
+  try {
+    var r = await apiFetch(API_SETTINGS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lan_enabled: true, regenerate: true })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (d.token) setStoredToken(d.token);
+    renderSettings(d);
+    toast('New token generated');
+  } catch (e) {
+    toast('Failed to regenerate token: ' + e.message, true);
+  }
+}
+function sleep(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
+async function waitForHealth() {
+  var deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    try {
+      var r = await apiFetch(API_HEALTH);
+      if (r.ok) return true;
+    } catch (e) { /* server bouncing — retry */ }
+    await sleep(2000);
+  }
+  return false;
+}
+async function restartServer() {
+  try {
+    var r = await apiFetch(API_RESTART, { method: 'POST' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  } catch (e) {
+    // The server may already be tearing down — the health poll below decides.
+  }
+  var ok = await waitForHealth();
+  toast(ok ? 'Server restarted' : 'Server restarted — health check timed out', !ok);
+}
+
 /* ============ Summary ============ */
 function updateSummary() {
   $('sum-lte').textContent = lteEnabled.size;
@@ -1261,8 +1595,9 @@ function updateCarrierRow() {
 
 /* ============ Carrier-aware defaults ============ */
 // Best-effort: never blocks/blocks init; on failure keep the DEFAULT_* fallback.
+// Resolves true when carrier-aware defaults are in hand, false on failure.
 function fetchDefaults() {
-  fetch(API_DEFAULTS).then(function (r) {
+  return apiFetch(API_DEFAULTS).then(function (r) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).then(function (d) {
@@ -1270,8 +1605,10 @@ function fetchDefaults() {
     if (d.nr && d.nr.length) defaultsNr = d.nr.map(String);
     carrierInfo = d;
     updateCarrierRow();
+    return true;
   }).catch(function () {
     // server unreachable — keep DEFAULT_* fallback, carrier row stays "—"
+    return false;
   });
 }
 
@@ -1291,6 +1628,13 @@ function toast(msg, isErr) {
 function showBanner() { $('server-banner').style.display = 'block'; }
 function hideBanner() { $('server-banner').style.display = 'none'; }
 
+/* ============ In-page modals (WebView-safe) ============ */
+function openModal(id) { $(id).classList.add('open'); }
+function closeModal(id) { $(id).classList.remove('open'); }
+function closeModals() {
+  ['preset-modal', 'reset-modal'].forEach(function (id) { closeModal(id); });
+}
+
 /* ============ Delegated events ============ */
 document.addEventListener('click', function (e) {
   var tab = e.target.closest('.tabbar button[data-tab]');
@@ -1309,6 +1653,11 @@ document.addEventListener('keydown', function (e) {
     e.preventDefault();
     toggleBand(band.dataset.band, band.dataset.type);
   }
+  if (e.key === 'Escape') closeModals();
+  if (e.key === 'Enter' && $('preset-modal').classList.contains('open') && e.target === $('preset-name-input')) {
+    e.preventDefault();
+    confirmSavePreset();
+  }
 });
 
 /* ============ Init ============ */
@@ -1318,10 +1667,19 @@ function init() {
   $('refresh-btn').addEventListener('click', loadBands);
   $('retry-btn').addEventListener('click', retryConnect);
   $('modem-reset-btn').addEventListener('click', modemReset);
+  $('reset-modal-confirm').addEventListener('click', confirmModemReset);
+  $('reset-modal-cancel').addEventListener('click', function () { closeModal('reset-modal'); });
   $('preset-save-btn').addEventListener('click', savePreset);
+  $('preset-modal-save').addEventListener('click', confirmSavePreset);
+  $('preset-modal-cancel').addEventListener('click', function () { closeModal('preset-modal'); });
   $('export-btn').addEventListener('click', exportConfig);
   $('import-btn').addEventListener('click', function () { $('import-file').click(); });
   $('import-file').addEventListener('change', function () { onImportFile($('import-file').files[0]); });
+  $('lan-toggle').addEventListener('change', toggleLan);
+  $('lan-regenerate').addEventListener('click', regenerateToken);
+  $('lan-restart').addEventListener('click', restartServer);
+  $('lan-token-save').addEventListener('click', saveLanToken);
+  $('lan-token-show').addEventListener('click', toggleTokenShown);
   window.addEventListener('hashchange', onHash);
   window.addEventListener('resize', drawGraph);
 
@@ -1331,6 +1689,7 @@ function init() {
   loadBands();
   startPolling();
   fetchDefaults(); // parallel, best-effort; populates defaultsLte/NR + carrier row
+  fetchSettings(); // parallel, best-effort; populates LAN toggle + token state
 }
 
 init();

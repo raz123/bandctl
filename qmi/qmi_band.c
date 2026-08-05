@@ -313,6 +313,52 @@ static int probe_raw(int fd, uint32_t node, uint32_t port, uint16_t msg_id,
 	return 0;
 }
 
+/* Receive the QMI response matching (txn, msg_id) from node:port, skipping
+ * stray datagrams (late qrtr-ns NEW_SERVER/control packets, responses to
+ * earlier probes) until the right one arrives or a bounded timeout is hit.
+ * Mirrors probe_raw's stray-skipping loop but also validates the sender and
+ * the transaction handle so a stale datagram can never masquerade as our
+ * response. Returns response length (>0), 0 on timeout, <0 on error. */
+static int recv_response(int fd, uint32_t node, uint32_t port,
+			 uint16_t txn, uint16_t msg_id,
+			 unsigned char *rx, int rxmax, int timeout_ms)
+{
+	struct timespec start;
+	int elapsed = 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		struct pollfd pfd = {fd, POLLIN, 0};
+		struct sockaddr_qrtr from;
+		socklen_t flen = sizeof(from);
+		struct timespec now;
+		int ms, pr, n;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		elapsed = (int)((now.tv_sec - start.tv_sec) * 1000 +
+				(now.tv_nsec - start.tv_nsec) / 1000000);
+		ms = timeout_ms - elapsed;
+		if (ms <= 0)
+			return 0; /* bounded timeout */
+		if (ms > 200)
+			ms = 200; /* poll in slices so strays can't starve the deadline */
+		pr = poll(&pfd, 1, ms);
+		if (pr < 0)
+			return -1;
+		if (pr == 0)
+			return 0; /* no matching response within budget */
+		n = (int)recvfrom(fd, rx, rxmax, 0,
+				  (struct sockaddr *)&from, &flen);
+		if (n < 0)
+			return -1;
+		if (n >= 7 && rx[0] == 0x02 &&
+		    from.sq_node == node && from.sq_port == port &&
+		    le16(rx + 1) == txn && le16(rx + 3) == msg_id)
+			return n;
+		/* stray datagram: skip it and keep waiting */
+	}
+}
+
 /* Decode status/error from a response; returns -1 if no result TLV. */
 static int response_status(const unsigned char *rx, int n, uint16_t *err)
 {
@@ -449,7 +495,8 @@ static int send_get(int fd, uint32_t node, uint32_t port)
 		printf("sendto GET: %s\n", strerror(errno));
 		return 1;
 	}
-	ret = wait_recv(fd, rx, sizeof(rx), 5000);
+	ret = recv_response(fd, node, port, q.txn_id, q.msg_id,
+			    rx, sizeof(rx), 800);
 	if (ret <= 0) {
 		printf("GET response: %s\n", ret == 0 ? "timeout" : strerror(errno));
 		return 1;
@@ -480,7 +527,10 @@ static int send_set(int fd, uint32_t node, uint32_t port,
 		printf("sendto SET: %s\n", strerror(errno));
 		return 1;
 	}
-	ret = wait_recv(fd, rx, sizeof(rx), 5000);
+	ret = recv_response(fd, node, port,
+			    ((struct qmi_hdr *)msg)->txn_id,
+			    ((struct qmi_hdr *)msg)->msg_id,
+			    rx, sizeof(rx), 800);
 	if (ret <= 0) {
 		printf("SET response: %s\n", ret == 0 ? "timeout" : strerror(errno));
 		return 1;
