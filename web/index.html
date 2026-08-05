@@ -665,13 +665,6 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
     <div class="empty" id="preset-empty">No presets yet — save one to quickly restore a band configuration.</div>
   </div>
   <div class="section">
-    <h2>Auto-disable bands on boot</h2>
-    <div class="set-row">
-      <span>Disable unselected bands at boot <em>(applied on next boot)</em></span>
-      <label class="switch"><input type="checkbox" id="boot-toggle"><span class="slider"></span></label>
-    </div>
-  </div>
-  <div class="section">
     <h2>Export / Import</h2>
     <div class="btn-row">
       <button class="btn" id="export-btn">Export config (.json)</button>
@@ -705,7 +698,6 @@ var GRAPH_WINDOW_MS = 240 * 1000;
 var HISTORY_MAX = 200;
 
 var PRESETS_KEY = 'bandController.presets.v1';
-var BOOT_KEY = 'bandController.autoDisableBoot';
 
 /* ============ Band catalogs (existing visual language) ============ */
 var LTE_BANDS = [
@@ -840,7 +832,7 @@ async function saveBands() {
     var d = await r.json();
     if (d.ok) {
       source = d.source || source;
-      showStatus('Saved & applied (source: ' + source + '). Reboot to apply.', false);
+      showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
       // Confirm applied state by polling /api/read once
       try {
         var r2 = await fetch(API_READ);
@@ -1158,6 +1150,7 @@ function loadPreset(i) {
   setBands(p.lte, p.nr);
   renderBands();
   updateSummary();
+  switchTab('bands');
   toast('Preset "' + p.name + '" loaded — press Save & Apply to push');
 }
 function deletePreset(i) {
@@ -1170,15 +1163,7 @@ function deletePreset(i) {
   toast('Preset "' + name + '" deleted');
 }
 
-/* ============ Settings: boot toggle, export/import ============ */
-function bindBootToggle() {
-  var t = $('boot-toggle');
-  t.checked = localStorage.getItem(BOOT_KEY) === '1';
-  t.addEventListener('change', function () {
-    localStorage.setItem(BOOT_KEY, t.checked ? '1' : '0');
-    toast(t.checked ? 'Auto-disable enabled (applied on next boot)' : 'Auto-disable disabled');
-  });
-}
+/* ============ Settings: export/import ============ */
 
 function exportConfig() {
   var payload = {
@@ -1233,6 +1218,7 @@ function onImportFile(file) {
       setBands(lte, nr);
       renderBands();
       updateSummary();
+      switchTab('bands');
       toast('Config imported — ' + lte.length + ' LTE, ' + nr.length + ' NR bands. Press Save & Apply to push');
     } catch (e) {
       toast('Import failed: ' + e.message, true);
@@ -1303,7 +1289,6 @@ function init() {
   $('export-btn').addEventListener('click', exportConfig);
   $('import-btn').addEventListener('click', function () { $('import-file').click(); });
   $('import-file').addEventListener('change', function () { onImportFile($('import-file').files[0]); });
-  bindBootToggle();
   window.addEventListener('hashchange', onHash);
   window.addEventListener('resize', drawGraph);
 
