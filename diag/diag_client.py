@@ -91,6 +91,13 @@ class DiagClient:
         self.device_path = device
         self.timeout = timeout
         self.fd = None
+        # Reader-lifecycle state for the abandoned-reader fix: at most one
+        # in-flight os.read() per fd. _reader_lock serializes readers;
+        # _fd_dirty + _reader_thread mark a timed-out read whose daemon
+        # reader is still blocked on the fd (see _ensure_clean_reader).
+        self._reader_thread = None
+        self._fd_dirty = False
+        self._reader_lock = threading.Lock()
         self._open()
         try:
             self._create_md_session()
@@ -141,6 +148,8 @@ class DiagClient:
 
     def close(self):
         """Close the device; the kernel restores USB mode and frees the session."""
+        self._fd_dirty = False
+        self._reader_thread = None
         if self.fd is not None:
             try:
                 os.close(self.fd)
@@ -182,27 +191,77 @@ class DiagClient:
         select()/poll() cannot be used on /dev/diag: there is no .poll
         handler (diagchar_core.c:4391-4401), so they always report the fd
         as readable and read() still blocks. On timeout the daemon reader
-        thread is abandoned; it is released when the fd is closed.
+        thread is abandoned and the fd is marked dirty; the NEXT read
+        retires it (close+reopen, see _ensure_clean_reader) so a second
+        reader never races the abandoned one on the same fd for the
+        modem's delayed NV reply.
 
         Returns the bytes read, or None on timeout. Raises OSError on I/O
         failure.
         """
-        result = {}
+        with self._reader_lock:
+            self._ensure_clean_reader()
+            result = {}
 
-        def _reader():
-            try:
-                result['data'] = os.read(self.fd, 16384)
-            except BaseException as exc:  # OSError, KeyboardInterrupt, ...
-                result['error'] = exc
+            def _reader():
+                try:
+                    result['data'] = os.read(self.fd, 16384)
+                except BaseException as exc:  # OSError, KeyboardInterrupt, ...
+                    result['error'] = exc
 
-        thread = threading.Thread(target=_reader, daemon=True)
-        thread.start()
-        thread.join(timeout if timeout is not None else None)
-        if thread.is_alive():
-            return None  # timed out; daemon thread abandoned
-        if 'error' in result:
-            raise result['error']
-        return result['data']
+            thread = threading.Thread(target=_reader, daemon=True)
+            self._reader_thread = thread
+            thread.start()
+            thread.join(timeout if timeout is not None else None)
+            if thread.is_alive():
+                # Timed out: the daemon reader is still blocked in
+                # os.read() on this fd. Keep its reference and mark the fd
+                # dirty so the next read knows to close+reopen instead of
+                # spawning a second concurrent reader on the same fd.
+                self._fd_dirty = True
+                return None
+            self._reader_thread = None
+            if 'error' in result:
+                raise result['error']
+            return result['data']
+
+    def _ensure_clean_reader(self):
+        """Retire an abandoned reader before starting a new read.
+
+        A timed-out read leaves a daemon thread blocked in ``os.read()``
+        on the current fd. A second reader on the SAME fd would race it
+        for the modem's delayed NV reply: whichever thread loses the race
+        blocks again, and the reply is consumed by the abandoned thread's
+        unobserved result dict -- the caller sees None (the UI's empty
+        bands from an authoritative-looking 'diag' read).
+
+        Called (under ``_reader_lock``) before every read. When the fd is
+        dirty and the prior reader is still alive, the fd is closed and
+        reopened (fresh MD session): the new reader runs on a different
+        file description, so no read can block behind a hung modem for
+        more than one timeout. A prior reader that finished on its own
+        leaves the fd reusable.
+
+        Raises RuntimeError if the session cannot be re-created (e.g. the
+        modem diag session is now owned by another client).
+        """
+        if not self._fd_dirty:
+            return
+        self._fd_dirty = False
+        prior = self._reader_thread
+        self._reader_thread = None
+        if prior is None or not prior.is_alive():
+            return  # reader exited on its own; fd is clean, reuse it
+        # The abandoned reader is still blocked on the old file
+        # description. Retire it: close the fd, open a fresh one, and
+        # re-create the memory-device session on it.
+        self.close()
+        self._open()
+        try:
+            self._create_md_session()
+        except BaseException:
+            self.close()
+            raise
 
     def _drain_mask_notifications(self, timeout: Optional[float]) -> bytes:
         """Drain the 5 mask notifications queued by the kernel at open().
@@ -305,7 +364,10 @@ class DiagClient:
         response = self.read_response()
         if response is None:
             return None
-        return parse_nv_read_response(response)
+        # Echo-validate: a response carrying a DIFFERENT nv_id (e.g. the
+        # other band's reply surfacing via _scan_stream's fallback) must
+        # not be attributed to this request.
+        return parse_nv_read_response(response, nv_id, slot)
 
     def write_nv(self, nv_id: int, data: bytes, slot: int = 0) -> bool:
         """Write an NV item; True when the 0x3E echo reports status 0."""
@@ -314,7 +376,7 @@ class DiagClient:
         response = self.read_response()
         if response is None:
             return False
-        parsed = parse_nv_write_response(response)
+        parsed = parse_nv_write_response(response, nv_id, slot)
         return bool(parsed and parsed['success'])
 
     def get_band_config(self, slot: int = 0) -> dict:
@@ -359,13 +421,23 @@ class DiagClient:
 
 
 # Convenience functions
+# Serialize all /dev/diag session use: the MD session is exclusive per
+# client (DIAG_IOCTL_SWITCH_LOGGING fails if another client owns it), and
+# the threaded HTTP server would otherwise race concurrent read/write
+# calls (v2.4 hardening). External diag clients (NSG, Termux tools) are
+# outside this lock — contention with them surfaces as the session's own
+# clear error.
+_DIAG_LOCK = threading.Lock()
+
+
 def read_bands(device: str = "/dev/diag") -> dict:
     """Read the band configuration from the modem.
 
     Returns a dict with 'lte_bands' and 'nr_bands' lists.
     """
-    with DiagClient(device) as client:
-        return client.get_band_config()
+    with _DIAG_LOCK:
+        with DiagClient(device) as client:
+            return client.get_band_config()
 
 
 def write_bands(lte_bands: list, nr_bands: list, device: str = "/dev/diag") -> bool:
@@ -373,5 +445,6 @@ def write_bands(lte_bands: list, nr_bands: list, device: str = "/dev/diag") -> b
 
     Returns True if all writes succeeded.
     """
-    with DiagClient(device) as client:
-        return client.set_band_config(lte_bands, nr_bands)
+    with _DIAG_LOCK:
+        with DiagClient(device) as client:
+            return client.set_band_config(lte_bands, nr_bands)

@@ -421,13 +421,23 @@ class DiagClient:
 
 
 # Convenience functions
+# Serialize all /dev/diag session use: the MD session is exclusive per
+# client (DIAG_IOCTL_SWITCH_LOGGING fails if another client owns it), and
+# the threaded HTTP server would otherwise race concurrent read/write
+# calls (v2.4 hardening). External diag clients (NSG, Termux tools) are
+# outside this lock — contention with them surfaces as the session's own
+# clear error.
+_DIAG_LOCK = threading.Lock()
+
+
 def read_bands(device: str = "/dev/diag") -> dict:
     """Read the band configuration from the modem.
 
     Returns a dict with 'lte_bands' and 'nr_bands' lists.
     """
-    with DiagClient(device) as client:
-        return client.get_band_config()
+    with _DIAG_LOCK:
+        with DiagClient(device) as client:
+            return client.get_band_config()
 
 
 def write_bands(lte_bands: list, nr_bands: list, device: str = "/dev/diag") -> bool:
@@ -435,5 +445,6 @@ def write_bands(lte_bands: list, nr_bands: list, device: str = "/dev/diag") -> b
 
     Returns True if all writes succeeded.
     """
-    with DiagClient(device) as client:
-        return client.set_band_config(lte_bands, nr_bands)
+    with _DIAG_LOCK:
+        with DiagClient(device) as client:
+            return client.set_band_config(lte_bands, nr_bands)

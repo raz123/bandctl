@@ -408,6 +408,32 @@ def _cmd_available(service, subcommand):
         return False
 
 
+def _airplane_on():
+    """True when the persistent airplane-mode prop says the radio is off.
+
+    ponytail: getprop failing is treated as "off" (cleanup reports
+    success); the disable command failing is caught separately in
+    _disable_airplane, which is the path that matters for leaving
+    airplane mode stuck on."""
+    try:
+        return str(_get_prop("persist.radio.airplane_mode_on")).strip() == "1"
+    except Exception:
+        return False
+
+
+def _disable_airplane(attempts=3):
+    """Disable airplane mode and verify it took; retries. True when off."""
+    for _ in range(attempts):
+        try:
+            _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "disable"], timeout=10)
+        except Exception:
+            pass
+        time.sleep(1)
+        if not _airplane_on():
+            return True
+    return False
+
+
 def _parse_int(value):
     """Parse an int from a regex match group, or None."""
     try:
@@ -1295,19 +1321,29 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"Modem reset via radio power failed: {e}")
 
-        # Fallback: airplane-mode toggle
+        # Fallback: airplane-mode toggle. Airplane mode is ALWAYS turned
+        # back off with verification — a reset that leaves airplane mode on
+        # would silently kill all connectivity (v2.4 hardening). The
+        # enable/disable commands are separate, so even a mid-toggle
+        # exception still runs the cleanup before reporting.
         if _cmd_available("connectivity", "airplane-mode"):
             try:
                 _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "enable"], timeout=10)
                 time.sleep(3)
-                if _wait_for_radio_state("POWER_OFF"):
-                    _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "disable"], timeout=10)
+                powered_off = _wait_for_radio_state("POWER_OFF")
+                # Guaranteed cleanup: disable + verify, retried.
+                if not _disable_airplane():
+                    return {"ok": False,
+                            "error": "airplane mode left on after modem reset (disable failed)"}
+                if powered_off:
                     return {"ok": True}
-                # Cleanup: make sure airplane mode is not left on.
-                _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "disable"], timeout=10)
                 return {"ok": False, "error": "airplane-mode toggle did not power off the radio"}
             except Exception as e:
-                print(f"Modem reset via airplane mode failed: {e}")
+                # Mid-toggle failure: try to leave the radio on before
+                # reporting, so a stuck airplane mode is never silent.
+                if _airplane_on() and not _disable_airplane():
+                    return {"ok": False,
+                            "error": f"airplane mode left on after modem reset: {e}"}
                 return {"ok": False, "error": f"modem reset failed: {e}"}
 
         return {"ok": False, "error": "modem reset unavailable on this build"}

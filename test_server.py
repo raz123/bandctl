@@ -550,5 +550,72 @@ class TestStaticServing(unittest.TestCase):
             self.assertEqual(status, 404, path)
 
 
+class TestModemReset(unittest.TestCase):
+    """v2.4: the airplane-mode fallback must never leave airplane mode on.
+
+    Covers the guaranteed-cleanup contract: the radio-power path stays
+    airplane-free, the airplane path always disables (even when the toggle
+    fails mid-way), and a disable that cannot succeed is reported loudly
+    instead of silently leaving the radio off."""
+
+    def _reset(self):
+        h = make_handler('/api/modem-reset?action=modem-reset', 'POST')
+        h.handle_api()
+        raw = h.wfile.getvalue()
+        status = int(raw.split(b'\r\n', 1)[0].split()[1])
+        return status, json.loads(raw.split(b'\r\n\r\n', 1)[1])
+
+    def test_radio_power_path_no_airplane(self):
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'phone'), \
+             mock.patch.object(server, '_run_cmd') as run, \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True):
+            status, payload = self._reset()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['ok'])
+        cmds = [c.args[0][-1] for c in run.call_args_list]
+        self.assertEqual(cmds, ['off', 'on'])
+
+    def test_airplane_path_success_disables_and_verifies(self):
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'connectivity'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_disable_airplane',
+                               return_value=True) as disable:
+            status, payload = self._reset()
+        self.assertTrue(payload['ok'])
+        disable.assert_called_once()
+
+    def test_airplane_mid_toggle_failure_still_cleans_up(self):
+        def boom(cmd, timeout=None):
+            if 'enable' in cmd:
+                raise RuntimeError('enable crashed')
+            return ''
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'connectivity'), \
+             mock.patch.object(server, '_run_cmd', side_effect=boom), \
+             mock.patch.object(server, '_airplane_on', return_value=True), \
+             mock.patch.object(server, '_disable_airplane',
+                               return_value=True) as disable:
+            status, payload = self._reset()
+        self.assertFalse(payload['ok'])
+        disable.assert_called_once()
+
+    def test_airplane_left_on_reported_loudly(self):
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'connectivity'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_disable_airplane',
+                               return_value=False):
+            status, payload = self._reset()
+        self.assertFalse(payload['ok'])
+        self.assertIn('airplane mode left on', payload['error'])
+
+
 if __name__ == '__main__':
     unittest.main()
