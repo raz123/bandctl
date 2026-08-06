@@ -100,13 +100,6 @@ LTE bands **7 and 66 are intentionally disabled** — a community-validated fix 
 - Server tests: **64/64 passing**; diag protocol tests: **2/2 passing** (`python3 test_server.py` / `python3 test_diag_client.py`).
 - The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), and `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot).
 
-## Changelog
-
-- **v2.5** — Settings > Debug: drop-logging toggle. A server-side watchdog stamps radio drops (registration, call state, Wi-Fi, data counters, radio tail) to `config/drop_log/` and records recovery duration; survives reboot, no extra daemons.
-- **v2.4** — Modem reset hardening (the airplane-mode fallback now always verifies airplane mode is off afterwards); diag client serialized against concurrent MD-session races.
-- **v2.3** — UI: in-page preset/reset modals (no native dialogs), in-progress selection protection, awaited carrier defaults; QMI receive hardening; server-side config seeding (replaces the unreliable installer-time seed).
-- **v2.2** — LAN access (opt-in, token-gated, loopback default); server hardening (input validation, atomic config writes, boot-apply fixes).
-
 ## License
 
 [MIT](LICENSE) © 2026.
