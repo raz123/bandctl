@@ -768,6 +768,15 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
       <div class="hint">Restarting the server is needed for the change to take effect.</div>
       <div class="hint">LAN mode protects the API with the token above; the phone itself never needs it.</div>
     </div>
+    <h2>Debug</h2>
+    <div class="set-row">
+      <span>Drop logging — snapshot radio drops (registration, Wi-Fi, data) to the module config dir</span>
+      <label class="switch">
+        <input type="checkbox" id="drop-log-toggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="hint" id="drop-log-note">Disabled.</div>
   </div>
 </div>
 
@@ -814,6 +823,7 @@ var API_EXPORT = API_BASE + '/api/export?action=export';
 var API_DEFAULTS = API_BASE + '/api/defaults?action=defaults';
 var API_CAMPING = API_BASE + '/api/band-camping?action=band-camping';
 var API_SETTINGS = API_BASE + '/api/settings?action=settings';
+var API_DROP_LOG = API_BASE + '/api/drop-log?action=drop-log';
 var API_RESTART = API_BASE + '/api/restart?action=restart';
 var API_HEALTH = API_BASE + '/api/health?action=health';
 
@@ -1517,6 +1527,49 @@ function fetchSettings() {
     // leave the panel untouched.
   });
 }
+
+/* ============ Settings: Debug (drop logger) ============ */
+function renderDropLog(d) {
+  var toggle = $('drop-log-toggle');
+  if (!toggle) return;
+  toggle.checked = !!d.enabled;
+  var note = $('drop-log-note');
+  if (d.enabled) {
+    var n = (d.files || []).length;
+    note.textContent = 'Logging drops to ' + (d.dir || 'config/drop_log') +
+      (n ? ' — ' + n + ' snapshot' + (n === 1 ? '' : 's') : '');
+  } else {
+    note.textContent = 'Disabled — no snapshots are taken.';
+  }
+}
+function fetchDropLog() {
+  apiFetch(API_DROP_LOG).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (d) {
+    if (d.ok) renderDropLog(d);
+  }).catch(function () {
+    // best-effort; the panel stays on its last state
+  });
+}
+function toggleDropLog() {
+  var checked = $('drop-log-toggle').checked;
+  apiFetch(API_DROP_LOG, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: checked })
+  }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (d) {
+    if (!d.ok) throw new Error(d.error || 'failed');
+    renderDropLog(d);
+    toast(checked ? 'Drop logging enabled' : 'Drop logging disabled');
+  }).catch(function (e) {
+    toast('Failed to change drop logging: ' + e.message, true);
+    fetchDropLog(); // resync the toggle
+  });
+}
 async function toggleLan() {
   var checked = $('lan-toggle').checked;
   try {
@@ -1680,6 +1733,7 @@ function init() {
   $('lan-restart').addEventListener('click', restartServer);
   $('lan-token-save').addEventListener('click', saveLanToken);
   $('lan-token-show').addEventListener('click', toggleTokenShown);
+  $('drop-log-toggle').addEventListener('change', toggleDropLog);
   window.addEventListener('hashchange', onHash);
   window.addEventListener('resize', drawGraph);
 
@@ -1690,6 +1744,7 @@ function init() {
   startPolling();
   fetchDefaults(); // parallel, best-effort; populates defaultsLte/NR + carrier row
   fetchSettings(); // parallel, best-effort; populates LAN toggle + token state
+  fetchDropLog(); // parallel, best-effort; populates the Debug drop-logging toggle
 }
 
 init();

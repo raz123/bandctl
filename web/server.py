@@ -143,7 +143,7 @@ DIAG_DEVICE = "/dev/diag"
 # (127.0.0.1 = local-only, 0.0.0.0 = LAN); the token gates /api/* from
 # non-loopback clients while LAN is enabled.
 SETTINGS_FILE = MODDIR / "config" / "settings.json"
-DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None}
+DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None, "drop_log": False}
 
 # Serialize config/settings writes so concurrent saves cannot interleave
 # (each save is temp-file + os.replace, atomic per write).
@@ -168,6 +168,8 @@ def _load_settings():
             settings["bind"] = data["bind"]
         token = data.get("token")
         settings["token"] = token if isinstance(token, str) and token else None
+        if isinstance(data.get("drop_log"), bool):
+            settings["drop_log"] = data["drop_log"]
     except (OSError, ValueError):
         pass
     return settings
@@ -238,6 +240,176 @@ EXPORT_DIR = MODDIR / "config"
 # validated offline (does the modem ever camp on a banned band?).
 BAND_CAMPING_LOG = MODDIR / "config" / "band_camping.log"
 BAND_CAMPING_INTERVAL = 5
+
+# v2.5 drop logger: when enabled (Settings > Debug > Drop logging), a
+# daemon watchdog stamps every radio drop (OUT_OF_SERVICE / POWER_OFF /
+# EMERGENCY_ONLY) with correlation context — registration, call state,
+# wifi link/AP, data counters, radio-buffer tail — and records the
+# recovery duration. Snapshots go to config/drop_log/ (module config dir,
+# survives reboot; the logger itself survives reboot because the server
+# starts at boot and re-reads the persisted setting).
+DROP_LOG_DIR = MODDIR / "config" / "drop_log"
+DROP_POLL_INTERVAL = 10
+DROP_SNAP_GAP = 60  # min seconds between snapshots of one episode
+
+
+class _DropWatch(object):
+    """Drop-state tracking shared with the watchdog thread: episode
+    bookkeeping (in-drop flag, start time, snapshot path) is kept in one
+    place so the API can report the current state."""
+
+    def __init__(self):
+        self.in_drop = False
+        self.drop_start = None
+        self.episode_file = None
+        self.lock = threading.Lock()
+
+
+_DROP_WATCH = _DropWatch()
+
+
+def _read_sys(path):
+    """Read a small sysfs file, or None on failure."""
+    try:
+        with open(path, 'r') as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _wifi_status():
+    """Short wifi link summary: cmd wifi status head + wlan0 inet line."""
+    try:
+        out = _run_cmd(["/system/bin/cmd", "wifi", "status"], timeout=5)
+        first = [ln.strip() for ln in out.splitlines() if ln.strip()][:3]
+        ip = _run_cmd(["/system/bin/ip", "-4", "addr", "show", "wlan0"],
+                      timeout=5)
+        wlan = [ln.strip() for ln in ip.splitlines() if "inet" in ln][:1]
+        return " | ".join(first + wlan) or "unknown"
+    except Exception as e:
+        return "error: {}".format(e)
+
+
+def _net_counters():
+    """rx/tx byte counters for the cellular + wifi interfaces."""
+    out = []
+    for iface in ("rmnet_data0", "rmnet0", "wwan0", "wlan0"):
+        rx = _read_sys("/sys/class/net/{}/statistics/rx_bytes".format(iface))
+        tx = _read_sys("/sys/class/net/{}/statistics/tx_bytes".format(iface))
+        if rx is not None:
+            out.append("{} rx={} tx={}".format(iface, rx, tx))
+    return "; ".join(out) or "none"
+
+
+def _call_state():
+    """mCallState from telephony.registry (0 idle, 1 ringing, 2 off-hook)."""
+    try:
+        text = _run_dumpsys("telephony.registry")
+        for line in text.splitlines():
+            if line.lstrip().startswith("mCallState="):
+                return line.split("mCallState=", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _drop_state():
+    """Parsed registration dict, or None when dumpsys/parse fails."""
+    try:
+        return _parse_registration(_run_dumpsys("telephony.registry"))
+    except Exception:
+        return None
+
+
+def _drop_snapshot_text(reg):
+    """Correlation context for a drop: registration, call state, wifi,
+    counters, and the last PHONE0 radio-buffer lines."""
+    lines = ["registration: {}".format(json.dumps(reg))]
+    call = _call_state()
+    if call is not None:
+        lines.append("call_state: {}".format(call))
+    lines.append("wifi: {}".format(_wifi_status()))
+    lines.append("counters: {}".format(_net_counters()))
+    try:
+        tail = _run_cmd(["/system/bin/logcat", "-b", "radio", "-d",
+                         "-v", "threadtime", "-t", "300"], timeout=5)
+        ph0 = [ln for ln in tail.splitlines() if "PHONE0" in ln][-40:]
+        if ph0:
+            lines.append("radio tail (PHONE0, last {}):".format(len(ph0)))
+            lines.extend(ph0)
+        else:
+            lines.append("radio tail: (no PHONE0 lines)")
+    except Exception as e:
+        lines.append("radio tail unavailable: {}".format(e))
+    return "\n".join(lines) + "\n"
+
+
+def _drop_log_loop():
+    """Watchdog (daemon): while drop_log is enabled, watch the radio
+    registration. On a drop, write a context snapshot to config/drop_log/
+    and append the recovery duration to the same file. Live-toggles with
+    the SETTINGS flag (no restart needed). Never raises."""
+    w = _DROP_WATCH
+    while True:
+        try:
+            if not SETTINGS.get("drop_log"):
+                with w.lock:
+                    w.in_drop = False
+                    w.drop_start = None
+                    w.episode_file = None
+                time.sleep(5)
+                continue
+            reg = _drop_state()
+            state = (reg or {}).get("service_state")
+            now = time.time()
+            if state in ("POWER_OFF", "OUT_OF_SERVICE", "EMERGENCY_ONLY"):
+                with w.lock:
+                    if not w.in_drop:
+                        w.in_drop = True
+                        w.drop_start = now
+                        os.makedirs(DROP_LOG_DIR, exist_ok=True)
+                        w.episode_file = DROP_LOG_DIR / "drop_{}.txt".format(
+                            time.strftime("%Y%m%d_%H%M%S"))
+                    elif now - w.drop_start >= DROP_SNAP_GAP:
+                        # Long episode: refresh the snapshot so the tail
+                        # stays relevant.
+                        w.episode_file = DROP_LOG_DIR / "drop_{}.txt".format(
+                            time.strftime("%Y%m%d_%H%M%S"))
+                    if w.episode_file and not w.episode_file.exists():
+                        with open(w.episode_file, 'w') as f:
+                            f.write("=== DROP DETECTED {} ===\n".format(
+                                time.strftime("%Y-%m-%d %H:%M:%S")))
+                            f.write(_drop_snapshot_text(reg))
+                time.sleep(DROP_POLL_INTERVAL)
+            else:
+                with w.lock:
+                    if w.in_drop:
+                        duration = (now - w.drop_start) if w.drop_start else 0
+                        path = w.episode_file
+                        w.in_drop = False
+                        w.drop_start = None
+                        w.episode_file = None
+                        if path:
+                            with open(path, 'a') as f:
+                                f.write("=== RECOVERED {} (duration {}s) ===\n".format(
+                                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    int(duration)))
+                            print("Drop episode recorded: {} ({}s)".format(
+                                path, int(duration)))
+                time.sleep(DROP_POLL_INTERVAL)
+        except Exception as e:
+            print("Drop logger failed: {}".format(e))
+            time.sleep(DROP_POLL_INTERVAL)
+
+
+def _drop_log_files():
+    """Snapshot filenames in config/drop_log, newest first."""
+    try:
+        if not os.path.isdir(DROP_LOG_DIR):
+            return []
+        return sorted(os.listdir(DROP_LOG_DIR), reverse=True)[:20]
+    except Exception:
+        return []
 
 # Plain ioctl number (include/linux/diagchar.h) - NOT _IO-encoded, same
 # convention as DIAG_IOCTL_SWITCH_LOGGING in diag_client.py.
@@ -927,6 +1099,11 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(self.modem_health())
             elif action == 'modem-reset':
                 self.send_json(self.modem_reset())
+            elif action == 'drop-log':
+                if self.command == 'POST':
+                    self.send_json(self.update_drop_log(self._read_json_body()))
+                else:
+                    self.send_json(self.read_drop_log())
             elif action == 'band-camping':
                 limit = 50
                 if '?' in self.path:
@@ -1274,6 +1451,33 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         parsed["timestamp"] = int(time.time() * 1000)
         return parsed
 
+    def read_drop_log(self):
+        """GET /api/drop-log — drop-logger state + snapshot files.
+
+        Returns the enabled flag, the snapshot dir, and the latest
+        snapshot filenames. Never raises."""
+        return {
+            "ok": True,
+            "enabled": bool(SETTINGS.get("drop_log")),
+            "dir": str(DROP_LOG_DIR),
+            "files": _drop_log_files(),
+        }
+
+    def update_drop_log(self, data):
+        """POST /api/drop-log — enable/disable the drop logger (v2.5).
+
+        The setting is persisted to settings.json and picked up live by
+        the watchdog thread (no restart needed)."""
+        try:
+            if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+                return {"ok": False, "error": "enabled must be a bool"}
+            SETTINGS["drop_log"] = data["enabled"]
+            _save_settings()
+            return {"ok": True, "enabled": data["enabled"],
+                    "dir": str(DROP_LOG_DIR)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def read_band_camping(self, limit=50):
         """Return the last `limit` lines of the band camping log as JSON.
 
@@ -1431,6 +1635,11 @@ if __name__ == '__main__':
     # metainstall staging). Runs here AND lazily in boot_apply so the
     # config_file read-fallback and the boot re-apply both see it.
     seed_config_if_absent()
+
+    # v2.5 drop logger (daemon): stamps radio drops with correlation
+    # context while Settings > Debug > Drop logging is enabled. The
+    # setting is live — the thread sleeps cheaply when disabled.
+    threading.Thread(target=_drop_log_loop, daemon=True).start()
 
     # Threaded: the 2s signal/registration polling (each dumpsys call takes
     # seconds on this device) must not starve other requests — a single-

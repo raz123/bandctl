@@ -84,30 +84,42 @@ class TestSettingsLoad(SettingsFileCase):
 
     def test_missing_file_defaults(self):
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": None})
+                         {"bind": "127.0.0.1", "token": None,
+                          "drop_log": False})
 
     def test_malformed_json_defaults(self):
         server.SETTINGS_FILE.write_text("{not json")
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": None})
+                         {"bind": "127.0.0.1", "token": None,
+                          "drop_log": False})
 
     def test_invalid_bind_falls_back_to_localhost(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "9.9.9.9", "token": "tok"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": "tok"})
+                         {"bind": "127.0.0.1", "token": "tok",
+                          "drop_log": False})
 
     def test_invalid_token_normalized_to_null(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0", "token": 12345}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "0.0.0.0", "token": None})
+                         {"bind": "0.0.0.0", "token": None,
+                          "drop_log": False})
 
     def test_load_persisted_values(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0", "token": "tok"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "0.0.0.0", "token": "tok"})
+                         {"bind": "0.0.0.0", "token": "tok",
+                          "drop_log": False})
+
+    def test_load_persisted_drop_log(self):
+        server.SETTINGS_FILE.write_text(
+            json.dumps({"bind": "127.0.0.1", "drop_log": True}))
+        loaded = server._load_settings()
+        self.assertTrue(loaded["drop_log"])
+        self.assertEqual(loaded["bind"], "127.0.0.1")
 
 
 class TestSettingsSave(SettingsFileCase):
@@ -615,6 +627,80 @@ class TestModemReset(unittest.TestCase):
             status, payload = self._reset()
         self.assertFalse(payload['ok'])
         self.assertIn('airplane mode left on', payload['error'])
+
+
+class TestDropLog(unittest.TestCase):
+    """v2.5: the debug drop logger — API toggle + watchdog pieces."""
+
+    def setUp(self):
+        self._orig = server.SETTINGS.get("drop_log")
+        server.SETTINGS["drop_log"] = False
+
+    def tearDown(self):
+        server.SETTINGS["drop_log"] = self._orig
+
+    def _get(self):
+        return run_api('/api/drop-log?action=drop-log')
+
+    def _post(self, enabled):
+        body = json.dumps({'enabled': enabled}).encode()
+        return run_api('/api/drop-log?action=drop-log', 'POST',
+                       headers=FakeHeaders(
+                           {'Content-Length': str(len(body))}),
+                       body=body)
+
+    def test_get_default_disabled(self):
+        with mock.patch.object(server, '_save_settings'):
+            status, payload = self._get()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['ok'])
+        self.assertFalse(payload['enabled'])
+        self.assertIn('drop_log', payload['dir'])
+
+    def test_post_toggles_and_persists(self):
+        with mock.patch.object(server, '_save_settings') as save:
+            status, payload = self._post(True)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['enabled'])
+        self.assertTrue(server.SETTINGS['drop_log'])
+        save.assert_called_once()
+        with mock.patch.object(server, '_save_settings'):
+            status, payload = self._post(False)
+        self.assertFalse(server.SETTINGS['drop_log'])
+
+    def test_post_rejects_non_bool(self):
+        with mock.patch.object(server, '_save_settings'):
+            status, payload = run_api(
+                '/api/drop-log?action=drop-log', 'POST',
+                body=json.dumps({'enabled': 'yes'}).encode())
+        self.assertEqual(status, 200)
+        self.assertFalse(payload['ok'])
+
+    def test_drop_state_detects_power_off(self):
+        fake = "mServiceState={mVoiceRegState=3(POWER_OFF), " \
+               "mDataRegState=3(POWER_OFF), mOperatorAlphaLong=null}\n"
+        with mock.patch.object(server, '_run_dumpsys', return_value=fake):
+            reg = server._drop_state()
+        self.assertEqual(reg['service_state'], 'POWER_OFF')
+
+    def test_snapshot_text_includes_context(self):
+        with mock.patch.object(server, '_run_dumpsys',
+                               return_value="mServiceState={mVoiceRegState=1(OUT_OF_SERVICE)}\nmCallState=0\n"), \
+             mock.patch.object(server, '_run_cmd',
+                               side_effect=lambda args, timeout=None:
+                               'Wifi is enabled\n' if 'wifi' in args
+                               else 'inet 192.168.8.1/24\n'
+                               if 'addr' in args
+                               else '08-05 15:43:43 PHONE0 REG_HOME\n'), \
+             mock.patch.object(server, '_read_sys',
+                               side_effect=lambda p: '123' if 'wlan0' in p
+                               else None):
+            text = server._drop_snapshot_text({'service_state': 'OUT_OF_SERVICE'})
+        self.assertIn('OUT_OF_SERVICE', text)
+        self.assertIn('call_state: 0', text)
+        self.assertIn('wifi: Wifi is enabled', text)
+        self.assertIn('counters:', text)
+        self.assertIn('radio tail', text)
 
 
 if __name__ == '__main__':
