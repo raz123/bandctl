@@ -36,12 +36,12 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 <p align="center">
   <img src="settings.png" alt="Settings tab" width="180" />
   <br />
-  <em>Settings tab — config summary, presets, export/import, network access</em>
+  <em>Settings tab — config summary, presets, export/import, network access, debug drop logging</em>
 </p>
 
 ## Features
 
-- **12 API endpoints**:
+- **13 API endpoints**:
   - `GET  /api/read` — current LTE/NR band configuration (from QMI, diag, config file, or default)
   - `POST /api/write` — write LTE/NR band configuration to the modem (QMI first, diag fallback)
   - `GET  /api/defaults` — carrier-aware defaults (Rogers 302720 curated, others unrestricted)
@@ -54,7 +54,9 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
   - `GET  /api/health` — transport status (QMI or diag, band counts, diag session owner)
   - `POST /api/modem-reset` — soft modem reset (`cmd phone radio power` off/on, with fallback)
   - `GET  /api/band-camping` — live band-camping log: last N serving-cell EARFCN/band samples
+  - `GET/POST /api/drop-log` — debug drop logging: enable/disable the watchdog, list recorded drop snapshots
 - **Live band-camping readout** — the Diagnostics tab shows the current camped band (band + EARFCN) live, so you can see whether a forced band actually stuck.
+- **Debug drop logging** — Settings > Debug > Drop logging (default off): when enabled, a server-side watchdog stamps every radio drop (OUT_OF_SERVICE / POWER_OFF / EMERGENCY_ONLY) with correlation context — registration state, call state, Wi-Fi link/AP, data counters, radio-buffer tail — and records the recovery duration. Snapshots land in `config/drop_log/` and survive reboots; the toggle is live, no restart needed.
 - **Boot-time band re-apply** — the persisted config is re-applied automatically at every boot (pre-unlock, no app needed); config-file absent = no-op.
 - **Carrier-aware defaults** — Rogers (302720) gets a curated whitelist; other carriers get unrestricted defaults until you lock bands.
 - **RSRP graph UI** — the web UI plots signal strength over time.
@@ -81,7 +83,7 @@ By default the server listens on **127.0.0.1 only** — reachable from the phone
 
 ## Band configuration
 
-Default config on Rogers (MCC/MNC 302720), seeded at install (`config/bands.json`):
+Default config on Rogers (MCC/MNC 302720), seeded automatically by the server on first boot (`config/bands.json`):
 
 ```json
 {
@@ -95,8 +97,15 @@ LTE bands **7 and 66 are intentionally disabled** — a community-validated fix 
 ## Development / testing
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
-- Protocol tests: **27/27 passing**.
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), and `config/bands.json` (default band config).
+- Server tests: **64/64 passing**; diag protocol tests: **2/2 passing** (`python3 test_server.py` / `python3 test_diag_client.py`).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), and `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot).
+
+## Changelog
+
+- **v2.5** — Settings > Debug: drop-logging toggle. A server-side watchdog stamps radio drops (registration, call state, Wi-Fi, data counters, radio tail) to `config/drop_log/` and records recovery duration; survives reboot, no extra daemons.
+- **v2.4** — Modem reset hardening (the airplane-mode fallback now always verifies airplane mode is off afterwards); diag client serialized against concurrent MD-session races.
+- **v2.3** — UI: in-page preset/reset modals (no native dialogs), in-progress selection protection, awaited carrier defaults; QMI receive hardening; server-side config seeding (replaces the unreliable installer-time seed).
+- **v2.2** — LAN access (opt-in, token-gated, loopback default); server hardening (input validation, atomic config writes, boot-apply fixes).
 
 ## License
 
