@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="color-scheme" content="dark">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light">
 <title>Band Controller</title>
 <style>
 /* ============ DESIGN TOKENS ============ */
@@ -643,142 +644,438 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
     animation: none !important;
   }
 }
+
+/* ============ WHITE MOBILE INSTRUMENT SKIN ============ */
+:root {
+  --bg: #ffffff;
+  --surface: #f7faf9;
+  --surface-2: #eff8f6;
+  --line: #e3e9e7;
+  --line-strong: #cfdad6;
+  --ink: #111a24;
+  --ink-strong: #111a24;
+  --muted: #64707a;
+  --accent: #079eb3;
+  --accent-ink: #ffffff;
+  --success: #1b8d47;
+  --success-ink: #ffffff;
+  --danger: #d93f37;
+  --danger-ink: #d93f37;
+  --warn: #a96d09;
+  --warn-ink: #a96d09;
+  --focus: #079eb3;
+  --r-sm: 9px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --header-h: 78px;
+}
+
+html { min-width: 320px; background: #e8efec; }
+body {
+  width: min(100%, 430px);
+  max-width: none;
+  min-width: 320px;
+  margin: 0 auto;
+  padding: 0 0 calc(46px + env(safe-area-inset-bottom, 0px));
+  background: #e8efec;
+  color: var(--ink);
+  font-family: "Avenir Next", "Helvetica Neue", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+body > .app {
+  width: 100%;
+  min-height: 100vh;
+  overflow: hidden;
+  border: 1px solid #dfe8e4;
+  border-radius: 25px 25px 0 0;
+  background: var(--bg);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .12);
+}
+button, input { font: inherit; }
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  margin: 0;
+  padding: 22px 20px 20px;
+  border: 0;
+  background: var(--bg);
+}
+.brand-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.brand-row h1 { margin: 0; color: var(--ink); font-size: 24px; line-height: 1.05; letter-spacing: -.045em; }
+.brand-row p { margin: 7px 0 0; color: var(--muted); font-size: 13px; line-height: 1.2; }
+.wordmark, .subline { display: none; }
+.connection-line { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; margin-top: 5px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.live-dot { width: 9px; height: 9px; border-radius: 50%; background: #20a557; }
+.connection-line strong { color: var(--success); font-weight: 600; }
+.connection-line.offline .live-dot { background: var(--danger); }
+.connection-line.offline strong { color: var(--danger); }
+
+.tabbar {
+  position: sticky;
+  top: var(--header-h);
+  z-index: var(--z-sticky);
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin: 0;
+  border-top: 1px solid #eef3f1;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.tabbar-inner { display: contents; }
+.tabbar button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 54px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  transition: color .18s var(--ease), background .18s var(--ease);
+}
+.tab-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.tab-icon.gear-icon { width: 26px; height: 26px; stroke-width: 1.7; }
+.tabbar button::after { content: ""; position: absolute; right: 18px; bottom: -1px; left: 18px; height: 3px; transform: scaleX(0); border-radius: 3px 3px 0 0; background: var(--accent); transition: transform .2s var(--ease); }
+.tabbar button:hover { background: var(--surface); color: var(--ink); }
+.tabbar button.active { background: transparent; color: #087f91; font-weight: 600; }
+.tabbar button.active::after { transform: scaleX(1); }
+
+#server-banner {
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 11px 16px;
+  background: #fff0ee;
+  color: var(--danger);
+  text-align: left;
+  font-size: 11px;
+  line-height: 1.35;
+}
+#server-banner[style*="display: block"] { display: flex !important; }
+#server-banner button { min-height: 32px; margin-left: auto; padding: 5px 10px; border: 1px solid currentColor; border-radius: 8px; background: transparent; color: inherit; font-size: 11px; font-weight: 750; }
+
+.tab-panel { display: none; padding: 22px 20px 46px; }
+.tab-panel.active { display: block; animation: tabIn .22s var(--ease); }
+.section { margin: 0 0 25px; padding: 0; border: 0; border-radius: 0; background: transparent; }
+.section + .section { padding-top: 4px; }
+.section-head, .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0 0 13px; }
+.section-head h2, .section-heading h2 { margin: 0; font-size: 18px; line-height: 1.2; letter-spacing: -.025em; }
+.section-title { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+.section-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: var(--success); stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.9; }
+.section-heading .count, .section-head .count, .section-heading .meta, .canvas-meta { color: #087f91; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.section-heading .meta, .canvas-meta { color: var(--muted); font-weight: 500; }
+.hint { margin: -2px 0 11px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+
+.live-strip { display: grid; grid-template-columns: 1fr 1fr 1fr; margin-bottom: 20px; overflow: hidden; border: 1px solid #ccece8; border-radius: var(--r-lg); background: #eff8f6; }
+.live-strip div { min-width: 0; padding: 11px 10px; border-right: 1px solid #d7ece9; }
+.live-strip div:last-child { border-right: 0; }
+.live-strip span { display: block; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.live-strip strong { display: block; margin-top: 4px; overflow: hidden; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+.live-strip .good { color: var(--success); }
+
+.band-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.band { min-width: 0; min-height: 58px; padding: 8px 4px 7px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--muted); text-align: center; transition: transform .16s var(--ease), border-color .16s var(--ease), background .16s var(--ease), color .16s var(--ease); }
+.band:hover { transform: translateY(-1px); border-color: #9edee5; color: var(--ink); }
+.band.active { border-color: #a9e6eb; background: #e4f8fb; color: #087f91; }
+.band.active::after { top: 6px; right: 7px; width: 5px; height: 5px; background: #087f91; opacity: .55; }
+.band .name { display: block; color: currentColor; font-size: 14px; font-weight: 800; line-height: 1; }
+.band .freq { display: block; margin-top: 7px; color: currentColor; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; opacity: .72; }
+.band.active .name, .band.active .freq { color: currentColor; }
+
+.button-stack { display: grid; gap: 9px; margin-top: 20px; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.button-stack .btn-row { margin-top: 0; }
+.btn-row .btn { flex: 1 1 145px; margin-top: 0; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: auto; min-height: 48px; margin-top: 0; padding: 9px 13px; border: 1px solid transparent; border-radius: 10px; background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; transition: background .18s var(--ease), border-color .18s var(--ease), color .18s var(--ease), transform .18s var(--ease), opacity .18s var(--ease); }
+.btn.primary { width: 100%; }
+.btn:hover { transform: translateY(-1px); background: #087f91; }
+.btn:disabled, .btn.loading { cursor: wait; opacity: .65; transform: none; pointer-events: none; }
+.btn.ghost { border-color: var(--line); background: var(--bg); color: #087f91; }
+.btn.ghost:hover { background: #e4f8fb; border-color: #b6e5e9; }
+.btn.danger { border-color: #ffc7c3; background: #fff0ee; color: var(--danger); }
+.btn.danger:hover { background: #ffe3df; }
+.btn.danger-outline { border-color: var(--danger); background: var(--bg); color: var(--danger); }
+.btn.danger-outline:hover { background: #fff0ee; }
+.btn.small { min-height: 36px; padding: 7px 10px; border-radius: 8px; font-size: 12px; }
+.btn-icon { width: 20px; height: 20px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.button-with-icon { gap: 9px; }
+.status { display: none; margin-top: 10px; padding: 10px 12px; border-radius: 9px; background: #e9f6e8; color: var(--success); font-size: 11px; line-height: 1.4; }
+.status.ok, .status.err { display: block; }
+.status.err { background: #fff0ee; color: var(--danger); }
+
+.canvas-label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0 0 13px; }
+.canvas-label-row h2 { margin: 0; font-size: 18px; line-height: 1.2; letter-spacing: -.025em; }
+.canvas-wrap { position: relative; overflow: visible; border-radius: 0; background: var(--bg); }
+#signal-canvas { width: 100%; height: 184px; display: block; }
+.readouts { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 10px; overflow: visible; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; }
+.readout { min-width: 0; padding: 16px 7px 17px; border-right: 1px solid var(--line); background: transparent; text-align: center; }
+.readout:last-child { border-right: 0; }
+.readout .label { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: none; letter-spacing: 0; }
+.readout .value { margin-top: 5px; color: var(--ink); font-size: 23px; font-weight: 500; letter-spacing: -.03em; line-height: 1; white-space: nowrap; }
+.readout .unit { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1; }
+
+.chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.chip { min-width: 0; min-height: 70px; padding: 11px 10px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink); }
+.chip .state-chip-top { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+.chip .label { display: block; min-width: 0; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.chip .chipval { display: block; margin-top: 5px; overflow: hidden; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.state-icon { flex: 0 0 auto; width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.state-icon.check-icon circle { fill: transparent; stroke: var(--line-strong); }
+.state-icon.check-icon path { stroke: transparent; }
+.chip.good .state-icon.check-icon circle { fill: var(--success); stroke: var(--success); }
+.chip.good .state-icon.check-icon path, .chip.bad .state-icon.check-icon path { stroke: #fff; }
+.chip.bad .state-icon.check-icon circle { fill: var(--danger); stroke: var(--danger); }
+.state-icon.bars-icon { fill: currentColor; stroke: none; }
+.chip.good .state-icon, .chip.good .chipval { color: var(--success); }
+.chip.accent .state-icon, .chip.accent .chipval { color: #087f91; }
+.chip.selected { border-color: #a9e4eb; background: #f1fcfd; }
+.chip.amber { border-color: #f3dfaa; background: #fff4d6; }
+.chip.amber .chipval { color: #a96d09; }
+
+.camping-list, .hist { border-top: 1px solid var(--line); }
+.camping-row, .hist-item { display: grid; align-items: center; gap: 8px; padding: 12px 0; border-bottom: 1px solid #eef3f1; }
+.camping-row { grid-template-columns: 7px 57px minmax(0, 1fr) auto; }
+.camping-row:last-child, .hist-item:last-child { border-bottom: 0; }
+.camping-row .marker { width: 8px; height: 8px; border-radius: 50%; background: #c8d2cf; }
+.camping-row:first-child .marker { background: var(--accent); }
+.camping-row time, .hist-time { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-variant-numeric: tabular-nums; }
+.camping-row strong { min-width: 0; overflow: hidden; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.camping-row em { color: #087f91; font-size: 11px; font-style: normal; font-weight: 700; white-space: nowrap; }
+.hist { max-height: 280px; overflow-y: auto; margin-top: 4px; }
+.hist-item { grid-template-columns: 46px 70px minmax(0, 1fr); }
+.tag { display: inline-flex; justify-content: center; min-height: 24px; padding: 4px 5px; border-radius: 6px; background: #e9f6e8; color: var(--success); font-size: 10px; font-weight: 750; letter-spacing: 0; text-transform: uppercase; }
+.tag.DROP { background: #fff0ee; color: var(--danger); }
+.hist-text { min-width: 0; color: var(--ink); font-size: 11px; line-height: 1.35; }
+.modem-reset { width: 100%; min-height: 52px; margin-top: 16px !important; border-color: var(--danger); border-radius: 8px; background: var(--bg); color: var(--danger); font-size: 16px; font-weight: 650; }
+.modem-reset:hover { background: #fff0ee; }
+.modem-reset svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+
+.setting-list { border-top: 1px solid var(--line); }
+.set-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 47px; padding: 7px 0; border-bottom: 1px solid #eef3f1; font-size: 13px; }
+.set-row:last-child { border-bottom: 0; }
+.set-row > span:first-child { color: var(--muted); font-size: 13px; line-height: 1.35; }
+.set-row b { color: var(--ink); font-size: 13px; font-weight: 700; text-align: right; }
+.preset-item { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 7px; margin-top: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.preset-name { overflow: hidden; color: var(--ink); font-size: 11px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+.preset-count { overflow: hidden; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.empty { display: none; margin-top: 10px; padding: 11px 12px; border: 1px dashed #cfdad6; border-radius: 10px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.empty[style*="display: block"] { display: block !important; }
+.export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.export-grid .btn { min-width: 0; padding-inline: 8px; }
+.network-block { padding-top: 2px; }
+.network-row { align-items: flex-start; }
+.network-row > span:first-child { max-width: 280px; color: var(--ink); font-weight: 650; }
+.switch { position: relative; flex: 0 0 auto; width: 45px; height: 26px; }
+.switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.slider { position: absolute; inset: 0; border-radius: 999px; background: #dce5e2; transition: background .18s var(--ease); }
+.slider::before { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(17, 26, 36, .18); transition: transform .18s var(--ease); }
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(19px); }
+.network-details { display: none; margin-top: 5px; padding: 11px 0 0 12px; border-left: 2px solid #bce7ec; }
+.network-details[style*="display: block"] { display: block !important; }
+.token-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding-bottom: 10px; }
+.token-row label { color: var(--muted); font-size: 11px; }
+.token-code { min-width: 0; overflow: hidden; padding: 7px 8px; border-radius: 7px; background: var(--surface); color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.token-actions { display: flex; align-items: center; gap: 5px; }
+.icon-btn { display: inline-grid; width: 36px; min-height: 36px; padding: 0; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: #087f91; transition: background .18s var(--ease), border-color .18s var(--ease), transform .18s var(--ease); }
+.icon-btn:hover { transform: translateY(-1px); border-color: #b6e5e9; background: #e4f8fb; }
+.icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.network-details .btn-row { margin: 0 0 4px; }
+.network-details .hint { margin-top: 8px; }
+.subsection-title { margin: 20px 0 10px; color: var(--ink); font-size: 15px; letter-spacing: -.02em; }
+#drop-log-note { margin: 0; }
+
+#toast { right: 16px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); left: 16px; max-width: 398px; margin: 0 auto; padding: 11px 13px; border: 0; border-radius: 10px; background: #18252b; color: #fff; box-shadow: 0 12px 30px rgba(0,0,0,.2); font-size: 11px; line-height: 1.35; }
+#toast.err { background: var(--danger); color: #fff; }
+.modal-overlay { align-items: flex-end; padding: 16px; background: rgba(0,0,0,.25); }
+.modal { width: min(100%,398px); max-width: none; padding: 18px; border: 1px solid var(--line); border-radius: 18px; background: #fff; box-shadow: 0 20px 60px rgba(0,0,0,.2); }
+.modal h3 { margin: 0 0 8px; color: var(--ink); font-size: 17px; letter-spacing: -.025em; }
+.modal p { margin: 8px 0 14px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.modal input[type="text"] { min-height: 44px; margin-bottom: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--ink); font-size: 12px; }
+.modal .btn-row { margin-top: 12px; }
+
+@media (min-width: 640px) {
+  body { padding: 0 0 26px; }
+  body > .app { min-height: calc(100vh - 58px); border-radius: 25px; }
+}
+@media (max-width: 370px) {
+  .app-header { padding-inline: 15px; }
+  .brand-row { gap: 8px; }
+  .connection-line { font-size: 11px; }
+  .tab-panel { padding-inline: 15px; }
+  .band-grid { gap: 5px; }
+  .band { min-height: 54px; }
+  .readout .value { font-size: 20px; }
+  .camping-row { grid-template-columns: 7px 52px minmax(0,1fr) auto; }
+  .camping-row em { display: block; font-size: 9px; }
+}
 </style>
 </head>
 <body>
-
-<div id="server-banner">Server unreachable — polling paused. Polling resumes after a manual retry succeeds.<button id="retry-btn">Retry</button></div>
-<div id="toast"></div>
+<div class="app" id="app">
+<div id="server-banner" role="status"><span>Server unreachable — polling paused. Polling resumes after a manual retry succeeds.</span><button type="button" id="retry-btn">Retry</button></div>
 
 <header class="app-header">
-  <div class="wordmark">Band Controller</div>
-  <div class="subline">LTE/NR band control &middot; kernel module</div>
+  <div class="brand-row">
+    <div>
+      <h1>Band Controller</h1>
+      <p>LTE/NR band control &middot; kernel module</p>
+    </div>
+    <div class="connection-line" id="connection-line">
+      <span class="live-dot" aria-hidden="true"></span>
+      <strong id="connection-state">Connected</strong>
+    </div>
+  </div>
 </header>
 
-<div class="tabbar" role="tablist">
+<nav class="tabbar" role="tablist" aria-label="Band Controller sections">
   <div class="tabbar-inner">
-    <button id="tab-bands" data-tab="bands" class="active" role="tab" aria-selected="true" aria-controls="panel-bands">Bands</button>
-    <button id="tab-diag" data-tab="diag" role="tab" aria-selected="false" aria-controls="panel-diag">Diagnostics</button>
-    <button id="tab-settings" data-tab="settings" role="tab" aria-selected="false" aria-controls="panel-settings">Settings</button>
+    <button type="button" id="tab-bands" data-tab="bands" class="active" role="tab" aria-selected="true" aria-controls="panel-bands"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12"></path><circle cx="4" cy="6" r="1"></circle><circle cx="4" cy="12" r="1"></circle><circle cx="4" cy="18" r="1"></circle></svg><span>Bands</span></button>
+    <button type="button" id="tab-diag" data-tab="diag" role="tab" aria-selected="false" aria-controls="panel-diag"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 13h5l3-8 4 15 3-7h5"></path></svg><span>Diagnostics</span></button>
+    <button type="button" id="tab-settings" data-tab="settings" role="tab" aria-selected="false" aria-controls="panel-settings"><svg class="tab-icon gear-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.7 2.3 2.8-.2.7 2.7 2.5 1.4-1.4 2.5 1.4 2.5-2.5 1.4-.7 2.7-2.8-.2L12 21l-1.7-2.3-2.8.2-.7-2.7-2.5-1.4 1.4-2.5-1.4-2.5 2.5-1.4.7-2.7 2.8.2L12 3Z"></path><circle cx="12" cy="12" r="3.2"></circle></svg><span>Settings</span></button>
   </div>
-</div>
+</nav>
 
 <!-- ============ BAND MANAGEMENT ============ -->
 <div id="panel-bands" class="tab-panel active" role="tabpanel" aria-labelledby="tab-bands">
-  <div class="section">
-    <div class="section-head"><h2>LTE Bands</h2><span class="count" id="lte-count"></span></div>
+  <div class="live-strip" aria-label="Current modem state">
+    <div><span>Modem</span><strong class="good" id="band-live-service">Connected</strong></div>
+    <div><span>Serving</span><strong id="band-live-camped">—</strong></div>
+    <div><span>Staged</span><strong id="staged-count">0 LTE / 0 NR</strong></div>
+  </div>
+  <section class="section">
+    <div class="section-heading"><h2>LTE Bands</h2><span class="count" id="lte-count"></span></div>
     <div id="lte-bands" class="band-grid"></div>
-  </div>
-  <div class="section">
-    <div class="section-head"><h2>NR (5G) Bands</h2><span class="count" id="nr-count"></span></div>
+  </section>
+  <section class="section">
+    <div class="section-heading"><h2>NR (5G) Bands</h2><span class="count" id="nr-count"></span></div>
     <div id="nr-bands" class="band-grid"></div>
-  </div>
-  <div class="btn-row">
-    <button class="btn" id="save-btn">Save &amp; Apply</button>
-    <button class="btn ghost" id="reset-btn">Reset to defaults</button>
-  </div>
-  <div class="btn-row">
-    <button class="btn ghost" id="refresh-btn">Refresh from modem</button>
+  </section>
+  <div class="button-stack">
+    <button type="button" class="btn primary" id="save-btn">Save &amp; Apply</button>
+    <div class="btn-row">
+      <button type="button" class="btn ghost" id="reset-btn">Reset to defaults</button>
+      <button type="button" class="btn ghost" id="refresh-btn">Refresh from modem</button>
+    </div>
   </div>
   <div id="status" class="status"></div>
 </div>
 
 <!-- ============ DIAGNOSTICS ============ -->
 <div id="panel-diag" class="tab-panel" role="tabpanel" aria-labelledby="tab-diag">
-  <div class="section">
+  <section class="section">
     <div class="canvas-label-row">
       <h2>Signal — RSRP over time</h2>
       <span class="canvas-meta">Updated <span id="sig-time">—</span></span>
     </div>
     <div class="canvas-wrap"><canvas id="signal-canvas"></canvas></div>
     <div class="readouts">
-      <div class="readout"><div class="label">RSRP</div><div class="value" id="sig-rsrp">—</div></div>
-      <div class="readout"><div class="label">RSRQ</div><div class="value" id="sig-rsrq">—</div></div>
+      <div class="readout"><div class="label">RSRP</div><div class="value" id="sig-rsrp">—</div><span class="unit">dBm</span></div>
+      <div class="readout"><div class="label">RSRQ</div><div class="value" id="sig-rsrq">—</div><span class="unit">dB</span></div>
       <div class="readout"><div class="label">Tech</div><div class="value" id="sig-tech">—</div></div>
       <div class="readout"><div class="label">Level</div><div class="value" id="sig-level">—</div></div>
     </div>
-  </div>
-  <div class="section">
-    <h2>Registration</h2>
+  </section>
+  <section class="section">
+    <div class="section-heading"><h2>Registration</h2></div>
     <div class="chips" id="reg-chips">
-      <span class="chip" id="chip-svc"><b>Service</b><span class="chipval">—</span></span>
-      <span class="chip" id="chip-data"><b>Data</b><span class="chipval">—</span></span>
-      <span class="chip" id="chip-net"><b>Network</b><span class="chipval">—</span></span>
-      <span class="chip" id="chip-op"><b>Operator</b><span class="chipval">—</span></span>
-      <span class="chip" id="chip-roam"><b>Roaming</b><span class="chipval">—</span></span>
-      <span class="chip" id="chip-camped"><b>Camped</b><span class="chipval">—</span></span>
+      <div class="chip" id="chip-svc"><div class="state-chip-top"><span class="label">Service</span><svg class="state-icon check-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="m8 12 2.6 2.6L16.5 9"></path></svg></div><span class="chipval">—</span></div>
+      <div class="chip" id="chip-data"><div class="state-chip-top"><span class="label">Data</span><svg class="state-icon check-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="m8 12 2.6 2.6L16.5 9"></path></svg></div><span class="chipval">—</span></div>
+      <div class="chip" id="chip-net"><div class="state-chip-top"><span class="label">Network</span><svg class="state-icon bars-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h3v-5H4zM9 19h3v-8H9zM14 19h3V9h-3zM19 19h3V6h-3z"></path></svg></div><span class="chipval">—</span></div>
+      <div class="chip" id="chip-op"><div class="state-chip-top"><span class="label">Operator</span><svg class="state-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 20V5h10v15M6 9h10M9 7v1M13 7v1M9 12v1M13 12v1M9 16v1M13 16v1M16 8h3v12"></path></svg></div><span class="chipval">—</span></div>
+      <div class="chip" id="chip-roam"><div class="state-chip-top"><span class="label">Roaming</span><svg class="state-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 11 8-6 8 6v8H4zM9 19v-5h6v5"></path></svg></div><span class="chipval">—</span></div>
+      <div class="chip" id="chip-camped"><div class="state-chip-top"><span class="label">Camped</span><svg class="state-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V7M8 20h8M9 7a4 4 0 0 1 6 0M6 4a8 8 0 0 1 12 0"></path><circle cx="12" cy="4" r="1"></circle></svg></div><span class="chipval">—</span></div>
     </div>
-    <button class="btn danger" id="modem-reset-btn" style="margin-top:12px">Reset Modem</button>
-    <div class="hint">Camped band = the LTE cell your phone is listening to right now. If you ban a band and it camps there anyway, the ban didn't stick.</div>
-  </div>
-  <div class="section">
-    <h2>Event History</h2>
-    <div class="hint">Service/network state changes are tagged REG; drops (out-of-service or signal fetch failure) are tagged DROP.</div>
+  </section>
+  <section class="section">
+    <div class="section-heading"><h2>Band camping</h2><span class="meta">Last 5 samples · every 5s</span></div>
+    <div class="camping-list" id="camping-list" aria-label="Recent serving cell samples"></div>
+    <button type="button" class="btn modem-reset" id="modem-reset-btn"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13-6l2 2M20 12a8 8 0 0 1-13 6l-2-2"></path><path d="M19 4v4h-4M5 20v-4h4"></path></svg><span>Reset Modem</span></button>
+  </section>
+  <section class="section">
+    <div class="section-heading"><h2>Event History</h2></div>
     <div class="hist" id="history-list"></div>
-  </div>
+  </section>
 </div>
 
 <!-- ============ SETTINGS ============ -->
 <div id="panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings">
-  <div class="section">
-    <h2>Config Summary</h2>
-    <div class="set-row"><span>LTE bands</span><b id="sum-lte">0</b></div>
-    <div class="set-row"><span>NR bands</span><b id="sum-nr">0</b></div>
-    <div class="set-row"><span>Source</span><b id="sum-source">&mdash;</b></div>
-    <div class="set-row"><span>Carrier</span><b id="sum-carrier">&mdash;</b></div>
-  </div>
-  <div class="section">
-    <h2>Presets</h2>
-    <div class="btn-row">
-      <button class="btn" id="preset-save-btn">Save current as preset</button>
+  <section class="section">
+    <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="12" height="16" rx="2"></rect><path d="M9 5V3h6v2M9 11h6M9 15l1.5 1.5L13 14"></path></svg><span>Config Summary</span></h2><span class="meta">Applied</span></div>
+    <div class="setting-list">
+      <div class="set-row"><span>LTE bands</span><b id="sum-lte">0</b></div>
+      <div class="set-row"><span>NR bands</span><b id="sum-nr">0</b></div>
+      <div class="set-row"><span>Source</span><b id="sum-source">&mdash;</b></div>
+      <div class="set-row"><span>Carrier</span><b id="sum-carrier">&mdash;</b></div>
     </div>
+  </section>
+  <section class="section">
+    <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18l-6-4-6 4Z"></path></svg><span>Presets</span></h2></div>
+    <button type="button" class="btn primary" id="preset-save-btn">Save current as preset</button>
     <div id="preset-list"></div>
     <div class="empty" id="preset-empty">No presets yet — save one to quickly restore a band configuration.</div>
-  </div>
-  <div class="section">
-    <h2>Export / Import</h2>
-    <div class="btn-row">
-      <button class="btn" id="export-btn">Export config (.json)</button>
-      <button class="btn ghost" id="import-btn">Import config</button>
+  </section>
+  <section class="section">
+    <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10v10h14V10M12 15V3M8 7l4-4 4 4"></path></svg><span>Export / Import</span></h2></div>
+    <div class="export-grid">
+      <button type="button" class="btn ghost button-with-icon" id="export-btn"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10v10h14V10M12 15V3M8 7l4-4 4 4"></path></svg><span>Export config (.json)</span></button>
+      <button type="button" class="btn ghost button-with-icon" id="import-btn"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 14v7h14v-7M12 3v12M8 11l4 4 4-4"></path></svg><span>Import config</span></button>
     </div>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
-  </div>
-  <div class="section">
-    <h2>Network access</h2>
-    <div class="set-row">
+  </section>
+  <section class="section network-block">
+    <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9a14 14 0 0 1 18 0M6 13a9 9 0 0 1 12 0M9.5 17a4 4 0 0 1 5 0"></path><circle cx="12" cy="20" r="1"></circle></svg><span>Network access</span></h2></div>
+    <div class="set-row network-row">
       <span>Allow access from other devices on your network (LAN)</span>
-      <label class="switch">
+      <label class="switch" aria-label="Enable LAN access">
         <input type="checkbox" id="lan-toggle">
         <span class="slider"></span>
       </label>
     </div>
-    <div id="lan-token-section" style="display:none">
-      <div class="set-row">
-        <span>Access token</span>
-        <span class="lan-token-wrap"><b id="lan-token" class="lan-token-display"></b><button class="btn small ghost" id="lan-token-show" style="display:none">Show</button></span>
+    <div id="lan-token-section" class="network-details" style="display:none">
+      <div class="token-row">
+        <label for="lan-token">Access token</label>
+        <span id="lan-token" class="token-code"></span>
+        <div class="token-actions" id="token-actions" aria-label="Token actions" style="display:none">
+          <button class="icon-btn" type="button" id="token-copy" title="Copy access token" aria-label="Copy access token"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="10" height="11" rx="1.5"></rect><path d="M6 16H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>
+          <button class="icon-btn" type="button" id="token-share" title="Share access token" aria-label="Share access token"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2"></circle><circle cx="6" cy="12" r="2"></circle><circle cx="18" cy="19" r="2"></circle><path d="m8 11 8-5M8 13l8 5"></path></svg></button>
+          <button class="btn small ghost" type="button" id="lan-token-show" style="display:none">Show</button>
+        </div>
       </div>
       <div class="set-row" id="lan-token-entry" style="display:none">
         <input type="text" id="lan-token-input" placeholder="Paste the access token" autocomplete="off" spellcheck="false">
-        <button class="btn small" id="lan-token-save">Save token</button>
+        <button type="button" class="btn small" id="lan-token-save">Save token</button>
       </div>
       <div class="btn-row">
-        <button class="btn ghost" id="lan-regenerate">Regenerate token</button>
-        <button class="btn ghost" id="lan-restart">Restart server</button>
+        <button type="button" class="btn small ghost button-with-icon" id="lan-regenerate"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13-6l2 2M20 12a8 8 0 0 1-13 6l-2-2"></path><path d="M19 4v4h-4M5 20v-4h4"></path></svg><span>Regenerate token</span></button>
+        <button type="button" class="btn small danger-outline button-with-icon" id="lan-restart"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13-6l2 2M20 12a8 8 0 0 1-13 6l-2-2"></path><path d="M19 4v4h-4M5 20v-4h4"></path></svg><span>Restart server</span></button>
       </div>
       <div class="hint">Restarting the server is needed for the change to take effect.</div>
       <div class="hint">LAN mode protects the API with the token above; the phone itself never needs it.</div>
     </div>
-    <h2>Debug</h2>
-    <div class="set-row">
+    <h3 class="subsection-title">Debug</h3>
+    <div class="set-row network-row">
       <span>Drop logging — snapshot radio drops (registration, Wi-Fi, data) to the module config dir</span>
-      <label class="switch">
+      <label class="switch" aria-label="Enable drop logging">
         <input type="checkbox" id="drop-log-toggle">
         <span class="slider"></span>
       </label>
     </div>
-    <div class="hint" id="drop-log-note">Disabled.</div>
-  </div>
+    <div class="hint" id="drop-log-note">Disabled — no snapshots are taken.</div>
+  </section>
 </div>
+
+</div>
+
+<div id="toast"></div>
 
 <!-- ============ In-page modals (WebView-safe; no alert/confirm/prompt) ============ -->
 <div class="modal-overlay" id="preset-modal" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">
@@ -881,6 +1178,15 @@ function fmtClock() {
   return [d.getHours(), d.getMinutes(), d.getSeconds()].map(function (x) { return String(x).padStart(2, '0'); }).join(':');
 }
 function fmtTime(ts) { return new Date(ts).toLocaleTimeString(); }
+function setConnectionState(connected) {
+  var line = $('connection-line');
+  var label = $('connection-state');
+  var live = $('band-live-service');
+  if (line) line.classList.toggle('offline', !connected);
+  if (label) label.textContent = connected ? 'Connected' : 'Offline';
+  if (live) live.textContent = connected ? 'Connected' : 'Offline';
+  if (live) live.classList.toggle('good', connected);
+}
 
 /* ============ Tabs ============ */
 var TABS = ['bands', 'diag', 'settings'];
@@ -892,6 +1198,7 @@ function switchTab(name) {
     b.setAttribute('aria-selected', String(isActive));
   });
   if (name === 'diag') drawGraph();
+  window.scrollTo(0, 0);
 }
 function onHash() {
   var t = (location.hash || '#bands').slice(1);
@@ -902,6 +1209,7 @@ function onHash() {
 function renderBands() {
   renderGrid('lte-bands', LTE_BANDS, lteEnabled, 'lte');
   renderGrid('nr-bands', NR_BANDS, nrEnabled, 'nr');
+  updateSummary();
 }
 function renderGrid(elId, catalog, enabled, type) {
   var el = $(elId);
@@ -954,6 +1262,7 @@ async function loadBands() {
       serverDownReported = false;
       hideBanner();
     }
+    setConnectionState(true);
     startPolling();
     showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
     return true;
@@ -1048,6 +1357,7 @@ function serverDown(err) {
   if (serverDownReported) return;
   serverDownReported = true;
   stopPolling();
+  setConnectionState(false);
   showBanner();
   logDrop('Server unreachable — ' + (err && err.message ? err.message : String(err)));
 }
@@ -1084,11 +1394,12 @@ async function pollSignal() {
     var now = Date.now();
     signalHistory.push({ t: now, rsrp: (d.rsrp_dbm == null ? null : d.rsrp_dbm) });
     if (signalHistory.length > GRAPH_POINTS) signalHistory.shift();
-    $('sig-rsrp').textContent = d.rsrp_dbm == null ? '—' : d.rsrp_dbm + ' dBm';
-    $('sig-rsrq').textContent = d.rsrq_db == null ? '—' : d.rsrq_db + ' dB';
+    $('sig-rsrp').textContent = d.rsrp_dbm == null ? '—' : d.rsrp_dbm;
+    $('sig-rsrq').textContent = d.rsrq_db == null ? '—' : d.rsrq_db;
     $('sig-tech').textContent = d.tech || '—';
     $('sig-level').textContent = d.level == null ? '—' : String(d.level);
     $('sig-time').textContent = fmtTime(d.timestamp || now);
+    setConnectionState(true);
     drawGraph();
   } catch (e) {
     serverDown(e);
@@ -1102,6 +1413,7 @@ async function pollRegistration() {
     var d = await r.json();
     updateChips(d);
     checkRegChange(d);
+    setConnectionState(true);
   } catch (e) {
     serverDown(e);
   }
@@ -1111,24 +1423,64 @@ async function pollRegistration() {
 function setChip(id, txt, tone) {
   var el = $(id);
   el.querySelector('.chipval').textContent = txt;
-  el.classList.remove('good', 'bad', 'amber');
+  el.classList.remove('good', 'bad', 'amber', 'accent', 'selected');
   if (tone) el.classList.add(tone);
+  if (id === 'chip-camped' && txt !== '—') el.classList.add('selected');
 }
 var SVC_BAD = { POWER_OFF: 1, OUT_OF_SERVICE: 1, EMERGENCY_ONLY: 1, SERVICE_EMERGENCY: 1 };
 function updateChips(d) {
   var svc = d.service_state || '—';
   // Only explicit service-loss states are 'bad'; unknown/'—' stays neutral, never red.
   setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : (SVC_BAD[svc] ? 'bad' : null));
-  setChip('chip-data', d.data_state || '—');
-  setChip('chip-net', d.network_type || '—');
+  var data = d.data_state || '—';
+  setChip('chip-data', data, data === 'IN_SERVICE' ? 'good' : (SVC_BAD[data] ? 'bad' : null));
+  setChip('chip-net', d.network_type || '—', d.network_type ? 'accent' : null);
   setChip('chip-op', d.operator || '—');
-  setChip('chip-roam', d.roaming ? 'Roaming' : 'Home', d.roaming ? 'amber' : null);
+  setChip('chip-roam', d.roaming == null ? '—' : (d.roaming ? 'Roaming' : 'Home'), d.roaming ? 'amber' : null);
+}
+function fmtSampleTime(ts) {
+  if (ts == null) return '—';
+  return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+}
+function renderCamping(samples) {
+  var list = $('camping-list');
+  if (!list) return;
+  var recent = (samples || []).slice(-5).reverse();
+  list.innerHTML = '';
+  if (!recent.length) {
+    var empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.style.display = 'block';
+    empty.textContent = 'No serving-cell samples yet.';
+    list.appendChild(empty);
+    $('band-live-camped').textContent = '—';
+    return;
+  }
+  recent.forEach(function (sample, index) {
+    var row = document.createElement('div');
+    row.className = 'camping-row';
+    var marker = document.createElement('span');
+    marker.className = 'marker';
+    var time = document.createElement('time');
+    time.textContent = fmtSampleTime(sample.timestamp);
+    var cell = document.createElement('strong');
+    cell.textContent = sample.earfcn == null ? 'No LTE cell' :
+      (sample.band == null ? 'EARFCN ' + sample.earfcn : 'B' + sample.band + ' · EARFCN ' + sample.earfcn);
+    var serving = document.createElement('em');
+    serving.textContent = index === 0 ? 'Serving cell' : '';
+    row.append(marker, time, cell, serving);
+    list.appendChild(row);
+  });
+  var latest = recent[0];
+  $('band-live-camped').textContent = latest.earfcn == null ? '—' :
+    (latest.band == null ? 'EARFCN ' + latest.earfcn : 'B' + latest.band + ' · ' + latest.earfcn);
 }
 async function updateCamping() {
   try {
     var r = await apiFetch(API_CAMPING);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    renderCamping(d && d.samples ? d.samples : []);
     var s = (d && d.samples && d.samples.length) ? d.samples[d.samples.length - 1] : null;
     if (!s || s.earfcn === null || s.earfcn === undefined) {
       setChip('chip-camped', '—');
@@ -1167,8 +1519,8 @@ function logEntry(tag, text) {
   var txt = document.createElement('span');
   txt.className = 'hist-text';
   txt.textContent = text;
-  item.appendChild(time);
   item.appendChild(tagEl);
+  item.appendChild(time);
   item.appendChild(txt);
   list.insertBefore(item, list.firstChild);
   while (list.children.length > HISTORY_MAX) list.removeChild(list.lastChild);
@@ -1180,7 +1532,7 @@ function drawGraph() {
   var canvas = $('signal-canvas');
   var w = canvas.clientWidth;
   if (w === 0) return; // hidden tab
-  var h = 240;
+  var h = 184;
   var dpr = window.devicePixelRatio || 1;
   if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
     canvas.width = Math.round(w * dpr);
@@ -1194,7 +1546,7 @@ function drawGraph() {
   var pw = w - padL - padR, ph = h - padT - padB;
 
   // plot background
-  ctx.fillStyle = '#1d242e';
+  ctx.fillStyle = '#ffffff';
   ctx.fillRect(padL, padT, pw, ph);
 
   var now = Date.now();
@@ -1221,14 +1573,16 @@ function drawGraph() {
   ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
 
   // horizontal grid + Y labels
+  ctx.fillStyle = '#7a878d';
+  ctx.fillText('dBm', 2, 9);
   var TICKS = 4, i;
   for (i = 0; i <= TICKS; i++) {
     var v = yMin + (yMax - yMin) * i / TICKS;
     var yy = Y(v);
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.strokeStyle = '#dce8e5';
     ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke();
-    ctx.fillStyle = '#98a2b3';
-    ctx.fillText(Math.round(v) + ' dBm', 2, yy + 3);
+    ctx.fillStyle = '#7a878d';
+    ctx.fillText(Math.round(v), 2, yy + 3);
   }
 
   // vertical grid + X labels (relative seconds)
@@ -1236,15 +1590,15 @@ function drawGraph() {
     var tt = now - s * 1000;
     if (tt < tMin - 1000) continue;
     var xx = X(tt);
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.strokeStyle = '#dce8e5';
     ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, h - padB); ctx.stroke();
-    ctx.fillStyle = '#98a2b3';
+    ctx.fillStyle = '#7a878d';
     ctx.fillText(s === 0 ? 'now' : '-' + s + 's', xx - 10, h - 6);
   }
 
   if (vals.length) {
     // signal line with gaps on null values
-    ctx.strokeStyle = '#45c4e8';
+    ctx.strokeStyle = '#079eb3';
     ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
     ctx.beginPath();
@@ -1259,13 +1613,13 @@ function drawGraph() {
     // current-value dot
     var last = signalHistory[signalHistory.length - 1];
     if (last && last.rsrp != null) {
-      ctx.fillStyle = '#f5b544';
+      ctx.fillStyle = '#079eb3';
       ctx.beginPath();
       ctx.arc(X(last.t), Y(last.rsrp), 3.5, 0, Math.PI * 2);
       ctx.fill();
     }
   } else {
-    ctx.fillStyle = '#98a2b3';
+    ctx.fillStyle = '#7a878d';
     ctx.fillText('No signal data yet — waiting for /api/signal…', padL + 10, padT + ph / 2);
   }
 }
@@ -1473,6 +1827,7 @@ function renderSettings(d) {
     $('lan-token-entry').style.display = 'none';
     renderTokenDisplay(token);
   } else {
+    if ($('token-actions')) $('token-actions').style.display = 'none';
     $('lan-token-show').style.display = 'none';
     $('lan-token').textContent = '';
     $('lan-token-entry').style.display = 'flex';
@@ -1482,6 +1837,7 @@ function renderTokenDisplay(token) {
   $('lan-token').textContent = lanTokenShown ? token : token.slice(0, 6) + '\u2026';
   $('lan-token-show').textContent = lanTokenShown ? 'Hide' : 'Show';
   $('lan-token-show').style.display = 'inline-block';
+  if ($('token-actions')) $('token-actions').style.display = 'flex';
 }
 function toggleTokenShown() {
   lanTokenShown = !lanTokenShown;
@@ -1496,9 +1852,52 @@ function showReAuth() {
   if (entry) entry.style.display = 'flex';
   var show = $('lan-token-show');
   if (show) show.style.display = 'none';
+  if ($('token-actions')) $('token-actions').style.display = 'none';
   var tok = $('lan-token');
   if (tok) tok.textContent = '';
   if (!wasVisible) toast('Token required — enter it below', true);
+}
+function writeTokenToClipboard(token) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(token);
+  var field = document.createElement('textarea');
+  field.value = token;
+  field.setAttribute('readonly', '');
+  field.style.position = 'fixed';
+  field.style.opacity = '0';
+  document.body.appendChild(field);
+  field.select();
+  var copied = document.execCommand('copy');
+  field.remove();
+  return copied ? Promise.resolve() : Promise.reject(new Error('clipboard unavailable'));
+}
+async function copyToken() {
+  var token = getStoredToken();
+  if (!token) { toast('Save the access token first', true); return; }
+  try {
+    await writeTokenToClipboard(token);
+    toast('Access token copied');
+  } catch (e) {
+    toast('Copy unavailable — use Show and copy the token manually', true);
+  }
+}
+async function shareToken() {
+  var token = getStoredToken();
+  if (!token) { toast('Save the access token first', true); return; }
+  try {
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'Band Controller access token', text: token });
+        toast('Access token ready to share');
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;
+      }
+    }
+    await writeTokenToClipboard(token);
+    toast('Sharing unavailable — access token copied instead');
+  } catch (e) {
+    toast('Share unavailable — use Show and copy the token manually', true);
+  }
 }
 function saveLanToken() {
   var val = $('lan-token-input').value.trim();
@@ -1633,6 +2032,7 @@ function updateSummary() {
   $('sum-source').textContent = source;
   $('lte-count').textContent = lteEnabled.size + ' active';
   $('nr-count').textContent = nrEnabled.size + ' active';
+  if ($('staged-count')) $('staged-count').textContent = lteEnabled.size + ' LTE / ' + nrEnabled.size + ' NR';
 }
 function updateCarrierRow() {
   var el = $('sum-carrier');
@@ -1733,12 +2133,15 @@ function init() {
   $('lan-restart').addEventListener('click', restartServer);
   $('lan-token-save').addEventListener('click', saveLanToken);
   $('lan-token-show').addEventListener('click', toggleTokenShown);
+  $('token-copy').addEventListener('click', copyToken);
+  $('token-share').addEventListener('click', shareToken);
   $('drop-log-toggle').addEventListener('change', toggleDropLog);
   window.addEventListener('hashchange', onHash);
   window.addEventListener('resize', drawGraph);
 
   onHash();
   renderPresets();
+  renderCamping([]);
   updateSummary();
   loadBands();
   startPolling();
