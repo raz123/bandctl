@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-178
+## Continuation audit (2026-08-10) — findings A-150..A-179
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2921,6 +2921,14 @@ Evidence: GitHub release v2.5 asset (md5 `168f24b0…`); `service.sh:17,33-48`; 
 Probe (local server instance, no auth headers anywhere): `POST /api/settings?action=settings` body `{"lan_enabled":true,"regenerate":true}` → `{"ok": true, "lan_enabled": true, "token_required": true, "token": "aiboq7PdqPMzdpsRKMdzO1gOrYIN9Ml8"}`; `config/settings.json` afterwards contains `"bind": "0.0.0.0"` + that token; unauthenticated `POST /api/write` and `GET /api/modem-reset` reach the modem apply/reset paths (they fail only because this host has no `/dev/diag` or `cmd phone` — on-device they execute); `Host: attacker.example` is accepted (HTTP 200).
 
 Evidence: `web/server.py:982-996` (`_auth_required` loopback exemption), `:1200-1211` (`update_settings` mint + return), `:1215-1231` (unauthenticated restart scheduling), A-26 (wildcard CORS), A-66 (GET mutations). Affected: every `/api/*` action while the server is loopback-bound (the default); the LAN pivot after restart. Remediation: require the bearer token (or a device-local secret) for state-changing actions even from loopback, and exempt only read-only diagnostics; validate the `Host` header against `localhost`/the configured bind; add `Access-Control-Allow-Private-Network` awareness and drop wildcard CORS on non-loopback binds; rotate the token when LAN is enabled from an unauthenticated context is not possible — instead make the mint require the existing token or a per-install secret. Confirmed.
+
+### A-179 — Bundled python launcher hardcodes the Termux RUNPATH; works only via service.sh's LD_LIBRARY_PATH (P3)
+
+`python/bin/python3.14` (v2.6 zip) has `DT_RUNPATH = /data/data/com.termux/files/usr/lib` (twice) and `DT_NEEDED = libandroid-support.so, libpython3.14.so, libc.so`, while the bundled shared libs live at `python/usr/lib/` (a mangled Termux prefix — launcher at `python/bin/`, stdlib at `python/lib/python3.14/`, libs left at `python/usr/lib/`). The interpreter starts at boot ONLY because `service.sh` exports `LD_LIBRARY_PATH="$MODDIR/python/usr/lib"` and bionic searches LD_LIBRARY_PATH before DT_RUNPATH; the RUNPATH is vestigial. Additionally, the Python selection test is `[ -f "$BUNDLED_PYTHON" ]` (`service.sh:56`), not `-x`: a present-but-inexecutable launcher (partial install, lost perms) makes `nohup "$PYTHON" …` fail silently with no fallback (the elif chain was already consumed).
+
+Probe: ELF parse of `python/bin/python3.14` — NEEDED `libandroid-support.so`/`libpython3.14.so`/`libc.so`, RUNPATH `/data/data/com.termux/files/usr/lib`; `libpython3.14.so` at `python/usr/lib/` exports `Py_BytesMain` (0x43a138) so the pair is symbol-consistent under LD_LIBRARY_PATH; stdlib import graph (http.server, socketserver, secrets, pathlib package, urllib, email, encodings, hmac, json + C deps fcntl, select, math, _posixsubprocess, _struct, _json, _hashlib, _socket, binascii, _ctypes, zlib, _interpchannels) all present in the zip — the bundle is import-complete, unlike v2.5's absent python (A-152/A-177). Not executable on macOS to fully confirm runtime (aarch64-android), but the static link chain is complete.
+
+Evidence: `python/bin/python3.14` RUNPATH/NEEDED (zip), `python/usr/lib/*.so` placement, `service.sh:56` (`-f`), `:59` (chmod 755 re-assert), `customize.sh:86` (chmod 755), `:17` (`BUNDLED_PYTHON`), `:18` (`BUNDLED_LD`). Affected: any direct invocation of the bundled interpreter outside service.sh (adb shell, manager terminal) fails on devices without Termux; bootstrap fragility if the LD_LIBRARY_PATH export is ever removed. Remediation: build the bundle with a relative RUNPATH (`$ORIGIN/../usr/lib` or `$ORIGIN/../lib` per final layout), place libpython under `python/lib/`, and gate on `-x` with an explicit fallback on exec failure. Confirmed (static).
 
 ## Not yet fixed
 
