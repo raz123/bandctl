@@ -2351,6 +2351,530 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
+## Continuation audit (2026-08-10) — findings A-150..A-172
+
+Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
+`audit/2026-08-deep`). The tree is byte-identical to the audited
+`55b0e2d` except for AUDIT.md, so every prior finding above stands.
+Method: five parallel slices (web UI, backend/API, diag/QMI,
+boot/packaging/release, and independent prior-claims verification),
+plus re-verification of 15 high-value prior findings — all 15
+CONFIRMED (A-01 shipped diag ABI, A-04 hardcoded API base, A-13/A-145
+QMI masks, A-26 wildcard CORS + preflight, A-57 OOB read, A-65
+undocumented `action`, A-74 PosixPath serialization, A-105 remote
+lockout, A-119 seed-before-skip, A-129 fd race, A-143 ioctl, A-146,
+A-149). Verification discrepancies: (1) A-01's "compatible signature
+only in uncommitted v2.6.1 worktree" is stale — the fixed 3-arg parser
+IS committed in the repo-ROOT `protocol.py` mirror while the shipped
+`diag/protocol.py` and both zips carry the broken 1-arg ABI (see
+A-151); (2) A-146's cited lines drifted ~4 lines, content identical;
+(3) the settings-GET auth exemption keys on `action==settings`, so the
+README-documented bare `GET /api/settings` is not exempt remotely
+(see A-158).
+
+Baseline verifications (no defect found): diag CRC-16/X-25 variant,
+HDLC 0x7D/0x7E escaping, and little-endian field widths all match the
+CAF diag HDLC layer (cross-checked against CAF kernel sources); no
+XSS-reachable innerHTML interpolation in the v2.6 UI (three sites, all
+static data); no eval/Function/document.write/external resources;
+localStorage key names consistent; clipboard code guards
+`navigator.clipboard`; no interval pileup in startPolling; qmi_band has
+no malloc paths and no 64-bit shift UB; `_run_cmd` args and `_get_prop`
+names are compile-time constants (no injection surface); token
+comparison is constant-time; v2.6 zip hygiene clean (no tests, pyc,
+config, symlinks) and its python layout satisfies service.sh (v2.5 zip
+does not — A-152); both zips pass `unzip -t`; test_server.py 64/64 and
+test_diag_client.py 2/2 pass.
+
+### A-150 — Shipped diag parser has no NV echo validation (P1)
+
+`parse_nv_read_response()` accepts any 0x3D/0x3E frame with status 0,
+regardless of which request it answers. `_scan_stream()` returns the
+first decoded NV frame in the stream, and delayed/cross replies are
+real mechanics on this transport (A-126/A-129). `get_band_config()`
+can therefore label NR data as `lte_bands` (or the reverse) and
+`write_nv` can attribute the wrong write's echo. The client comment at
+`diag/diag_client.py:367-369` promises an echo-validate guard that is
+not implemented anywhere in the shipped parser. The repo-root mirror
+`protocol.py:143-169` contains the real `expected_nv_id`/
+`expected_sub_id` logic — a naive A-01 fix that drops the extra
+arguments at the call site instead of restoring validation leaves this
+hole open.
+
+A probe loaded the shipped parser and the root mirror side by side: a
+NR reply (nv_id 26950) submitted to `parse_nv_read_response()` for an
+LTE 26664 request returned `{'nv_id': 26950, 'status': 0, 'success':
+True}` (accepted — its bitmask would be shown as the LTE bands); the
+root mirror with `expected_nv_id=26664` returned `None` (rejected).
+
+Evidence: `diag/protocol.py:143-169,172-191`; `diag/diag_client.py:
+367-369,289-329,382-405`. Affected: diag `read_nv`/`write_nv`/
+`get_band_config`/`set_band_config`, `/api/read`, `/api/write`,
+boot-apply fallback on diag-only devices. Remediation: restore the
+echo-validation parameters into the shipped `diag/protocol.py`
+(validate both nv_id and sub_id); do not fix A-01 by ignoring the
+extra arguments. Distinct from A-01 (signature TypeError) and A-61
+(non-NV notifications). Confirmed.
+
+### A-151 — Repo-root mirrors mask the shipped A-01 defect (P1)
+
+Root `protocol.py` (245 lines, committed since v2.2 `f92dc30`) carries
+the v2.6.1-compatible 3-arg signatures `parse_nv_read_response(
+response, expected_nv_id=None, expected_sub_id=None)` and the write
+equivalent; the shipped `diag/protocol.py` (219 lines, unchanged since
+v1.0 `b333f0d`) accepts only `response`. `diag/diag_client.py:370,379`
+call the 3-arg form, so a repo-root dev checkout runs fine while every
+shipped copy — the diag/ package and both zips — fails on-device with
+the A-01 TypeError. This explains how the P0 shipped: the only code
+path developers and CI exercise masks the defect, and the root mirror
+documents an API that does not exist in any artifact. The shipped
+v2.6 zip's `diag/protocol.py` md5 equals the repo `diag/protocol.py`
+(ea5200c8), so the broken ABI is in the release. `python3 test_server.py`
+(64 tests) passes from the root tree because root `protocol.py`
+satisfies the callers.
+
+Evidence: `protocol.py:143-147,186-190` vs `diag/protocol.py:143,172`;
+`diag/diag_client.py:370,379`; `git log --all -- protocol.py`
+(f92dc30 only) vs `-- diag/protocol.py` (b333f0d only). Affected:
+dev/CI verification, docs, diag transport on-device. Remediation:
+delete the root mirror (or make it a copy/symlink of diag/) and fix
+`diag/protocol.py`; add a build gate asserting the zipped protocol
+matches the tested file. Extension of A-01 (shipped-artifact angle).
+Confirmed.
+
+### A-152 — Released bandctl-v2.5.zip contains no Python interpreter (P1)
+
+The v2.5 zip ships 21 members; the python/ subtree is only shared
+libraries under `python/usr/lib/` — no `python/bin/python3.14`, no
+`python/lib/`. `service.sh:33` `[ -f "$BUNDLED_PYTHON" ]` therefore
+fails on every fresh install; on ArrowOS 13.1 (no python, no Termux,
+no pyroot) all three selection branches fail and the module aborts
+with "Python not found" — the server never starts. The field device's
+boot log "bundled python missing, using pyroot fallback" is the exact
+mechanism (that device had pyroot installed by hand). The v2.5 tag
+tree (9b250c0) DOES contain the full python runtime (611 files under
+python/), so the zip was built from an incomplete tree; the repo still
+hosts and advertises the broken artifact. The v2.6 zip layout
+(python/bin/python3.14 + python/usr/lib + python/lib) satisfies
+service.sh. Confirmed.
+
+Evidence: `service.sh:17,33-48`; `unzip -Z1 bandctl-v2.5.zip` (21
+members, zero python/bin or python/lib entries); `git ls-tree -r
+--name-only v2.5 python/ | wc -l` (611); v2.5 zip module.prop claims
+"bundled Python runtime — no Termux". Affected: install → boot on
+stock ROMs; the v2.5 release artifact; upgrade paths from v2.5.
+Remediation: rebuild the v2.5 zip from the tag tree or remove it; add
+a CI gate that fails a release build whose zip lacks
+`python/bin/python3.14`. Confirmed.
+
+### A-153 — Failed settings save silently revokes the bearer token (P2)
+
+`update_settings()` mutates the live `SETTINGS` dict before
+persistence and returns `ok:false` without the token field when the
+save fails. `_check_auth()` reads the live `SETTINGS["token"]` on
+every request, so a failed `regenerate:true` revokes the token every
+LAN client holds (they receive 401s for the rest of the process
+lifetime) while the new token is never persisted and never disclosed
+— unrecoverable until a restart reloads the old token from disk.
+With `lan_enabled:true` the bind also flips to 0.0.0.0 in-memory
+despite the failure. Trigger is realistic: full /data partition or
+EPERM on the module config dir.
+
+Probe (in-process with a natural EPERM save failure):
+`update_settings(None, {"lan_enabled": True, "regenerate": True})`
+→ `{'ok': False, 'error': 'settings save failed: ...'}`; afterwards
+`_check_auth('Bearer OLD-TOKEN-ON-DISK')` → unauthorized, the new
+in-memory token accepted, and `'token' not in res` (never returned).
+
+Evidence: `web/server.py:1200-1207,1010-1014,1211`. Affected: POST
+/api/settings, LAN auth gate for every non-loopback request.
+Remediation: compute the new state in a copy, persist first, mutate
+`SETTINGS` only after success (or restore on failure); never rotate
+the token until save succeeds. Extension of A-17/A-41/A-63 (new
+angle: credential revocation + multi-client lockout). Confirmed.
+
+### A-154 — Drop-log durations derive from wall-clock time (P2)
+
+`_drop_log_loop()` stamps `w.drop_start` with `time.time()` and
+computes the recovery duration as `now - drop_start`. A backward clock
+step (NTP/carrier time sync, which phones perform at boot/reconnect)
+between detection and recovery persists a NEGATIVE duration in the
+snapshot file, and the DETECTED/RECOVERED stamps can be identical or
+out of order. The episode filename `drop_YYYYMMDD_HHMMSS.txt` is
+re-derivable after a backward step, aggravating A-128's same-second
+overwrite. The band-camping CSV timestamps (`int(time.time()*1000)`)
+become non-monotonic, so the last-N-sample chart can show time going
+backwards.
+
+Probe: `_drop_log_loop()` with mocked `_drop_state` (POWER_OFF then
+IN_SERVICE) and a 1-hour backward `time.time` step persisted
+`=== DROP DETECTED 2026-08-10 00:08:36 ===` then
+`=== RECOVERED 2026-08-10 00:08:36 (duration -3600s) ===`.
+
+Evidence: `web/server.py:364,369,371-372,376-377,387,394-396,933`.
+Affected: drop-log watchdog, band-camping CSV, Diagnostics plot.
+Remediation: use `time.monotonic()` for durations/gaps; keep
+wall-clock only for display stamps; add a uniqueness guard to episode
+and export filenames. Confirmed.
+
+### A-155 — POST /api/export persists unvalidated bodies verbatim (P2)
+
+`export_config()` dumps the raw submitted JSON to a config-dir file
+without the M8 validation `write_config()` applies. A body of
+`["not","a","dict"]` or `{"lte":[999,"x"],"nr":[1337]}` returns
+`ok:true` and persists the invalid content, which the UI presents as
+a band-config backup and offers for later Import. A LAN attacker with
+the token (the export auth surface) can plant garbage configs; the
+export endpoint's contract diverges from the write endpoint's for
+identical input. The 1 MiB body cap still bounds the write primitive.
+
+Probe: with mocked FS, body `["not","a","dict"]` → `{'ok': True,
+'path': ...}` with verbatim content; `{"lte":[999,"x"],"nr":[1337]}`
+→ `{'ok': True}`; contrast `_validate_bands({"lte":[999],"nr":[]})`
+→ `(None, 'invalid lte band list: each band must be an integer 1-79')`.
+
+Evidence: `web/server.py:1402-1416` vs `:1304-1315`. Affected: POST
+/api/export, the UI Import flow. Remediation: run `_validate_bands`
+normalization on the export path (and reject non-dict bodies).
+Confirmed.
+
+### A-156 — NV item constants are hex-vs-decimal ambiguous and never hardware-validated (P2)
+
+`NV_LTE_BAND_PREF = 0x06828` (26664 decimal) and `NV_NR5G_BAND_PREF =
+0x06946` (26950) are sent little-endian on the wire. The classic,
+widely-documented Qualcomm items are NV 6828 decimal (0x1AAC, "LTE BC
+Configuration") and 6829; the hex reading is consistent with QXDM-style
+hex NV ids. If the correct numbering is decimal, every diag-only
+read/write targets a nonexistent item: reads return status!=0 and
+writes are silently rejected while the API reports success. The diag
+path has NEVER completed a parse in any release (A-01 TypeError), so
+the constants were never confirmed by a working round trip, and no
+provenance exists in the repo.
+
+Probe: `build_nv_read_cmd(26664,0)` → `3d 28 68 00 ...` vs
+`build_nv_read_cmd(6828,0)` → `3d ac 1a 00 ...`; repo-wide search
+finds 6828/6946/26664/26950 only at `diag/protocol.py:26-27`.
+
+Evidence: `diag/protocol.py:26-27`. Affected: diag `read_nv`/
+`write_nv` for LTE/NR band preference. Remediation: verify the two NV
+ids with one QXDM/QRCT read on a working diag session; state the
+numbering convention in a comment. Hypothesis (unresolvable without
+device access).
+
+### A-157 — Repo-root index.html is the stale v2.5 dark UI (P2)
+
+Root `index.html` (1753 lines, md5 e5adc638) is byte-identical to the
+v2.5 zip's `web/index.html` — the previous release's UI — while the
+shipped v2.6 white skin lives only in `web/index.html` and
+`webroot/index.html` (2156 lines, md5 7fccca1b, byte-identical to
+each other). GitHub presents a checkout whose root UI is not what
+ships; contributors, CI, and tooling read the wrong copy, and the
+root `server.py` (identical to web/) serves whichever index.html sits
+in its web/ sibling, so a root checkout is internally inconsistent.
+(The webroot copy is not dead: KernelSU Manager serves `$MODDIR/
+webroot/index.html` by directory convention; the duplication is by
+design. The defect is the root mirror.)
+
+Evidence: root `index.html` md5 e5adc638 == `unzip -p
+bandctl-v2.5.zip web/index.html`; `web/index.html` == `webroot/
+index.html` md5 7fccca1b; both root and web copies are tracked in git.
+Affected: repo docs/CI/devs. Remediation: replace root `index.html`
+with the web/ copy (or remove it) and add a CI mirror check. A-19
+covers screenshots only; this is the tracked source-copy drift.
+Confirmed.
+
+### A-158 — LAN settings-GET auth exemption is query-dependent (P2)
+
+The settings-GET auth exemption keys on the query parameter
+`action==settings`, so the README-documented bare `GET /api/settings`
+(README.md:49) is NOT exempt for a non-loopback client: it hits the
+gate and returns 401 even though the intended exempt route
+`GET /api/settings?action=settings` (the frontend's form) works. On
+the A-105 lockout state (persisted `bind: 0.0.0.0` with no token)
+this removes even the diagnostic `token_required` read that a remote
+operator could use to understand the lockout, and it compounds the
+"recovery surface hidden" problem: the only documented remote route
+that should reveal LAN state fails before the exemption applies.
+
+Probe: with LAN on and no token, non-loopback
+`GET /api/settings?action=settings` → 200 with `token_required: true`
+(exempt), while bare `GET /api/settings` → 401 (not exempt).
+
+Evidence: `web/server.py:985-1017` (exemption condition on
+`action`), `README.md:49`. Affected: LAN admin surface, A-105
+recovery path. Remediation: key the exemption on the path
+(`/api/settings`) rather than the query, or document the
+`?action=settings` requirement. Interaction found during prior-claims
+verification. Confirmed.
+
+### A-159 — Custom switch checkboxes have no accessible name (P2)
+
+Both LAN and Drop-logging toggles put `aria-label` on the wrapping
+`<label>` and leave the `<input>` unnamed. Per the accname
+algorithm, an input's name comes from its own aria-label/aria-
+labelledby or the label's TEXT content — the label element's aria-
+label contributes nothing, and the label's text content is just the
+empty slider span. Screen readers announce two nameless checkboxes;
+the purpose of the toggles is unknowable non-visually.
+
+Probe: node extraction of both blocks → both inputs have 0
+aria-label/aria-labelledby attributes; enclosing label text is empty.
+
+Evidence: `web/index.html:1038-1041` (lan-toggle), `:1067-1070`
+(drop-log-toggle). Affected: Settings → Network access / Debug.
+Remediation: put `aria-label` on the `<input>` or add
+`aria-labelledby` to the row text. A-39 covers the token/preset-name
+text inputs only. Confirmed.
+
+### A-160 — toggleLan() lacks a failure resync (P2)
+
+When the `/api/settings` POST fails at the transport level (server
+down, network error, 401), `toggleLan()`'s catch only toasts; the
+switch keeps the user's flip, `lanEnabled` stays stale, and the token
+section visibility matches neither the server nor the user's intent.
+`toggleDropLog()` is asymmetric: its catch calls `fetchDropLog()` to
+resync. Transport failure is a distinct trigger from A-17's
+HTTP-200-error-payload path.
+
+Probe: function-body extraction — toggleDropLog catch resyncs via
+fetchDropLog (true); toggleLan catch resyncs (false); catch body is
+`catch (e) { toast('Failed to change network access: ' + e.message,
+true); }`.
+
+Evidence: `web/index.html:1972-1988` vs `:1954-1971`. Affected:
+Settings → Network access switch; feeds the stale-state family in
+A-49/A-125. Remediation: restore `$('lan-toggle').checked =
+lanEnabled` (or re-fetch settings) in the catch, mirroring
+toggleDropLog. Confirmed.
+
+### A-161 — Export can report success without producing a file (P2)
+
+`exportConfig()` uses the reliable on-device server export only when
+`typeof window.ksu !== 'undefined'`; otherwise it takes the desktop
+blob-`<a download>` path, whose own comment says the Manager WebView
+drops blob downloads. In any host without the injected `ksu` bridge
+(older Manager builds, alternate WebUI hosts, browsers blocking the
+download), the click is silently dropped while the unconditional
+toast claims "Config exported (n LTE, m NR)" and no file exists
+anywhere. There is no check that the blob download was accepted.
+Export is a data-preservation action; a false success strands the
+user's configuration. KernelSU's WebUI bridge injection is
+host/version-dependent (KsuWebUIStandalone exposes it as an injected
+`ksu` object), so the sniff is fragile.
+
+Evidence: `web/index.html:1733` (ksu gate), `:1734-1735` (comment),
+`:1755-1762` (blob path + unconditional toast); server export at
+`web/server.py:1402-1415`. Affected: Settings → Export config.
+Remediation: default to the server export and verify `d.ok`, or
+detect download acceptance and fall back to the server path.
+A-82 covers accumulation when the ksu path works; this is the
+silent no-file failure when it does not. Hypothesis (WebView
+unavailable; static branch trace).
+
+### A-162 — Active-state teal text fails small-text contrast (P2)
+
+The selected-band tile name/freq and the selected Camped chip use
+`#087f91` on light teal-tinted fills: 4.29:1 on `#e4f8fb` and 4.45:1
+on `#f1fcfd` — below the 4.5:1 AA threshold for the 14px/800 and 9px
+text that renders there. The active state is the primary feedback for
+band selection and the live serving-cell readout, so low-vision users
+fail to read exactly where state matters. Not covered by A-29 (white
+on `#079eb3`) or A-79 (state palette): this is a distinct pair that
+passes on white (4.71:1) but fails on the fills.
+
+Probe: node WCAG relative-luminance math; algorithm validated by
+exactly reproducing A-29 (3.21) and A-79 (3.80/4.02/3.93) values.
+
+Evidence: `web/index.html:787,789-791,838-841`. Affected: Bands tab
+selected tiles, Diagnostics selected chip. Remediation: darken the
+active-state teal or lighten the fill to reach ≥4.5:1. Confirmed.
+
+### A-163 — No diag protocol tests, fixtures, or committed test file (P2)
+
+`test_diag_client.py` has 2 tests, both for the abandoned-reader race;
+nothing exercises crc_ccitt, HDLC encode/decode, NV command build/
+parse, endianness, or `_scan_stream` against a captured stream, and
+no captured diag stream exists anywhere in the repo (no .bin/.raw/.
+cap/.hex/.qcn). The docstrings cite "kernel-verified protocol contract
+(docs/protocol_kernel.md)" and `test_server.py:8` cites
+"module/diag/tests/test_protocol.py" — neither file nor directory
+exists in the committed tree; `test_diag_protocol.py` (present in the
+v2.6.1 worktree per the AUDIT header) is also absent. Because every
+release ships the A-01 TypeError, no real NV response has ever been
+parsed by this code, so the whole parser is unvalidated against
+hardware. Separately, the v2.6 release changed only web/index.html
+(+591/-195 lines) and neither suite exercises it — the static-serving
+test writes its own stub `<html>bandctl test</html>`
+(test_server.py:536) and never loads the shipped page.
+
+Evidence: `test_diag_client.py` (2 tests); `diag/protocol.py:7-9`,
+`diag/diag_client.py:5`, `test_server.py:8`; glob of `**/test*.py`
+and `**/*.bin|raw|cap|hex|qcn|xml` returns only the two test files.
+Affected: test/verification pipeline, reproducibility of the
+"kernel-verified" claim. Remediation: add golden-fixture tests (a
+captured real NV read stream with expected output), a CRC check-value
+test (0x906E footer for "123456789"), escape round-trips, commit
+test_diag_protocol.py, and a smoke test asserting the shipped
+index.html parses; restore or drop the phantom doc references.
+Confirmed.
+
+### A-164 — qmi_band --set writes identical SA and NSA NR masks (P2)
+
+`main()` calls `build_nr_masks(nr_csv, sa)` and
+`build_nr_masks(nr_csv, nsa)` with the same string, so the SA and NSA
+preference TLVs always carry the same bands; the UI's single 'nr'
+list offers no way to express the SA/NSA split the QMI protocol
+supports. On SM8250 this forces every selected NR band into the SA
+preference, which can make the modem attempt or prefer SA registration
+on bands the network only offers via EN-DC/NSA, degrading service —
+while the mode-pref NR5G bit is set whenever either duplicate is
+non-empty. The shipped binary contains all 42 source string literals
+of this file, so it was built from this source.
+
+Evidence: `qmi/qmi_band.c:724-726` (both calls with the same
+`nr_csv`), `:251-267` (build_nr_masks), `:78-102` (build_set emits
+both TLVs), `:732`; caller `web/server.py:1388-1390`. Affected:
+`qmi_band --set`/`--set-all-lte` NR path, `/api/write` via QMI.
+Remediation: accept separate SA and NR lists (or a documented
+single-list policy) and stop duplicating the mask. Distinct from
+A-13 (LTE B66/B71 drop) and A-122 (output label overwrite).
+Confirmed.
+
+### A-165 — qmi_band --set exits 0 on a QMI FAILURE response (P3)
+
+`send_set()` prints `result: status=1 FAILURE` but returns 0, and
+`main` returns it directly, so a scripted `--set` gets exit code 0
+for a rejected band write. The web server compensates by regex-
+grepping `result: status=0` from stdout, so the UI path is protected,
+but the CLI contract is misleading and other consumers of the helper
+inherit the same gap A-44 documents for `--get`.
+
+Evidence: `qmi/qmi_band.c:509-541` (`send_set` returns 0 at 539-540
+regardless of printed status), `:735`; `parse_response` prints the
+status at `:189-190` with no flow into the return value. Affected:
+`qmi_band --set` CLI exit code (server compensated at
+`web/server.py:1390-1393`). Remediation: return nonzero when the
+result TLV status != 0. A-44 extension (SET path). Confirmed.
+
+### A-166 — parse_csv silently drops garbage and wraps overflow (P3)
+
+`strtol` overflow (e.g. 99999999999999999999) sets ERANGE and returns
+LONG_MAX, which `(int)` wraps to -1 and the range checks then skip;
+garbage tokens are skipped one character at a time ('1,abc,2' parses
+band 1 only). A typo can quietly produce a different mask with no
+error. The web server pre-validates band values, so this only affects
+direct CLI use.
+
+Evidence: `qmi/qmi_band.c:223-235` (no ERANGE check, no full-token
+consume), `:239-248,251-267` (silent range skips). Affected: `qmi_band
+--set`/`--set-all-lte` direct CLI. Remediation: validate each token
+(ERANGE, full-token consume, 1..N range) and abort with a message.
+Confirmed.
+
+### A-167 — README's documented 13 endpoints omit POST /api/export (P3)
+
+The dispatcher supports 13 actions including `export`
+(web/server.py:1078-1082), but README.md:45-57 documents 13 bullets
+that exclude /api/export; the only export mention is the settings.png
+caption. A user following the README cannot discover the on-device
+export endpoint the UI depends on; A-65 already showed the README/API
+documentation is not authoritative for the `action=` requirement.
+
+Evidence: `README.md:45-57` vs `web/server.py:1077-1113`; endpoint
+census intersection = 12. Affected: documentation, API consumers.
+Remediation: add `POST /api/export` to the README endpoint list (and
+note the `?action=` requirement). Confirmed.
+
+### A-168 — Responses disclose the exact bundled Python version (P3)
+
+`send_json()` never overrides `version_string()`, so every API
+response — including unauthenticated 401s and the CORS preflight —
+carries `Server: BaseHTTP/0.6 Python/3.14.5` (the bundled runtime).
+Combined with A-52 (plaintext HTTP on LAN) this gives any LAN
+observer exact version fingerprints for targeting known
+stdlib/CPython vulnerabilities in the shipped 3.14 runtime.
+
+Evidence: `web/server.py:1610-1624`; `service.sh:17`. Affected: all
+/api/* and static responses. Remediation: override `version_string()`
+(e.g. `server_version="Bandctl/2.6"`). Confirmed.
+
+### A-169 — HTTP/1.0 close-only semantics; chunked bodies silently dropped (P3)
+
+The handler keeps the stdlib default `protocol_version = "HTTP/1.0"`,
+so every request — even HTTP/1.1 keep-alive — is answered HTTP/1.0
+with `Connection: close`, pipelined requests left unread, and the UI's
+2s/5s polling churns a fresh TCP connection per request (TIME_WAIT
+accumulation). Requests with `Transfer-Encoding: chunked` and no
+Content-Length are treated as bodyless: the handler returns 200 with
+"invalid JSON body" and closes, silently dropping the client's body
+without a 411/501 explanation.
+
+Probe (socket-free parse_request harness): pipelined HTTP/1.1 second
+request → `HTTP/1.0 200 OK`, `close_connection=True`, 125 bytes left
+unread; chunked POST /api/settings → 200 invalid-JSON error + close;
+HEAD/TRACE/PUT → 501; 200KB header line → 431; 70KB URI → 414
+(stdlib guards present in the shipped 3.14 runtime).
+
+Evidence: `web/server.py:942-953` (no protocol_version override);
+shipped stdlib `python/lib/python3.14/http/server.py:694`. Affected:
+all /api/* and static responses; polling traffic pattern.
+Remediation: set `protocol_version="HTTP/1.1"` with keep-alive +
+chunked handling, or explicitly reject Transfer-Encoding with
+411/501 (keeping A-60's thread-pinning caveat in mind). Distinct
+from A-60 (no socket timeout) and A-34 (poll pileup). Confirmed.
+
+### A-170 — LTE bands 1-79 outside the 25-entry catalog render without tiles and are silently saved (P3)
+
+`setBands` keeps any band value; `renderGrid` renders only catalog
+entries. A modem/diag read or an imported file containing e.g. LTE
+B19/B21/B27 (valid 1-79 values absent from `LTE_BANDS`) shows
+"2 active" with one tile, and Save & Apply submits the invisible band
+— the server accepts it (validation is 1-79 only) — so the applied
+set silently differs from what the user sees. Unlike A-145 (NR>79
+rejected), here the save SUCCEEDS server-side, making the mismatch
+invisible end-to-end.
+
+Evidence: catalog `web/index.html:1138-1145` (25 LTE bands);
+`renderGrid` at `:1216-1219`; `setBands` at `:1230-1238`; server
+validation `web/server.py:1152-1173`. Affected: Bands tab read/save
+for non-Rogers/imported/other-carrier configs. Remediation: filter
+non-catalog bands with a visible warning, or add tiles (and enforce
+per-RAT catalogs server-side, cf. A-131). Extension of A-145
+(different trigger and outcome). Confirmed.
+
+### A-171 — service.sh lacks customize.sh's MODDIR self-heal (P3)
+
+`MODDIR=${0%/*}` (service.sh:7) yields "service.sh" when the script
+is invoked as `sh service.sh` from within the module dir — the same
+mangling customize.sh guards against with its module.prop-resolution
+loop. All subsequent state writes (config/, bandctl.log, chmod
+paths, nohup server path) then resolve under a stray "service.sh/"
+directory in the caller's cwd. Boot-time invocation by absolute path
+is safe; the UI restart path inherits whatever MODDIR the running
+server derived, and a manual `sh service.sh` from the module dir is a
+plausible user action.
+
+Evidence: `service.sh:7` (no guard) vs `customize.sh:13-30`
+(module.prop search self-heal); `service.sh:10,16,59,62` rely on
+MODDIR. Affected: manual restarts, non-boot invocations.
+Remediation: port customize.sh's module.prop-resolution loop (or
+`cd "$(dirname "$0")"` + realpath guard) into service.sh.
+Hypothesis (expansion verified statically).
+
+### A-172 — #lan-token-input is below the 44px touch-target minimum (P3)
+
+The token-entry field — the critical re-auth surface on remote LAN
+pages — computes to ≈37px tall (14px font × 1.5 line-height + 16px
+padding) with no white-skin min-height override, while the skin
+applies 44px to modal inputs and 48px to `.btn`. On-device taps near
+its edge can miss or hit the adjacent Save button. A-76 audits the
+buttons/switches but not this input.
+
+Evidence: `web/index.html:497-505` (the only #lan-token-input rule);
+contrast with the modal-input min-height rule. Affected: Settings →
+Network access → token entry. Remediation: add `min-height: 44px` to
+`#lan-token-input` in the white-skin block. Confirmed.
+
 ## Not yet fixed
 
 All findings above remain open unless explicitly marked otherwise by a later
