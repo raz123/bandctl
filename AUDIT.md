@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-172
+## Continuation audit (2026-08-10) — findings A-150..A-175
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2874,6 +2874,24 @@ Evidence: `web/index.html:497-505` (the only #lan-token-input rule);
 contrast with the modal-input min-height rule. Affected: Settings →
 Network access → token entry. Remediation: add `min-height: 44px` to
 `#lan-token-input` in the white-skin block. Confirmed.
+
+### A-173 — Module updates wipe exports and drop-log evidence — both persistence features self-destruct (P2)
+
+`EXPORT_DIR = MODDIR / "config"` and `DROP_LOG_DIR = MODDIR / "config" / "drop_log"` place every export and drop snapshot inside the module directory, which a KernelSU module update replaces wholesale (the zips ship zero `config/` members, and settings.json is already known not to survive updates). The Settings-tab Export is presented as a backup — "Config exported" — but the copy lives in the directory the next update deletes, so the backup is unusable across the upgrade it is most needed for. The drop-log snapshots, whose purpose is cross-reboot/cross-update correlation of radio outages, vanish the same way; the band-camping log has already suffered exactly this loss in the field (the log that could have measured a drop duration was wiped by the v2.4 update).
+
+Evidence: `web/server.py:238` (`EXPORT_DIR = MODDIR / "config"`), `:249` (`DROP_LOG_DIR = MODDIR / "config" / "drop_log"`); `unzip -Z1 bandctl-v2.6.zip | grep -c '^config/'` → 0; prior audit note that settings.json resets on update. Affected: Settings → Export config; Debug → Drop logging evidence; boot re-apply intent. Remediation: persist exports/snapshots outside the module dir (e.g. `/data/local/tmp/bandctl/` or a data dir) or teach customize.sh to preserve `config/` across updates. Confirmed (structural).
+
+### A-174 — Drop-log snapshots have no UI/API reader (P3)
+
+`read_drop_log()` returns only the snapshot filenames; no endpoint serves snapshot content, and the Settings Debug note points the user at a root-only module path. The feature exists to capture correlation evidence (registration, Wi-Fi, counters, radio tail), but once captured the evidence cannot be viewed or exported through the app — only via a root shell into the module dir. The "N snapshots" count in the UI is not actionable: there is no list, preview, or export surface.
+
+Evidence: `web/server.py:1460-1474` (`read_drop_log` returns `dir` + `files` only; the drop-log dispatch has no `file=` path); `web/index.html` drop-log-note renders the dir path + count. Affected: Debug → Drop logging. Remediation: add an auth-gated `GET /api/drop-log` content/export path (validate the filename against the directory) or a list+view in the Settings Debug section. Confirmed.
+
+### A-175 — Boot-apply result logging discards the response on slow applies (P3)
+
+The service's boot-apply POST uses a 10-second urllib timeout while the server-side apply has no matching deadline (QMI discovery alone can take ~98s worst case, A-64). When the apply outlives the client timeout, the shell captures an empty `resp` and logs `boot-apply -> ` — a blank line — even though the server continues applying and may succeed. Slow-but-successful boot applies are therefore logged as failures/no-ops, which has already caused a false "boot-apply skipped" diagnosis in the field (the v2.5 timeout regression).
+
+Evidence: `service.sh` boot-apply POST (`urllib.request.urlopen(req, timeout=10)`; `sys.exit(1)` on exception with no stdout) → `resp` empty; server apply path bounded only by `_run_qmi` subprocess timeouts per A-64. Affected: boot-time re-apply logging. Remediation: separate the response read from the timeout (accept a fire-and-forget 202 or log "apply started") or raise the POST timeout to cover the apply bound. Confirmed (structural; P3 — log-only misreport).
 
 ## Not yet fixed
 
