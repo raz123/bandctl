@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-177
+## Continuation audit (2026-08-10) — findings A-150..A-178
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2908,6 +2908,19 @@ The earlier finding (A-152) documented the committed `bandctl-v2.5.zip` shipping
 Probe: `gh release download v2.5` → `unzip -Z1 bandctl-v2.5.zip | grep -c python/bin` → 0; `md5 -q` release asset vs committed zip → identical. The v2.6 release asset matches the committed v2.6 zip (md5 `81473599…`), whose layout is correct.
 
 Evidence: GitHub release v2.5 asset (md5 `168f24b0…`); `service.sh:17,33-48`; A-152. Affected: all v2.5 installs from Releases; the v2.5 tag's advertised behavior. Remediation: re-cut the v2.5 release from the v2.5 tag tree (which contains the full 611-file python runtime) or unpublish the broken asset; add the CI gate proposed in A-152. Confirmed.
+
+### A-178 — Loopback is a trusted surface: unprivileged apps (or web pages) get full modem control and can mint + steal the LAN token (P1)
+
+`_auth_required()` exempts every loopback client from authentication on EVERY action — `if self._is_loopback(): return False` comes before any per-action check — and `update_settings()` creates AND returns a fresh `secrets.token_urlsafe(24)` bearer token in the response. The "phone itself never needs the token" intent ignores that the phone's apps and web pages are not the phone:
+
+- **Unprivileged app vector**: any app on the phone (INTERNET permission is default) can POST to `http://127.0.0.1:8080` with no token and reach every endpoint: `/api/write` (modem band control — privilege escalation from an unprivileged context with no native band API), `/api/modem-reset` (radio DoS, repeatable), `/api/restart`, `/api/export`, `/api/boot-apply`.
+- **Token theft + LAN pivot**: one unauthenticated POST `/api/settings?action=settings` with `{"lan_enabled": true, "regenerate": true}` both mints a fresh token and persists `bind: 0.0.0.0`; the response discloses the token. After the attacker triggers a restart (also unauthenticated), the server binds all interfaces with a token only the attacker holds — remote modem control from anywhere on the LAN, and the legitimate user's old token is invalidated (A-105 lockout for the owner, control for the attacker).
+- **Browser vector**: the wildcard CORS (A-26) makes preflighted `fetch` calls to the loopback server succeed (no auth required there), and the GET-mutation routes (A-66: `modem-reset`, `restart`, `boot-apply` via GET) work even without CORS — a plain `<img src="http://127.0.0.1:8080/api/modem-reset?action=modem-reset">` on any page the phone's browser renders triggers a radio reset. The KernelSU WebUI itself depends on cross-origin loopback access, so PNA is clearly not enforced in the primary client context.
+- **DNS-rebinding precondition**: the server never validates the `Host` header, so a remote page can rebind its own domain to 127.0.0.1 and drive the same endpoints; wildcard CORS makes the responses readable.
+
+Probe (local server instance, no auth headers anywhere): `POST /api/settings?action=settings` body `{"lan_enabled":true,"regenerate":true}` → `{"ok": true, "lan_enabled": true, "token_required": true, "token": "aiboq7PdqPMzdpsRKMdzO1gOrYIN9Ml8"}`; `config/settings.json` afterwards contains `"bind": "0.0.0.0"` + that token; unauthenticated `POST /api/write` and `GET /api/modem-reset` reach the modem apply/reset paths (they fail only because this host has no `/dev/diag` or `cmd phone` — on-device they execute); `Host: attacker.example` is accepted (HTTP 200).
+
+Evidence: `web/server.py:982-996` (`_auth_required` loopback exemption), `:1200-1211` (`update_settings` mint + return), `:1215-1231` (unauthenticated restart scheduling), A-26 (wildcard CORS), A-66 (GET mutations). Affected: every `/api/*` action while the server is loopback-bound (the default); the LAN pivot after restart. Remediation: require the bearer token (or a device-local secret) for state-changing actions even from loopback, and exempt only read-only diagnostics; validate the `Host` header against `localhost`/the configured bind; add `Access-Control-Allow-Private-Network` awareness and drop wildcard CORS on non-loopback binds; rotate the token when LAN is enabled from an unauthenticated context is not possible — instead make the mint require the existing token or a per-install secret. Confirmed.
 
 ## Not yet fixed
 
