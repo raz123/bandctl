@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-175
+## Continuation audit (2026-08-10) — findings A-150..A-177
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2892,6 +2892,22 @@ Evidence: `web/server.py:1460-1474` (`read_drop_log` returns `dir` + `files` onl
 The service's boot-apply POST uses a 10-second urllib timeout while the server-side apply has no matching deadline (QMI discovery alone can take ~98s worst case, A-64). When the apply outlives the client timeout, the shell captures an empty `resp` and logs `boot-apply -> ` — a blank line — even though the server continues applying and may succeed. Slow-but-successful boot applies are therefore logged as failures/no-ops, which has already caused a false "boot-apply skipped" diagnosis in the field (the v2.5 timeout regression).
 
 Evidence: `service.sh` boot-apply POST (`urllib.request.urlopen(req, timeout=10)`; `sys.exit(1)` on exception with no stdout) → `resp` empty; server apply path bounded only by `_run_qmi` subprocess timeouts per A-64. Affected: boot-time re-apply logging. Remediation: separate the response read from the timeout (accept a fire-and-forget 202 or log "apply started") or raise the POST timeout to cover the apply bound. Confirmed (structural; P3 — log-only misreport).
+
+### A-176 — Drop watchdog never triggers on IWLAN/VoWiFi transport transitions (P2)
+
+The watchdog's drop decision examines only `service_state` (`state = (reg or {}).get("service_state")`; the episode branch tests `POWER_OFF` / `OUT_OF_SERVICE` / `EMERGENCY_ONLY`). `network_type` is parsed and carried in the registration dict (line 787-791) but is consumed only by the UI chips — the logger never looks at it. A radio drop that manifests as a transport change — the field-observed IWLAN/VoWiFi signature where `network_type` becomes `IWLAN` while `service_state` and `data_state` stay `IN_SERVICE`, or where data silently fails over to the WLAN path — therefore enters neither the drop branch nor the snapshot, even though the snapshot machinery (registration dict, wifi status, per-interface counters, radio tail) is exactly the evidence needed to test the IWLAN hypothesis. This is distinct from A-85 (which covers `data_state=OUT_OF_SERVICE` while voice stays up): here there is no state transition at all — only the transport/technology field changes.
+
+Probe: `_drop_log_loop()` with mocked `_drop_state` returning `{"service_state": "IN_SERVICE", "data_state": "IN_SERVICE", "network_type": "IWLAN", ...}` runs a full poll cycle with no episode opened and no file written — the loop only branches on the three service-state strings.
+
+Evidence: `web/server.py:362-365` (state decision), `:787-791` (network_type parsed, never consumed by the watchdog). Affected: Debug → Drop logging — the IWLAN drop signature under investigation produces no snapshot or recovery duration. Remediation: treat a `network_type` transition into `IWLAN` (or a `data_state` regression) as an episode trigger, and/or snapshot on any registration transition. Confirmed.
+
+### A-177 — The published v2.5 release asset is the broken no-python zip (P3)
+
+The earlier finding (A-152) documented the committed `bandctl-v2.5.zip` shipping no Python interpreter and listed the Releases page as an unverifiable blind spot. That blind spot is now closed: the GitHub **release** asset `bandctl-v2.5.zip` is byte-identical to the committed broken artifact (md5 `168f24b0767118ec3549ffd0c716a329` both sides; 20 members, zero `python/bin/` entries). Every user who installed v2.5 from the Releases page received a module whose `service.sh` cannot find `python/bin/python3.14` and aborts on any ROM without a pre-existing Termux or `/data/local/tmp/pyroot` — the module's own "bundled Python runtime — no Termux" claim is false for the artifact that was actually published.
+
+Probe: `gh release download v2.5` → `unzip -Z1 bandctl-v2.5.zip | grep -c python/bin` → 0; `md5 -q` release asset vs committed zip → identical. The v2.6 release asset matches the committed v2.6 zip (md5 `81473599…`), whose layout is correct.
+
+Evidence: GitHub release v2.5 asset (md5 `168f24b0…`); `service.sh:17,33-48`; A-152. Affected: all v2.5 installs from Releases; the v2.5 tag's advertised behavior. Remediation: re-cut the v2.5 release from the v2.5 tag tree (which contains the full 611-file python runtime) or unpublish the broken asset; add the CI gate proposed in A-152. Confirmed.
 
 ## Not yet fixed
 
