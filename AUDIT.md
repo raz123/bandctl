@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-191
+## Continuation audit (2026-08-10) — findings A-150..A-193
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3018,6 +3018,18 @@ Evidence: `web/index.html:1343-1349` (`serverDown` → `logDrop`), `:1509-1528` 
 `#lan-token-input` is `type="text"` (`web/index.html:1054`), so the bearer token is visible in cleartext while typed and while the field holds focus — on the phone's own screen (KSU WebUI) this is exposed to shoulder-surfing and to any screen-recording/screen-capture app or accessibility layer. A-130 covers the masked DISPLAY of the stored token; the input itself is unmasked. The token is the LAN remote-control credential (A-178).
 
 Evidence: `web/index.html:1054`. Affected: token entry on the phone. Remediation: `type="password"` with an eye-toggle (matching `lan-token-show`'s pattern). Confirmed.
+
+### A-192 — Deleting a preset has no confirmation and no undo (P3)
+
+The delegated click handler maps `data-action="del"` straight to `deletePreset(i)` (`web/index.html:1226-1230` — the delegated listener, `:1267-1272` — `deletePreset` splices + saves immediately). Presets are the user's curated band configurations (the Rogers 13/10 work, region combos), stored only in localStorage under `PRESETS_KEY` — one misclick on "Delete" permanently destroys one with no confirm, no undo, no trash. Every other destructive action in the UI has a guard: the modem reset uses a modal, the LAN change is a toggle.
+
+Evidence: `web/index.html:1226-1230,1267-1272`; the reset-modal pattern at `:1293-1300` (the established confirm convention). Affected: Settings → Presets. Remediation: confirm modal for delete (mirroring reset-modal), or a 2-click "Delete → Confirm" affordance. Confirmed (code read).
+
+### A-193 — A user-initiated modem reset logs a false DROP in the event history (P3)
+
+`confirmModemReset()` POSTs the reset, which powers the radio off and on (3s apart, or the 6s airplane toggle). During that window the registration poll sees the radio leave IN_SERVICE and `checkRegChange` fires `logDrop('Service lost: …')` — a red DROP entry caused by the user's own reset button. The history cannot distinguish a user-initiated reset from an outage, so a deliberate reset looks like a radio drop (same family as A-190's server-down entries — the visible drop record mixes user actions with failures). Compounding A-190: both the restart and the reset — the two things a user does to FIX a drop — each manufacture false DROP entries.
+
+Probe: trace `confirmModemReset` (POST) → modem_reset powers radio off → `pollRegistration` (2s) sees POWER_OFF → `checkRegChange` IN_SERVICE→POWER_OFF → `logDrop`. Evidence: `web/index.html:1293-1311` (`confirmModemReset`), `:1431-1447` (`checkRegChange`), `web/server.py:1500-1557` (reset powers radio off); A-190 (server-down entries). Affected: Diag tab history interpretation. Remediation: suppress DROP tagging while a reset/restart is in flight (set a `userInitiated` flag in confirmModemReset/restartServer, cleared on the next IN_SERVICE poll). Confirmed (code trace).
 
 ## Not yet fixed
 
