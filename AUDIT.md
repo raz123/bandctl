@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-181
+## Continuation audit (2026-08-10) — findings A-150..A-184
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2951,6 +2951,24 @@ Probe: `ls -ld` of the module config dir on-device shows 777 (root, observed); `
 Probe (traced mock, `_drop_state` stubbed OUT_OF_SERVICE → None → OUT_OF_SERVICE): iteration 2 appends `RECOVERED (duration 10s)`, resets `in_drop`; iteration 3 starts a new episode; final file contains a spurious recovery between two drops that were one.
 
 Evidence: `web/server.py:378-379` (None → recovery branch), `:387-393` (recovery stamp + reset), `:316-321` (`_drop_state` → None), `:470-472` (`_run_dumpsys` timeout=5). Affected: drop-log analysis quality on every device with drop logging enabled; compounds A-176 (IWLAN signature missed entirely) and A-154 (wall-clock durations). Remediation: treat None as "unknown" — skip the poll (no stamp, no reset) and only stamp recovery on an explicit non-drop state; fold `network_type` into the recovery decision per A-176. Confirmed (mocked trace).
+
+### A-182 — The in-page drop record has the same IWLAN blind spot as the server watchdog, and is ephemeral (P2)
+
+The UI's own drop detection (`checkRegChange`, `web/index.html:1494-1508`) watches only `service_state` transitions: a DROP entry is logged only when service leaves `IN_SERVICE` (`if (!isIn && wasIn) logDrop(...)`). The field-observed drop signature — IWLAN/VoWiFi transport handover with both states IN_SERVICE (A-176) — is logged as a plain `REG` entry (`cur.net !== lastReg.net` fires, but the DROP tag does not), so the page the user watches misses the same precursor the server watchdog misses. Separately, the entire history is DOM-only (`logEntry` appends to `#history-list`, capped at `HISTORY_MAX = 200`): it is lost on every page reload and is never persisted, while the durable server-side snapshots (A-174) have no reader — the visible record is ephemeral and the durable record is invisible.
+
+Evidence: `web/index.html:1494-1528` (`checkRegChange` service-only gate, `logEntry` DOM append, `logDrop`), `:1127` (`HISTORY_MAX`). Affected: Diag tab history on every device; compounds A-176 (server watchdog) and A-174 (no snapshot reader). Remediation: tag DROP on `network_type` transport changes (IWLAN→LTE) while IN_SERVICE; persist the history (localStorage or the server API) so a reload does not erase the record. Confirmed (code read; IWLAN case traced — service unchanged → no DROP tag).
+
+### A-183 — service.sh kills unrelated processes whose cmdline contains "server.py" (P3)
+
+`kill $(pgrep -f "server.py") 2>/dev/null` (`service.sh:52`) uses `pgrep -f`, which regex-matches the FULL command line — `"server.py"` is a substring match, so any process whose cmdline contains `server.py` (e.g. `webserver.py`, `django-server.py`, another KernelSU module's python server, a Termux script) is SIGTERM'd on every boot AND every API restart. Verified locally: `pgrep -f "server.py"` returns both a plain `server.py` process and an unrelated `webserver.py` process. Also a boot/restart race: a manual "Restart server" during service.sh's boot window (the boot script runs ~1-2 min with wait_server/wait_radio) spawns a second service.sh whose kill takes out the first's freshly started server, and both proceed to boot-apply — a double QMI apply.
+
+Probe: on any POSIX host, `python3 -c 'import time; time.sleep(5)' & ` plus a process literally named `webserver.py` — `pgrep -f "server.py"` lists both. Evidence: `service.sh:52`. Affected: unrelated python servers on the phone (the installed voiprecorder module if it runs one), boot/restart races. Remediation: kill by exact path (`pgrep -f "$MODDIR/web/server.py"`) or record the PID at start; serialize restarts. Confirmed (local pgrep repro).
+
+### A-184 — The UI-facing dumpsys parsers have zero test coverage (P3)
+
+`test_server.py` (64 tests) covers settings/auth/validation/atomic-writes, but has NO test for `_parse_signal_object`, `_parse_signal_legacy`, `_parse_registration`, or the band-camping parse — the parsers that drive the entire Diag tab (signal graph, registration chips, camping list) and the drop-logger's trigger. The dual-format branches (modern `mServiceState={...}` object vs legacy flat `ServiceState: <voice> <data>`; `SignalStrength:{...}` vs flat list) — exactly the code an Android update can break — have no regression net; a format drift silently degrades the UI (nulls everywhere) and can blind the drop watchdog (A-181's family) with nothing failing loudly.
+
+Probe: `grep -c '_parse_signal\|_parse_registration\|_parse_band' test_server.py` → 0. Evidence: `web/server.py:649-756` (signal object/legacy), `:757-815` (registration), test_server.py absent coverage; A-163 covers the diag protocol tests, not the server parsers. Affected: regression risk on ROM/Android updates; compounds A-163. Remediation: fixture-based tests for both object and legacy formats of each parser (the modem_logs/ evidence files are ready-made fixtures). Confirmed.
 
 ## Not yet fixed
 
