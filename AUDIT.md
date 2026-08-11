@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-179
+## Continuation audit (2026-08-10) — findings A-150..A-181
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2929,6 +2929,28 @@ Evidence: `web/server.py:982-996` (`_auth_required` loopback exemption), `:1200-
 Probe: ELF parse of `python/bin/python3.14` — NEEDED `libandroid-support.so`/`libpython3.14.so`/`libc.so`, RUNPATH `/data/data/com.termux/files/usr/lib`; `libpython3.14.so` at `python/usr/lib/` exports `Py_BytesMain` (0x43a138) so the pair is symbol-consistent under LD_LIBRARY_PATH; stdlib import graph (http.server, socketserver, secrets, pathlib package, urllib, email, encodings, hmac, json + C deps fcntl, select, math, _posixsubprocess, _struct, _json, _hashlib, _socket, binascii, _ctypes, zlib, _interpchannels) all present in the zip — the bundle is import-complete, unlike v2.5's absent python (A-152/A-177). Not executable on macOS to fully confirm runtime (aarch64-android), but the static link chain is complete.
 
 Evidence: `python/bin/python3.14` RUNPATH/NEEDED (zip), `python/usr/lib/*.so` placement, `service.sh:33` (`-f`), `:59` (chmod 755 re-assert), `customize.sh:86` (chmod 755), `:17` (`BUNDLED_PYTHON`), `:18` (`BUNDLED_LD`). Affected: any direct invocation of the bundled interpreter outside service.sh (adb shell, manager terminal) fails on devices without Termux; bootstrap fragility if the LD_LIBRARY_PATH export is ever removed. Remediation: build the bundle with a relative RUNPATH (`$ORIGIN/../usr/lib` or `$ORIGIN/../lib` per final layout), place libpython under `python/lib/`, and gate on `-x` with an explicit fallback on exec failure. Confirmed (static).
+
+### A-180 — config/ is world-writable on-device: unprivileged apps can replace settings.json and pivot to LAN control (P1)
+
+The module config dir ends up mode 777 on the device (observed: `settings.json` 600, `config/` 777). The permission fix is conditionally skipped: `customize.sh` bails with `exit 0` before any chmod when it cannot resolve the module root (the known KernelSU metainstall mangling, same family as the seed that never lands), and the chmod that would cover the dir targets `$CONFIG_DIR` — which in the skip case is never created by customize.sh at all. At boot, `service.sh`'s bare `mkdir -p "$MODDIR/config"` (line 10) creates it with the ambient umask (000 in the boot context → 777), and nothing ever chmods it.
+
+In a world-writable dir, an unprivileged app can unlink and recreate **any** file regardless of its own mode (600 settings.json is read-protected only):
+
+- **Settings replacement → LAN pivot (second path to A-178's outcome)**: plant `config/settings.json` with `{"bind": "0.0.0.0", "token": "<attacker-known>", "drop_log": false}`; the server's `_load_settings` accepts it wholesale, so after a loopback-triggered `POST /api/restart` (unauthenticated — A-178) — or the next boot — the server binds all interfaces with a token the attacker holds. Distinct root cause from A-178 (directory permissions, not the auth gate), same blast radius.
+- **bands.json replacement**: force a hostile-but-valid band list on the next boot-apply.
+- **Drop-file symlink truncation**: the drop logger's `open(w.episode_file, 'w')` has no O_NOFOLLOW — a pre-planted symlink `drop_<ts>.txt` → `settings.json` truncates the server's own settings on the next drop.
+- **Log poisoning / disk fill**: `bandctl.log` (service.sh appends boot-apply results) is replaceable; junk files fill /data (tight partition on phones).
+- The temp-file guard in `_atomic_write_json` (O_NOFOLLOW on the temp name) does not help: the directory-level write permission governs unlink/replace, and a pre-created hard link at the temp name lets the app truncate `bands.json` through O_TRUNC when settings are saved.
+
+Probe: `ls -ld` of the module config dir on-device shows 777 (root, observed); `_load_settings` (`web/server.py:151-175`) accepts any dict with `bind` ∈ {127.0.0.1, 0.0.0.0} and any string token; `mkdir -p` at `service.sh:10` with no chmod follows; `customize.sh:14-22` (`exit 0` path skips `:77` chmod). Affected: every phone with the module installed (any app = any uid, INTERNET not even required — filesystem access needs no network). Remediation: chmod 755 config/ in service.sh (unconditionally, after mkdir) and re-assert on every boot; create drop_log with explicit 700/750; use O_NOFOLLOW in the drop logger; treat config/ as untrusted input. Confirmed (code + on-device mode observation; live app-level exploit not re-run this pass — adb detached).
+
+### A-181 — Drop watchdog stamps a false RECOVERED and resets the episode when dumpsys fails mid-drop (P2)
+
+`_drop_log_loop` derives the trigger state as `state = (reg or {}).get("service_state")` where `reg = _drop_state()` returns **None** on any dumpsys failure (timeout after 5s — `_run_dumpsys` → `_run_cmd` timeout; `TimeoutExpired`; empty/partial output with no `mServiceState=` line → `_parse_registration` returns None). None is not in the drop-state tuple, so the loop falls into the **recovery** branch: it appends `=== RECOVERED … (duration Ns) ===`, clears `in_drop`, and the next poll re-detects the still-down radio as a brand-new episode. The logger therefore records its most misleading data exactly when the modem is wedged — the moment dumpsys is most likely to hang (the RIL desync events this feature exists to capture). The recovery stamp is also used by the operator to decide the drop self-healed; a dumpsys glitch manufactures a fake "recovered in 10s".
+
+Probe (traced mock, `_drop_state` stubbed OUT_OF_SERVICE → None → OUT_OF_SERVICE): iteration 2 appends `RECOVERED (duration 10s)`, resets `in_drop`; iteration 3 starts a new episode; final file contains a spurious recovery between two drops that were one.
+
+Evidence: `web/server.py:378-379` (None → recovery branch), `:387-393` (recovery stamp + reset), `:316-321` (`_drop_state` → None), `:470-472` (`_run_dumpsys` timeout=5). Affected: drop-log analysis quality on every device with drop logging enabled; compounds A-176 (IWLAN signature missed entirely) and A-154 (wall-clock durations). Remediation: treat None as "unknown" — skip the poll (no stamp, no reset) and only stamp recovery on an explicit non-drop state; fold `network_type` into the recovery decision per A-176. Confirmed (mocked trace).
 
 ## Not yet fixed
 
