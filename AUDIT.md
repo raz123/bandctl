@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-184
+## Continuation audit (2026-08-10) — findings A-150..A-186
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2969,6 +2969,25 @@ Probe: on any POSIX host, `python3 -c 'import time; time.sleep(5)' & ` plus a pr
 `test_server.py` (64 tests) covers settings/auth/validation/atomic-writes, but has NO test for `_parse_signal_object`, `_parse_signal_legacy`, `_parse_registration`, or the band-camping parse — the parsers that drive the entire Diag tab (signal graph, registration chips, camping list) and the drop-logger's trigger. The dual-format branches (modern `mServiceState={...}` object vs legacy flat `ServiceState: <voice> <data>`; `SignalStrength:{...}` vs flat list) — exactly the code an Android update can break — have no regression net; a format drift silently degrades the UI (nulls everywhere) and can blind the drop watchdog (A-181's family) with nothing failing loudly.
 
 Probe: `grep -c '_parse_signal\|_parse_registration\|_parse_band' test_server.py` → 0. Evidence: `web/server.py:649-756` (signal object/legacy), `:757-815` (registration), test_server.py absent coverage; A-163 covers the diag protocol tests, not the server parsers. Affected: regression risk on ROM/Android updates; compounds A-163. Remediation: fixture-based tests for both object and legacy formats of each parser (the modem_logs/ evidence files are ready-made fixtures). Confirmed.
+
+### A-185 — Drop-log snapshots persist radio-buffer contents (IMSI/phone numbers) in world-readable files (P2)
+
+When drop logging is enabled, each episode snapshot (`_drop_snapshot_text`) writes the last 40 PHONE0 lines of `logcat -b radio` (RIL traffic — IMSI, dialed/received numbers, cell identifiers), plus wifi status (SSID/BSSID), call state, and net counters. The radio buffer is root/radio-group protected on Android; the server runs as root and **extracts those lines into plain files**: `_drop_log_loop` writes episodes with `open(w.episode_file, 'w')` — no explicit mode, no O_NOFOLLOW — landing in `config/drop_log/` created by `os.makedirs(..., exist_ok=True)` inside the world-writable config tree (A-180; root umask 000 → 777 dir, 666 files). Any unprivileged app can read the snapshots (IMSI/phone-number exfiltration — a privacy boundary the radio buffer normally enforces) and can append forged `DROP`/`RECOVERED` lines (log poisoning, same family as A-180). The files persist until the next module update wipes them (A-173) — a long exposure window.
+
+Evidence: `web/server.py:324-345` (radio-buffer tail in snapshot), `:359-380` (`open(..., 'w')` default mode, `os.makedirs` in the 777 tree), A-180 (config perms), A-173 (wipe window). Affected: every device with drop logging enabled while an episode occurs. Remediation: write snapshots with 0o600 (and 700 for drop_log/), never persist raw radio-buffer lines (redact IMSI/numbers or drop the tail), and add O_NOFOLLOW. Confirmed (static — mode/placement from code; radio-buffer sensitivity is the platform's own protection).
+
+### A-186 — The documented crash bands (7/66) are exposed in every default path except the Rogers whitelist (P2)
+
+README: "LTE bands **7 and 66 are intentionally disabled** — a community-validated fix for Canadian carriers: the SM8250 modem can crash during 66↔7 handover." That exclusion exists ONLY in `_ROGERS_BANDS`. Every other path exposes the crash pair on the same SM8250 hardware:
+
+- `_ALL_BANDS` (`web/server.py:453-456`) — the non-Rogers default — includes LTE 7, 66 and NR 7, 66; the README itself says non-Rogers get "unrestricted (all bands)".
+- UI fallback `DEFAULT_LTE`/`DEFAULT_NR` (`web/index.html`) — the unreachable-server state — includes 7 and 66.
+- The UI band catalogs present 7 and 66 as selectable buttons; the server's 1-79 validation accepts them; a QMI apply of 66 succeeds (the crash fires later on 66↔7 handover, not at apply), and the mirror persists it to bands.json — so boot-apply re-applies the crash pair on every boot.
+- A mid-drop reset (operator prop empty → `seed_config_if_absent` skips; `read_config` falls back to the all-bands list) lands the user on 66/7.
+
+A Bell/Telus user (same alioth/SM8250) hitting "Reset to defaults" gets the documented crash pair selected and saved — contradicting the README's "intentionally disabled" claim, which holds only for the Rogers whitelist.
+
+Probe: `_ALL_BANDS` and `DEFAULT_LTE/NR` list inspection (66 and 7 present); README:95 documents the crash + the intentional-disable claim; `_normalize_bands` accepts 1-79 (66 passes); `_save_config_file` mirrors unconditionally. Evidence: `web/server.py:453-456`, `:1122-1149` (validation), `:1395-1400` (mirror), `web/index.html` catalogs, README:95. Affected: non-Rogers carriers on SM8250 devices, mid-drop resets. Remediation: exclude 7/66 from the all-bands default and the UI fallback (keep them reachable only via explicit user action with a warning), or block them server-side for SM8250. Confirmed (static — lists + README claim).
 
 ## Not yet fixed
 
