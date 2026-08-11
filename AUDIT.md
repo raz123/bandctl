@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-186
+## Continuation audit (2026-08-10) — findings A-150..A-188
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -2988,6 +2988,18 @@ README: "LTE bands **7 and 66 are intentionally disabled** — a community-valid
 A Bell/Telus user (same alioth/SM8250) hitting "Reset to defaults" gets the documented crash pair selected and saved — contradicting the README's "intentionally disabled" claim, which holds only for the Rogers whitelist.
 
 Probe: `_ALL_BANDS` and `DEFAULT_LTE/NR` list inspection (66 and 7 present); README:95 documents the crash + the intentional-disable claim; `_normalize_bands` accepts 1-79 (66 passes); `_save_config_file` mirrors unconditionally. Evidence: `web/server.py:453-456`, `:1122-1149` (validation), `:1395-1400` (mirror), `web/index.html` catalogs, README:95. Affected: non-Rogers carriers on SM8250 devices, mid-drop resets. Remediation: exclude 7/66 from the all-bands default and the UI fallback (keep them reachable only via explicit user action with a warning), or block them server-side for SM8250. Confirmed (static — lists + README claim).
+
+### A-187 — Long drop episodes produce multiple files, only the last gets a recovery stamp (P3)
+
+When an episode outlasts `DROP_SNAP_GAP` (60s), `_drop_log_loop` creates a NEW episode file (a refresh so the radio tail stays relevant) and the old file is never touched again — the recovery stamp (`=== RECOVERED … ===`) is appended only to the last file. One drop of 3 minutes therefore produces 3 files, the first two of which permanently look like un-recovered drops. With `read_drop_log` returning filenames only (A-174), the file count is the operator's only signal — it overstates the drop count 3x and understates recovery (all but the last file show no recovery). The long-episode refresh also rewrites `=== DROP DETECTED ===` per file, so the same episode looks like a chain of separate drops.
+
+Probe: trace the loop with `DROP_SNAP_GAP = 1` and a 3-poll drop → 3 files, recovery line on the last only. Evidence: `web/server.py:381-387` (refresh creates a new file), `:391-398` (recovery stamps only `w.episode_file` — the last one). Affected: drop-log analysis on long outages (the device's observed drops lasted minutes). Remediation: keep one file per episode (append the refresh, don't rotate) or stamp all files of an episode on recovery; group files per episode in `read_drop_log`. Confirmed (code trace).
+
+### A-188 — Drop-logger episode state is lost on server restart mid-episode (P3)
+
+`_DROP_WATCH` (in_drop, drop_start, episode_file) is module-level in-memory state (`web/server.py:268`). The server restarts on every API restart (`POST /api/restart` → service.sh kills and respawns — also at boot) and the daemon thread dies with it. A restart while the radio is down orphans the episode file — no `=== RECOVERED ===` line is ever appended — and the fresh watchdog re-detects the still-down radio as a brand-new episode, so one outage yields two files, neither with a correct recovery (the orphan's recovery is missing, the new file's duration starts from the restart). Compounds A-181 (dumpsys-None false recovery) and A-187 (multi-file episodes).
+
+Evidence: `web/server.py:268` (`_DROP_WATCH = _DropWatch()` at import — state resets with the process), `:1215-1231` (restart respawns the server), A-187 (file rotation). Affected: drop analysis across restarts — a restart is plausible exactly during an outage (the user diagnosing the drop clicks Restart). Remediation: persist episode state (start timestamp + file) in settings.json or the drop_log dir on detection, and reconcile open episodes at startup. Confirmed (code trace).
 
 ## Not yet fixed
 
