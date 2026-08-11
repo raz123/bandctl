@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-188
+## Continuation audit (2026-08-10) — findings A-150..A-191
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3000,6 +3000,24 @@ Probe: trace the loop with `DROP_SNAP_GAP = 1` and a 3-poll drop → 3 files, re
 `_DROP_WATCH` (in_drop, drop_start, episode_file) is module-level in-memory state (`web/server.py:268`). The server restarts on every API restart (`POST /api/restart` → service.sh kills and respawns — also at boot) and the daemon thread dies with it. A restart while the radio is down orphans the episode file — no `=== RECOVERED ===` line is ever appended — and the fresh watchdog re-detects the still-down radio as a brand-new episode, so one outage yields two files, neither with a correct recovery (the orphan's recovery is missing, the new file's duration starts from the restart). Compounds A-181 (dumpsys-None false recovery) and A-187 (multi-file episodes).
 
 Evidence: `web/server.py:268` (`_DROP_WATCH = _DropWatch()` at import — state resets with the process), `:1215-1231` (restart respawns the server), A-187 (file rotation). Affected: drop analysis across restarts — a restart is plausible exactly during an outage (the user diagnosing the drop clicks Restart). Remediation: persist episode state (start timestamp + file) in settings.json or the drop_log dir on detection, and reconcile open episodes at startup. Confirmed (code trace).
+
+### A-189 — The test suite codifies the loopback-trust flaw as intended behavior (P2)
+
+`TestAuth` asserts the A-178 vulnerability as correct: `test_loopback_exempt_without_token` (`test_server.py:254-256`), `test_ipv6_loopback_exempt` (`:258-260`), and `test_loopback_request_not_gated_end_to_end` (`:321-324`) all assert that any loopback client bypasses authentication on every action — exactly the privilege-escalation surface A-178 documents. Fixing A-178 (requiring a token or device-local secret for state-changing loopback calls) breaks these tests, so the suite is a concrete barrier to the security remediation — a maintainer running the tests sees green and the flaw is re-verified as intended. Separately, the `allowed()` helper (`:243-252`) reimplements the gate sequence (`_auth_required` → `_check_auth`) instead of exercising `handle_api`, so a divergence between the helper's sequence and the real dispatch would pass tests while the shipped path differs (the end-to-end tests at `:307-324` partially close this).
+
+Evidence: `test_server.py:243-252,254-260,321-324`; A-178 (the loopback trust model). The mirror-on-failure behavior (A-186-family write persistence) has NO cementing test — `test_write_config_invalid_never_applies` covers validation-failure only, and no test exercises `_save_config_file` on a valid-but-failed apply. Affected: A-178 remediation, test realism. Remediation: rewrite the three tests to require credentials from loopback for state-changing actions (keep read-only diagnostics exempt); add a mirror-on-failure test that pins the intended (or fixed) semantics. Confirmed (test bodies read).
+
+### A-190 — The UI logs a false DROP whenever the server is unreachable (P3)
+
+`serverDown()` calls `logDrop('Server unreachable — …')` (`web/index.html:1343-1349`), so every server outage produces a red DROP entry in the in-page history — including the server restart the user just triggered with "Restart server", a LAN disconnect, a Wi-Fi blip, or a boot in progress. The history conflates radio drops (the thing the drop record exists for) with connectivity failures, showing "drops" that never happened. Compounds A-182 (history is ephemeral) and A-187 (file-count confusion) — three independent ways the visible drop record lies.
+
+Evidence: `web/index.html:1343-1349` (`serverDown` → `logDrop`), `:1509-1528` (`logEntry`/`logDrop` tags), `:2017-2027` (`restartServer` triggers the outage). Affected: Diag tab history interpretation on every page. Remediation: tag connectivity failures as `NET` (or `ERR`), reserve `DROP` for service_state transitions; suppress the entry when the outage follows a user-initiated restart. Confirmed (code read).
+
+### A-191 — The LAN token input is a plain text field (P3)
+
+`#lan-token-input` is `type="text"` (`web/index.html:1054`), so the bearer token is visible in cleartext while typed and while the field holds focus — on the phone's own screen (KSU WebUI) this is exposed to shoulder-surfing and to any screen-recording/screen-capture app or accessibility layer. A-130 covers the masked DISPLAY of the stored token; the input itself is unmasked. The token is the LAN remote-control credential (A-178).
+
+Evidence: `web/index.html:1054`. Affected: token entry on the phone. Remediation: `type="password"` with an eye-toggle (matching `lan-token-show`'s pattern). Confirmed.
 
 ## Not yet fixed
 
