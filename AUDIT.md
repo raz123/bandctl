@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-193
+## Continuation audit (2026-08-10) — findings A-150..A-195
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3030,6 +3030,18 @@ Evidence: `web/index.html:1226-1230,1267-1272`; the reset-modal pattern at `:129
 `confirmModemReset()` POSTs the reset, which powers the radio off and on (3s apart, or the 6s airplane toggle). During that window the registration poll sees the radio leave IN_SERVICE and `checkRegChange` fires `logDrop('Service lost: …')` — a red DROP entry caused by the user's own reset button. The history cannot distinguish a user-initiated reset from an outage, so a deliberate reset looks like a radio drop (same family as A-190's server-down entries — the visible drop record mixes user actions with failures). Compounding A-190: both the restart and the reset — the two things a user does to FIX a drop — each manufacture false DROP entries.
 
 Probe: trace `confirmModemReset` (POST) → modem_reset powers radio off → `pollRegistration` (2s) sees POWER_OFF → `checkRegChange` IN_SERVICE→POWER_OFF → `logDrop`. Evidence: `web/index.html:1293-1311` (`confirmModemReset`), `:1431-1447` (`checkRegChange`), `web/server.py:1500-1557` (reset powers radio off); A-190 (server-down entries). Affected: Diag tab history interpretation. Remediation: suppress DROP tagging while a reset/restart is in flight (set a `userInitiated` flag in confirmModemReset/restartServer, cleared on the next IN_SERVICE poll). Confirmed (code trace).
+
+### A-194 — Every QMI call pays a fixed ~3s discovery with only ~1.4s of timeout margin left (P2 extension of A-64)
+
+A-64 covers the worst-case discovery (98s) vs the 5s/8s subprocess timeouts. The sharper edge: `find_nas()` has a FIXED `time(NULL) + 3` second QRTR enumeration wait on EVERY invocation (no caching — each `qmi_band --get`/`--set` re-discovers from scratch), so the minimum discovery before the first response is ~3s + one 600ms probe ≈ 3.6s. The GET timeout is 5s — a **~1.4s margin** — so a modem that answers its first probe even slightly slowly (QRTR latency, radio instability — the exact conditions this module exists to diagnose) kills `qmi_band --get`; `/api/read` and `/api/health` fall back to diag/config while the radio is merely slow, not down. The SET (8s) leaves ~4s after the same fixed 3s. Every QMI read/apply also re-pays the full 3s enumeration, so the UI's 2s signal/registration polling and the health polls each spawn a qmi_band that burns 3s+ discovering before a single byte of band data — wasted subprocess time on every poll that touches QMI.
+
+Evidence: `qmi/qmi_band.c:608-673` (fixed `time(NULL)+3` wait, per-call discovery, no cache), `web/server.py:228-229` (5s/8s), `:1277-1281` (`_run_qmi(["--get"], 5)`), A-64. Affected: read/health/apply paths during slow-modem conditions; QMI-path latency on every call. Remediation: cache the discovered NAS endpoint (or persist it) across invocations, and/or raise QMI_GET_TIMEOUT above the fixed enumeration + probe budget. Confirmed (code read; the 3s minimum is unconditional).
+
+### A-195 — The README's screenshots show the pre-v2.6 dark UI while the shipped skin is white (P3 extension of A-19)
+
+`bands.png`, `diag.png`, and the settings screenshot referenced in the README were captured from the dark v2.5 skin; v2.6 shipped the white mobile skin (and the stale dark `index.html` remains at the repo root, A-157). A reader following the README sees a dark UI that no shipped artifact produces (root excepted). A-19 flagged the settings.png staleness; the same drift now applies to all three screenshots after the skin change, and the tracked PNGs predate the white tokens (`web/index.html:649-672`).
+
+Evidence: tracked `bands.png`/`diag.png` (dark-skin captures), README screenshot references, A-19, A-157. Affected: documentation accuracy. Remediation: re-capture the three screenshots from the v2.6 white skin (or the WebUI). Confirmed (tracked assets predate the white skin; v2.6 zip carries only code, no PNGs).
 
 ## Not yet fixed
 
