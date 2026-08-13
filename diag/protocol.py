@@ -140,11 +140,21 @@ def build_nv_write_cmd(nv_id: int, data: bytes, slot: int = 0) -> bytes:
     return bytes(header) + data
 
 
-def parse_nv_read_response(response: bytes) -> Optional[dict]:
+def parse_nv_read_response(
+    response: bytes,
+    expected_nv_id: Optional[int] = None,
+    expected_sub_id: Optional[int] = None,
+) -> Optional[dict]:
     """Parse an NV read response (nv_read_rsp_type).
 
     Layout: ``rsp 0x3D | nv_id LE | sub_id LE | status | data_len LE | data``
     -- status sits at offset 5, *before* data_len at 6-7 and data at 8.
+
+    ``expected_nv_id`` / ``expected_sub_id`` mirror the caller's request:
+    when given, the echoed values in the response must match or None is
+    returned. This stops a stray status frame (e.g. the _scan_stream
+    fallback surfacing the LTE reply for an NR read, or vice versa) from
+    being misattributed to the caller's request.
 
     Returns ``{nv_id, sub_id, status, data, success}`` or None on error.
     """
@@ -153,6 +163,10 @@ def parse_nv_read_response(response: bytes) -> Optional[dict]:
 
     nv_id = struct.unpack('<H', response[1:3])[0]
     sub_id = struct.unpack('<H', response[3:5])[0]
+    if expected_nv_id is not None and nv_id != expected_nv_id:
+        return None
+    if expected_sub_id is not None and sub_id != expected_sub_id:
+        return None
     status = response[5]
     data_len = struct.unpack('<H', response[6:8])[0]
 
@@ -169,11 +183,19 @@ def parse_nv_read_response(response: bytes) -> Optional[dict]:
     }
 
 
-def parse_nv_write_response(response: bytes) -> Optional[dict]:
+def parse_nv_write_response(
+    response: bytes,
+    expected_nv_id: Optional[int] = None,
+    expected_sub_id: Optional[int] = None,
+) -> Optional[dict]:
     """Parse an NV write response (nv_write_rsp_type).
 
     Layout: ``rsp 0x3E | nv_id LE | sub_id LE | status`` -- 6 bytes total,
     status at offset 5.
+
+    ``expected_nv_id`` / ``expected_sub_id`` mirror the caller's request:
+    when given, the echoed values in the response must match or None is
+    returned (same misattribution guard as parse_nv_read_response).
 
     Returns ``{nv_id, sub_id, status, success}`` or None on error.
     """
@@ -182,6 +204,10 @@ def parse_nv_write_response(response: bytes) -> Optional[dict]:
 
     nv_id = struct.unpack('<H', response[1:3])[0]
     sub_id = struct.unpack('<H', response[3:5])[0]
+    if expected_nv_id is not None and nv_id != expected_nv_id:
+        return None
+    if expected_sub_id is not None and sub_id != expected_sub_id:
+        return None
     status = response[5]
     return {
         'nv_id': nv_id,
