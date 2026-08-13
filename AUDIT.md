@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-205
+## Continuation audit (2026-08-10) — findings A-150..A-207
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3109,6 +3109,18 @@ Evidence: `bandctl-v2.6.zip` entries (`web/index.html` + `webroot/index.html`), 
 `qmi/Makefile`'s `push` target runs `adb push qmi_band /data/local/tmp/` + `adb shell chmod 755 /data/local/tmp/qmi_band` — dropping the freshly-built binary into exactly the path the server's `QMI_BIN` fallback execs as root when the module binary is missing (`web/server.py:225-227`). The A-198 fallback is not a hypothetical attacker surface: it is the project's own documented dev workflow (the README's `adb forward` testing + this Makefile target, and the module's own convention of pushing to `/data/local/tmp` because `/sdcard` push is broken post-reboot). The dev tooling legitimizes a world-adjacent root-exec target, and a stale/planted binary there (from any earlier build, another project, or an attacker with shell access) is silently exec'd by the root server — the very "tampered binary executes as root" scenario A-198 describes, made routine by the build system.
 
 Evidence: `qmi/Makefile` (push target), `web/server.py:225-227` (fallback), A-198 (root-exec boundary). Affected: any dev machine or device where the fallback path contains a binary. Remediation: push to a module-private path, or verify the binary hash before exec (A-198's remediation). Confirmed (Makefile + code).
+
+### A-206 — The README's settings.png is a v1.x-era capture: it documents a control v2.x removed ("Auto-disable bands on boot"), and the v2.x boot-apply is always-on with no UI disable (P3)
+
+Vision inspection of `settings.png` shows a Settings tab with an "Auto-disable bands on boot" toggle and "Disable unchecked bands at boot (applied on next boot)" — a control that does NOT exist in the v2.6 settings panel (read in full: Config Summary, Presets, Export/Import, Network access, Debug — no boot-apply toggle). The screenshot is doubly stale: dark skin (A-195) AND a removed control. The behavioral consequence is real: the v2.x boot-apply is always-on, gated only by `config/bands.json` existence (`web/server.py:508-512`, README "config-file absent = no-op") — there is no UI way to disable it, and a user who had the old toggle OFF silently gets boot-apply forced on after upgrading (their bands.json persists — A-173's wipe aside). That means A-186's crash-pair config (66/7) — if present — is re-applied at every boot with no UI off-switch. The docs' Settings tab is a different product than the shipped one.
+
+Evidence: `settings.png` (vision-verified "Auto-disable bands on boot" text), v2.6 `web/index.html` settings panel (no such control), `web/server.py:508-512` (config-gated always-on boot-apply), A-195 (dark skin), A-186 (crash pair). Affected: v1.x upgraders and anyone relying on the screenshot to find the disable control. Remediation: re-capture the screenshots against v2.6, and add a UI toggle to disable the boot-apply (or document the delete-config disable path in the UI). Confirmed (vision + code).
+
+### A-207 — Drop-log snapshots accumulate without rotation or cap: privacy-sensitive files grow unbounded in the world-writable config tree (P3 extension of A-201/A-185)
+
+The drop logger writes one file per episode (`drop_YYYYMMDD_HHMMSS.txt`) and never rotates, trims, or caps them — `_drop_log_files()` lists only the newest 20 (`web/server.py:408-412`), but the files themselves accumulate forever. The camping log has the identical gap (A-201); the drop log is the sharper instance because the content is privacy-sensitive (last 40 radio-buffer lines with IMSI/numbers — A-185) and the files live in the A-180 world-writable config tree where an unprivileged app can also append/poison them. Over the module's lifetime the directory grows without bound, and the oldest snapshots (the historical evidence the drop research depends on) silently age out of the API listing while remaining on disk.
+
+Evidence: `web/server.py:371-377` (episode files), `:408-412` (top-20 list, no rotation), `:407-412` (drop-log GET), A-201 (camping-log growth), A-185 (privacy), A-180 (config perms), A-187 (multi-file per long drop). Affected: long-running installs; the snapshot archive and the privacy leak both grow. Remediation: cap/rotate the drop_log dir (e.g. keep the newest N episodes), mirroring A-201's remediation for the camping log. Confirmed (code trace).
 
 ## Not yet fixed
 
