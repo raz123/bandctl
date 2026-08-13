@@ -15,7 +15,6 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
    - Alternatively, from a root shell: `ksud module install bandctl-*.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
-   - **KernelSU Manager WebUI** — open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl` directly). The UI is served from inside the Manager and the API calls reach the module's python server at 127.0.0.1:8080 (loopback cleartext is allowed by the Manager). Works out of the box — no extra setup.
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
 
@@ -61,7 +60,6 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 - **Carrier-aware defaults** — Rogers (302720) gets a curated whitelist; other carriers get unrestricted defaults until you lock bands.
 - **RSRP graph UI** — the web UI plots signal strength over time.
 - **Config persistence** — band settings are mirrored to `/data/adb/modules/bandctl/config/bands.json` and survive reboots.
-- **KernelSU Manager WebUI** — after install, open the module in KernelSU/ReSukiSU Manager and tap the launch button (or open `ksu://webui/bandctl`); the UI also still works at http://localhost:8080.
 
 ## How it works
 
@@ -79,7 +77,7 @@ Where the QRTR QMI service is unavailable, the module falls back to `/dev/diag` 
 
 ## Network access
 
-By default the server listens on **127.0.0.1 only** — reachable from the phone itself (Manager WebUI, device browser, `adb forward`), never from the network. To control the module from a computer on the same Wi-Fi, enable **Network access → Allow access from other devices** in the Settings tab: the server then binds all interfaces and **every API call from a non-loopback client requires the access token** shown in the UI (regenerate it anytime). The phone itself never needs the token. This is plain HTTP on your LAN — fine for home use, but treat the token like a password.
+By default the server listens on **127.0.0.1 only** — reachable from the phone itself (device browser, `adb forward`), never from the network. To control the module from a computer on the same Wi-Fi, enable **Network access → Allow access from other devices** in the Settings tab: the server then binds all interfaces and **every API call from a non-loopback client requires the access token** shown in the UI (regenerate it anytime). The phone itself never needs the token. This is plain HTTP on your LAN — fine for home use, but treat the token like a password.
 
 ## Band configuration
 
@@ -98,7 +96,7 @@ LTE bands **7 and 66 are intentionally disabled** — a community-validated fix 
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
 - Server tests: **64/64 passing**; diag protocol tests: **2/2 passing** (`python3 test_server.py` / `python3 test_diag_client.py`).
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), and `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot), and `tools/check_release_zip.py` (release gate: run `python3 tools/check_release_zip.py bandctl-*.zip` before publishing — it fails a zip missing the bundled interpreter, whose `diag/protocol.py` differs from the tested copy, or whose `_ssl`/`_hashlib` DT_NEEDED closure is unsatisfiable on bionic).
 
 ## License
 
