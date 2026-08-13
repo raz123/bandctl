@@ -111,6 +111,7 @@ HTTP API (all responses are JSON, served from the phone's web root):
 import http.server
 import fcntl
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -170,6 +171,14 @@ def _load_settings():
         settings["token"] = token if isinstance(token, str) and token else None
         if isinstance(data.get("drop_log"), bool):
             settings["drop_log"] = data["drop_log"]
+        # A-105/A-218: never accept a LAN bind without a usable token. That
+        # state remote-locks every non-loopback client (every request 401s
+        # while the server is reachable on the LAN, and the recovery POST is
+        # itself behind the gate). Downgrade to loopback-only so the server
+        # stays locally administrable; update_settings never produces this
+        # combination because the token is minted before the bind is flipped.
+        if settings["bind"] == "0.0.0.0" and not settings["token"]:
+            settings["bind"] = "127.0.0.1"
     except (OSError, ValueError):
         pass
     return settings
@@ -179,27 +188,77 @@ def _load_settings():
 # re-runs service.sh so a bind/token change takes effect on the fresh process.
 SETTINGS = _load_settings()
 
+# The address the HTTP socket actually listens on, set in __main__ after the
+# server binds. Auth decisions use THIS rather than SETTINGS["bind"] (A-049):
+# update_settings flips SETTINGS["bind"] immediately while the socket stays
+# put until the restart, so gating on the settings value would let a remote
+# client pass unauthenticated for the whole window after "disable LAN".
+# None outside __main__ (tests/imports) -> fall back to SETTINGS["bind"].
+_EFFECTIVE_BIND = None
+
+# Serialize POST /api/settings (and the drop-log toggle, which mutates the
+# same SETTINGS dict) so two racing requests cannot interleave their
+# read-modify-write of the shared snapshot (A-041).
+_SETTINGS_UPDATE_LOCK = threading.Lock()
+
+# One scheduled restart at a time (A-041): repeated taps must not stack
+# detached service.sh runs that each kill and replace the server.
+_RESTART_LOCK = threading.Lock()
+_RESTART_PENDING = False
+
+
+def _ensure_private_dir(path):
+    """Create `path` root-private (0o700), re-asserting the mode on an
+    existing directory.
+
+    Hardens the module config tree (A-180): service.sh's bare `mkdir -p`
+    inherits the boot umask (000 -> world-writable 777) and nothing else
+    chmods it, which lets any unprivileged app unlink/replace files in it.
+    The server runs as root and is the only legit reader of config/ and
+    config/drop_log/, so 0o700 is safe and strictly tighter than the
+    audit's 0755 recommendation."""
+    path = Path(path)
+    os.makedirs(str(path), mode=0o700, exist_ok=True)
+    try:
+        os.chmod(str(path), 0o700)
+    except OSError:
+        pass
+
 
 def _atomic_write_json(path, data):
     """Persist `data` as JSON to `path` atomically (M7).
 
     Writes to a temp file in the same directory, fsyncs, then
     os.replace()s it over the target so readers never observe a
-    partially-written file. The temp file is opened with O_NOFOLLOW so a
-    symlink planted at the temp name cannot redirect the write; the
-    replace itself swaps the target name outright (a pre-existing symlink
-    at the target is replaced, not followed). Writes are serialized by
-    _CONFIG_WRITE_LOCK. Raises on failure; callers turn exceptions into
-    JSON error responses."""
+    partially-written file. The temp file is opened with O_NOFOLLOW|O_EXCL
+    (A-180/A-211) so a symlink or pre-created hard link planted at the temp
+    name cannot redirect or truncate the write; a leftover temp from a
+    crashed save is cleared once and retried. The replace itself swaps the
+    target name outright (a pre-existing symlink at the target is replaced,
+    not followed). The directory is created root-private (A-180). Writes
+    are serialized by _CONFIG_WRITE_LOCK. Raises on failure; callers turn
+    exceptions into JSON error responses."""
     path = Path(path)
-    os.makedirs(str(path.parent), exist_ok=True)
+    _ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    flags |= os.O_EXCL
     tmp = os.path.join(str(path.parent),
                        ".{}.{}.tmp".format(path.name, os.getpid()))
     with _CONFIG_WRITE_LOCK:
-        fd = os.open(tmp, flags, 0o600)
+        fd = None
+        for attempt in (0, 1):
+            try:
+                fd = os.open(tmp, flags, 0o600)
+                break
+            except FileExistsError:
+                if attempt:
+                    raise
+                # Stale temp left by a crashed save: clear and retry.
+                os.unlink(tmp)
+        if fd is None:
+            raise OSError("cannot create temp file {}".format(tmp))
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
@@ -214,17 +273,22 @@ def _atomic_write_json(path, data):
             raise
 
 
-def _save_settings():
-    """Atomically persist the in-memory SETTINGS snapshot."""
-    _atomic_write_json(SETTINGS_FILE, SETTINGS)
+def _save_settings(settings=None):
+    """Atomically persist the in-memory SETTINGS snapshot (or a supplied
+    copy of it — persist-first callers pass the proposed new state)."""
+    _atomic_write_json(SETTINGS_FILE,
+                       settings if settings is not None else SETTINGS)
 
 
-# QMI band-apply client (QRTR transport). Resolved relative to the module
-# dir like DIAG_DIR; falls back to /data/local/tmp/qmi_band for dev use.
-# The module zip ships the static binary at qmi/qmi_band.
+# QMI band-apply client (QRTR transport), resolved relative to the module
+# dir like DIAG_DIR; the module zip ships the static binary at qmi/qmi_band.
+# A-198: the old fallback silently exec'd /data/local/tmp/qmi_band (an
+# adb-push scratch dir) as root. Never substitute non-module binaries —
+# when the bundled artifact is missing, QMI is simply unavailable and
+# _run_qmi reports it; __main__ logs the condition loudly.
 QMI_BIN = Path(__file__).parent.parent / "qmi" / "qmi_band"
 if not QMI_BIN.exists():
-    QMI_BIN = Path("/data/local/tmp/qmi_band")
+    QMI_BIN = None
 QMI_GET_TIMEOUT = 5
 QMI_SET_TIMEOUT = 8
 
@@ -330,17 +394,11 @@ def _drop_snapshot_text(reg):
         lines.append("call_state: {}".format(call))
     lines.append("wifi: {}".format(_wifi_status()))
     lines.append("counters: {}".format(_net_counters()))
-    try:
-        tail = _run_cmd(["/system/bin/logcat", "-b", "radio", "-d",
-                         "-v", "threadtime", "-t", "300"], timeout=5)
-        ph0 = [ln for ln in tail.splitlines() if "PHONE0" in ln][-40:]
-        if ph0:
-            lines.append("radio tail (PHONE0, last {}):".format(len(ph0)))
-            lines.extend(ph0)
-        else:
-            lines.append("radio tail: (no PHONE0 lines)")
-    except Exception as e:
-        lines.append("radio tail unavailable: {}".format(e))
+    # A-185: the radio buffer is root/radio-group protected precisely
+    # because it carries IMSI and phone numbers. Never persist raw RIL
+    # lines into world-reachable files; record an explicit marker instead.
+    lines.append("radio tail: omitted (privacy — raw RIL lines not "
+                 "persisted)")
     return "\n".join(lines) + "\n"
 
 
@@ -367,7 +425,11 @@ def _drop_log_loop():
                     if not w.in_drop:
                         w.in_drop = True
                         w.drop_start = now
-                        os.makedirs(DROP_LOG_DIR, exist_ok=True)
+                        # A-180/A-185: snapshots live in a root-private dir,
+                        # are written 0o600 with O_NOFOLLOW (a planted
+                        # symlink cannot redirect the write), and never
+                        # clobber an existing file (O_EXCL).
+                        _ensure_private_dir(DROP_LOG_DIR)
                         w.episode_file = DROP_LOG_DIR / "drop_{}.txt".format(
                             time.strftime("%Y%m%d_%H%M%S"))
                     elif now - w.drop_start >= DROP_SNAP_GAP:
@@ -376,10 +438,20 @@ def _drop_log_loop():
                         w.episode_file = DROP_LOG_DIR / "drop_{}.txt".format(
                             time.strftime("%Y%m%d_%H%M%S"))
                     if w.episode_file and not w.episode_file.exists():
-                        with open(w.episode_file, 'w') as f:
-                            f.write("=== DROP DETECTED {} ===\n".format(
-                                time.strftime("%Y-%m-%d %H:%M:%S")))
-                            f.write(_drop_snapshot_text(reg))
+                        fd = os.open(str(w.episode_file),
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                     getattr(os, "O_NOFOLLOW", 0), 0o600)
+                        try:
+                            with os.fdopen(fd, 'w') as f:
+                                f.write("=== DROP DETECTED {} ===\n".format(
+                                    time.strftime("%Y-%m-%d %H:%M:%S")))
+                                f.write(_drop_snapshot_text(reg))
+                        except BaseException:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                            raise
                 time.sleep(DROP_POLL_INTERVAL)
             else:
                 with w.lock:
@@ -390,10 +462,21 @@ def _drop_log_loop():
                         w.drop_start = None
                         w.episode_file = None
                         if path:
-                            with open(path, 'a') as f:
-                                f.write("=== RECOVERED {} (duration {}s) ===\n".format(
-                                    time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    int(duration)))
+                            fd = os.open(str(path),
+                                         os.O_WRONLY | os.O_APPEND |
+                                         os.O_CREAT |
+                                         getattr(os, "O_NOFOLLOW", 0), 0o600)
+                            try:
+                                with os.fdopen(fd, 'a') as f:
+                                    f.write("=== RECOVERED {} (duration {}s) ===\n".format(
+                                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        int(duration)))
+                            except BaseException:
+                                try:
+                                    os.close(fd)
+                                except OSError:
+                                    pass
+                                raise
                             print("Drop episode recorded: {} ({}s)".format(
                                 path, int(duration)))
                 time.sleep(DROP_POLL_INTERVAL)
@@ -527,11 +610,15 @@ def seed_config_if_absent():
 def _run_qmi(args, timeout):
     """Run the QMI band client; return (returncode, combined output).
 
-    Returns (None, "") when the binary is missing, not executable (e.g.
-    the exec bit was lost during install), or the call times out - callers
-    treat that as "QMI unavailable" and fall back. Catching OSError keeps
-    a PermissionError from killing the single-threaded HTTP server.
+    Returns (None, "") when the binary is missing (including the A-198
+    None sentinel for a module without the bundled artifact), not
+    executable (e.g. the exec bit was lost during install), or the call
+    times out - callers treat that as "QMI unavailable" and fall back.
+    Catching OSError keeps a PermissionError from killing the
+    single-threaded HTTP server.
     """
+    if QMI_BIN is None:
+        return None, ""
     try:
         proc = subprocess.run([str(QMI_BIN)] + args, capture_output=True,
                               text=True, timeout=timeout)
@@ -925,15 +1012,22 @@ def _band_camping_loop():
     skipped, never fatal."""
     while True:
         try:
-            os.makedirs(os.path.dirname(BAND_CAMPING_LOG), exist_ok=True)
+            _ensure_private_dir(os.path.dirname(BAND_CAMPING_LOG))
             earfcn, band = _parse_band_camping(
                 _run_dumpsys("telephony.registry"))
             if earfcn is not None:
                 line = "{},{},{}\n".format(
                     int(time.time() * 1000), earfcn,
                     band if band is not None else "")
-                with open(BAND_CAMPING_LOG, 'a') as f:
-                    f.write(line)
+                # A-211: append with O_NOFOLLOW so a symlink planted in a
+                # writable dir cannot redirect the write.
+                fd = os.open(BAND_CAMPING_LOG,
+                             os.O_WRONLY | os.O_APPEND | os.O_CREAT |
+                             getattr(os, "O_NOFOLLOW", 0), 0o600)
+                try:
+                    os.write(fd, line.encode())
+                finally:
+                    os.close(fd)
         except Exception as e:
             print("Band camping sample failed: {}".format(e))
         time.sleep(BAND_CAMPING_INTERVAL)
@@ -975,24 +1069,88 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _is_loopback(self):
-        """True when the client connected via a loopback address."""
+        """True when the client connected via a loopback address.
+
+        Uses ipaddress so the WHOLE 127.0.0.0/8 range (127.0.0.2, ...),
+        ::1, and IPv4-mapped forms count — not just the literal 127.0.0.1
+        (A-073)."""
         host = self.client_address[0]
-        return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    # State-changing actions that an unprivileged local app must not reach
+    # without the bearer token when one is configured (A-178/A-189). All
+    # other actions are read-only diagnostics.
+    _WRITE_ACTIONS = frozenset(
+        ["write", "modem-reset", "boot-apply", "restart", "export"])
 
     def _auth_required(self, action):
-        """LAN auth gate (batch contract + bootstrap amendment).
+        """LAN auth gate (A-026/A-049/A-158/A-178).
 
-        A bearer token is required iff LAN is enabled AND the client is
-        not loopback — except GET /api/settings, which returns no token
-        material and must stay readable so a fresh laptop page can learn
-        that a token is required before it can store one."""
-        if SETTINGS["bind"] != "0.0.0.0":
+        Remote (non-loopback) clients are gated whenever the server is
+        actually reachable on a non-loopback interface (the EFFECTIVE bind,
+        A-049 — not the pending SETTINGS value, which update_settings flips
+        before the socket is rebound). The only remote exemption is the
+        read-only GET /api/settings bootstrap, keyed on the PATH so the
+        documented bare route is exempt too (A-158).
+
+        Loopback clients are exempt only for read-only diagnostics; the
+        state-changing actions in _WRITE_ACTIONS (and the drop-log toggle)
+        require the bearer token when one is configured, so an unprivileged
+        phone app or web page cannot drive the modem, restart the server,
+        export files, or mint/steal LAN credentials (A-178/A-189). With no
+        token configured (LAN never enabled), loopback state changes pass —
+        the documented "the phone itself never needs the token" bootstrap.
+        POST /api/settings is handled here as the exposure control and its
+        regenerate path is separately gated on the current token."""
+        effective_bind = _EFFECTIVE_BIND or SETTINGS.get("bind", "127.0.0.1")
+        settings_get = (self.command == "GET"
+                        and self.path.split('?', 1)[0] == '/api/settings')
+        if not self._is_loopback():
+            if effective_bind != "0.0.0.0":
+                return False  # server not listening on this interface
+            if settings_get:
+                return False
+            return True
+        # Loopback client.
+        if settings_get:
             return False
-        if self._is_loopback():
+        if action in self._WRITE_ACTIONS:
+            return SETTINGS.get("token") is not None
+        if action == "drop-log" and self.command == "POST":
+            return SETTINGS.get("token") is not None
+        return False
+
+    def _host_allowed(self):
+        """Validate the Host header (A-178 DNS-rebinding defense).
+
+        Allows the loopback names/addresses and the LOCAL address of this
+        connection (the phone's LAN IP the client actually used). A missing
+        Host (HTTP/1.0) is accepted. Anything else — a rebinding domain —
+        is rejected, so a remote page cannot point its own name at
+        127.0.0.1 and drive the API."""
+        host = (self.headers.get('Host') or '').strip() if self.headers else ''
+        if not host:
+            return True
+        hostname = host
+        if hostname.startswith('['):  # [::1]:8080
+            hostname = hostname.split(']', 1)[0][1:]
+        elif hostname.count(':') == 1:
+            hostname = hostname.rsplit(':', 1)[0]
+        if hostname in ("localhost", "127.0.0.1", "::1"):
+            return True
+        try:
+            local = self.connection.getsockname()[0]
+        except Exception:
+            local = None
+        if local and hostname == local:
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
             return False
-        if action == "settings" and self.command == "GET":
-            return False
-        return True
 
     def _check_auth(self):
         """Validate the bearer token against SETTINGS["token"].
@@ -1035,17 +1193,37 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, TypeError) as e:
             raise ValueError("invalid JSON body: {}".format(e))
 
+    @staticmethod
+    def _cors_origin(origin):
+        """Reflect a cross-origin request's Origin only for the trusted
+        WebView schemes (KernelSU WebUI, Android asset WebViews). Never
+        wildcard: an arbitrary web page must not be able to READ API
+        responses (A-026). LAN-mode laptop clients are same-origin (the
+        page is served by this server) and need no CORS at all."""
+        if not origin:
+            return None
+        origin = origin.strip()
+        if origin.startswith("ksu://") or origin.startswith("appassets://"):
+            return origin
+        return None
+
     def do_OPTIONS(self):
         # CORS preflight for cross-origin POSTs from the KernelSU WebUI
-        # origin (ksu://webui/bandctl/ or appassets://...) and LAN-mode
-        # browser clients. Authorization must be allowed so a laptop page
-        # can send the bearer token on POST /api/settings. Preflights
-        # carry no Authorization header, so OPTIONS stays ungated.
+        # (ksu://webui/bandctl/) and Android asset WebViews (appassets://).
+        # Preflights carry no Authorization header, so the gate is
+        # origin-based: only trusted origins receive allow headers (plus
+        # the Private-Network-Access acknowledgement); everyone else gets a
+        # bare 204 and the browser blocks the request (A-026).
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers',
-                         'Content-Type, Authorization')
+        origin = self.headers.get('Origin') if self.headers else None
+        allowed = self._cors_origin(origin)
+        if allowed:
+            self.send_header('Access-Control-Allow-Origin', allowed)
+            self.send_header('Access-Control-Allow-Methods',
+                             'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers',
+                             'Content-Type, Authorization')
+            self.send_header('Access-Control-Allow-Private-Network', 'true')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -1061,6 +1239,13 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": "unknown action"})
                 return
 
+            # A-178: DNS-rebinding defense — the Host must be a loopback
+            # name or this connection's own local address.
+            if not self._host_allowed():
+                self.send_json({"ok": False, "error": "invalid host"},
+                               status=403)
+                return
+
             query = self.path.split('?', 1)[1] if '?' in self.path else ''
             action = ''
             for part in query.split('&'):
@@ -1074,13 +1259,44 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json(auth_error, status=401)
                     return
 
+            # A-66/A-71: state-changing endpoints are POST-only. GET must
+            # never trigger a restart, modem reset, boot apply, band write,
+            # or export — a link, prefetcher, retrying proxy, or <img> tag
+            # could fire it.
+            if self.command != 'POST' and action in (
+                    'write', 'restart', 'boot-apply', 'export',
+                    'modem-reset'):
+                self.send_json({"ok": False, "error": "method not allowed"},
+                               status=405)
+                return
+
             if action == 'read':
                 self.send_json(self.read_config())
             elif action == 'defaults':
                 self.send_json(self.read_defaults())
             elif action == 'settings':
                 if self.command == 'POST':
-                    self.send_json(self.update_settings(self._read_json_body()))
+                    data = self._read_json_body()
+                    # A-178/A-220: token rotation is gated on the CURRENT
+                    # token — an unauthenticated caller cannot mint-and-
+                    # steal a fresh credential. (First-ever enable with no
+                    # token configured is the legitimate bootstrap and stays
+                    # allowed.)
+                    if (isinstance(data, dict)
+                            and data.get("regenerate") is True):
+                        auth_error = self._check_auth()
+                        if auth_error is not None:
+                            self.send_json(auth_error, status=401)
+                            return
+                    res = self.update_settings(data)
+                    status = 200
+                    if res.get("ok") is False:
+                        # A-017: a failed persistence is distinguishable by
+                        # HTTP status so status-checking clients see the
+                        # failure; client validation errors are 400.
+                        status = 500 if res.get("error", "").startswith(
+                            "settings save failed") else 400
+                    self.send_json(res, status=status)
                 else:
                     self.send_json(self.read_settings())
             elif action == 'restart':
@@ -1101,7 +1317,11 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(self.modem_reset())
             elif action == 'drop-log':
                 if self.command == 'POST':
-                    self.send_json(self.update_drop_log(self._read_json_body()))
+                    res = self.update_drop_log(self._read_json_body())
+                    status = 500 if (res.get("ok") is False
+                                     and res.get("error", "").startswith(
+                                         "settings save failed")) else 200
+                    self.send_json(res, status=status)
                 else:
                     self.send_json(self.read_drop_log())
             elif action == 'band-camping':
@@ -1185,10 +1405,14 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         bearer token.
 
         lan_enabled must be a bool. The token is created when enabling
-        with no token set or when regenerate=true, and is returned ONLY
-        when it was created/regenerated in this call (otherwise null).
-        Settings are persisted atomically; a save failure is reported as
-        ok:false."""
+        with no token set or when regenerate=true (regeneration requires
+        the current token — enforced by the dispatcher, A-178/A-220), and
+        is returned ONLY when it was created/regenerated in this call
+        (otherwise null). The new state is computed on a COPY and persisted
+        BEFORE the live SETTINGS dict is mutated, so a failed save leaves
+        the running configuration — and the token every LAN client holds —
+        untouched (A-017/A-153). Calls are serialized so concurrent
+        requests cannot interleave the read-modify-write (A-041)."""
         if not isinstance(data, dict):
             return {"ok": False, "error": "request body must be a JSON object"}
         lan_enabled = data.get("lan_enabled")
@@ -1196,20 +1420,27 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "error": "lan_enabled must be a bool"}
         regenerate = data.get("regenerate") is True
 
-        created = False
-        if (lan_enabled and SETTINGS["token"] is None) or regenerate:
-            SETTINGS["token"] = secrets.token_urlsafe(24)
-            created = True
-        SETTINGS["bind"] = "0.0.0.0" if lan_enabled else "127.0.0.1"
-        try:
-            _save_settings()
-        except Exception as e:
-            return {"ok": False, "error": "settings save failed: {}".format(e)}
+        with _SETTINGS_UPDATE_LOCK:
+            new_settings = dict(SETTINGS)
+            created = False
+            if (lan_enabled and new_settings["token"] is None) or regenerate:
+                new_settings["token"] = secrets.token_urlsafe(24)
+                created = True
+            new_settings["bind"] = "0.0.0.0" if lan_enabled else "127.0.0.1"
+            try:
+                _save_settings(new_settings)
+            except Exception as e:
+                # Persist first: SETTINGS is untouched on failure, so a
+                # failed regenerate does not revoke the token in use.
+                return {"ok": False,
+                        "error": "settings save failed: {}".format(e)}
+            SETTINGS["token"] = new_settings["token"]
+            SETTINGS["bind"] = new_settings["bind"]
         return {
             "ok": True,
             "lan_enabled": lan_enabled,
-            "token_required": SETTINGS["token"] is not None,
-            "token": SETTINGS["token"] if created else None,
+            "token_required": new_settings["token"] is not None,
+            "token": new_settings["token"] if created else None,
         }
 
     def restart_service(self):
@@ -1217,16 +1448,29 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
 
         service.sh kills the old server and starts a fresh one; it is
         launched ~1s later from a background thread so the {"ok": true}
-        response is delivered first. Returns immediately."""
+        response is delivered first. Returns immediately. Serialized
+        (A-041): only one restart may be pending at a time, so repeated
+        taps cannot stack detached service.sh runs that each kill and
+        replace the server."""
+        global _RESTART_PENDING
+        with _RESTART_LOCK:
+            if _RESTART_PENDING:
+                return {"ok": False, "error": "restart already scheduled"}
+            _RESTART_PENDING = True
+
         def _do_restart():
-            time.sleep(1)
+            global _RESTART_PENDING
             try:
+                time.sleep(1)
                 subprocess.Popen(["sh", str(MODDIR / "service.sh")],
                                  start_new_session=True,
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
             except Exception as e:
                 print("Service restart failed: {}".format(e))
+            finally:
+                with _RESTART_LOCK:
+                    _RESTART_PENDING = False
         threading.Thread(target=_do_restart, daemon=True).start()
         return {"ok": True}
 
@@ -1403,17 +1647,55 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         """Write a submitted band config to a timestamped JSON file in the
         config dir. WebView-compatible export: the Manager WebView drops
         blob downloads, so the server delivers the file on-device and the
-        UI toasts the path. Returns {"ok": true, "path": ...} or
-        {"ok": false, "error": ...} - never raises."""
+        UI toasts the path.
+
+        The body is validated exactly like /api/write — non-dict bodies and
+        out-of-range bands are rejected instead of persisted verbatim
+        (A-155). The write is symlink-proof and collision-free (A-211/A-054):
+        content goes to a random O_EXCL|O_NOFOLLOW temp file (0o600) that is
+        os.replace()d over the timestamped name, so a planted symlink in the
+        config dir can neither be followed nor clobber another export.
+        Returns {"ok": true, "path": ...} or {"ok": false, "error": ...} —
+        never raises."""
+        bands, err = self._validate_bands(data)
+        if bands is None:
+            return {"ok": False, "error": err}
+        tmp = None
         try:
-            os.makedirs(EXPORT_DIR, exist_ok=True)
+            _ensure_private_dir(EXPORT_DIR)
             stamp = time.strftime('%Y%m%d-%H%M%S') + '.{:03d}'.format(
                 int(time.time() * 1000) % 1000)
-            path = os.path.join(EXPORT_DIR, "bandctl-export-{}.json".format(stamp))
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
+            # A-054/A-211: a random suffix keeps concurrent exports from
+            # overwriting each other AND makes the final name unpredictable
+            # (an attacker cannot pre-plant symlinks across the name space).
+            path = os.path.join(
+                EXPORT_DIR, "bandctl-export-{}-{}.json".format(
+                    stamp, secrets.token_hex(3)))
+            tmp = os.path.join(EXPORT_DIR, ".export-{}-{}.tmp".format(
+                os.getpid(), secrets.token_hex(4)))
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp, flags, 0o600)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(bands, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, path)
             return {"ok": True, "path": path}
         except Exception as e:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             return {"ok": False, "error": str(e)}
 
     def read_signal(self):
@@ -1467,16 +1749,23 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         """POST /api/drop-log — enable/disable the drop logger (v2.5).
 
         The setting is persisted to settings.json and picked up live by
-        the watchdog thread (no restart needed)."""
-        try:
-            if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
-                return {"ok": False, "error": "enabled must be a bool"}
+        the watchdog thread (no restart needed). Persist-first, like
+        update_settings: a failed save leaves the live snapshot unchanged
+        (A-153 family), and concurrent toggles are serialized (A-041)."""
+        if not isinstance(data, dict) or not isinstance(
+                data.get("enabled"), bool):
+            return {"ok": False, "error": "enabled must be a bool"}
+        with _SETTINGS_UPDATE_LOCK:
+            new_settings = dict(SETTINGS)
+            new_settings["drop_log"] = data["enabled"]
+            try:
+                _save_settings(new_settings)
+            except Exception as e:
+                return {"ok": False,
+                        "error": "settings save failed: {}".format(e)}
             SETTINGS["drop_log"] = data["enabled"]
-            _save_settings()
             return {"ok": True, "enabled": data["enabled"],
                     "dir": str(DROP_LOG_DIR)}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
 
     def read_band_camping(self, limit=50):
         """Return the last `limit` lines of the band camping log as JSON.
@@ -1611,9 +1900,15 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        origin = self.headers.get('Origin') if self.headers else None
+        allowed = self._cors_origin(origin)
+        if allowed:
+            self.send_header('Access-Control-Allow-Origin', allowed)
+            self.send_header('Access-Control-Allow-Methods',
+                             'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers',
+                             'Content-Type, Authorization')
+            self.send_header('Access-Control-Allow-Private-Network', 'true')
         self.send_header('Content-Length', len(body))
         self.end_headers()
         self.wfile.write(body)
@@ -1641,6 +1936,18 @@ if __name__ == '__main__':
     # setting is live — the thread sleeps cheaply when disabled.
     threading.Thread(target=_drop_log_loop, daemon=True).start()
 
+    # A-180: harden the module config tree even when service.sh created it
+    # with the boot umask (world-writable). The server runs as root and is
+    # the only legitimate reader of these dirs.
+    _ensure_private_dir(MODDIR / "config")
+    _ensure_private_dir(DROP_LOG_DIR)
+
+    # A-198: refuse to substitute third-party binaries — surface a missing
+    # bundled QMI client loudly instead of silently exec'ing adb scratch.
+    if QMI_BIN is None:
+        print("WARNING: bundled qmi/qmi_band missing — QMI band apply "
+              "disabled (no fallback binary is used)")
+
     # Threaded: the 2s signal/registration polling (each dumpsys call takes
     # seconds on this device) must not starve other requests — a single-
     # threaded server stalls /api/defaults, /api/read, and button actions
@@ -1648,6 +1955,10 @@ if __name__ == '__main__':
     # Bind comes from settings.json (default 127.0.0.1; 0.0.0.0 = LAN).
     bind = SETTINGS.get("bind", "127.0.0.1")
     server = http.server.ThreadingHTTPServer((bind, PORT), BandHandler)
+    # A-049: the auth gate keys on the ACTUAL listening address, not the
+    # settings value — a pending settings change must not drop auth before
+    # the socket is actually rebound (which happens on restart).
+    _EFFECTIVE_BIND = bind
     print(f"Band Controller server running on http://{bind}:{PORT}")
     print(f"QMI binary: {QMI_BIN}")
     print(f"Diag device: {DIAG_DEVICE or 'disabled'}")
