@@ -98,20 +98,20 @@ class TestSettingsLoad(SettingsFileCase):
     def test_missing_file_defaults(self):
         self.assertEqual(server._load_settings(),
                          {"bind": "127.0.0.1", "token": None,
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_malformed_json_defaults(self):
         server.SETTINGS_FILE.write_text("{not json")
         self.assertEqual(server._load_settings(),
                          {"bind": "127.0.0.1", "token": None,
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_invalid_bind_falls_back_to_localhost(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "9.9.9.9", "token": "tok"}))
         self.assertEqual(server._load_settings(),
                          {"bind": "127.0.0.1", "token": "tok",
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_invalid_token_downgrades_lan_bind(self):
         """A-105/A-218: a persisted LAN bind without a usable token is the
@@ -122,28 +122,28 @@ class TestSettingsLoad(SettingsFileCase):
             json.dumps({"bind": "0.0.0.0", "token": 12345}))
         self.assertEqual(server._load_settings(),
                          {"bind": "127.0.0.1", "token": None,
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_lan_bind_without_token_field_downgrades(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0"}))
         self.assertEqual(server._load_settings(),
                          {"bind": "127.0.0.1", "token": None,
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_lan_bind_with_valid_token_kept(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0", "token": "ok-token"}))
         self.assertEqual(server._load_settings(),
                          {"bind": "0.0.0.0", "token": "ok-token",
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_load_persisted_values(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0", "token": "tok"}))
         self.assertEqual(server._load_settings(),
                          {"bind": "0.0.0.0", "token": "tok",
-                          "drop_log": False})
+                          "drop_log": False, "band_camping": True})
 
     def test_load_persisted_drop_log(self):
         server.SETTINGS_FILE.write_text(
@@ -320,14 +320,24 @@ class TestAuth(SettingsFileCase):
         """A-189: loopback read-only diagnostics stay exempt — a fresh
         phone UI can poll health with no credential."""
         server.SETTINGS = self.lan
-        status, _ = run_api('/api/health?action=health', 'GET',
-                            addr=('127.0.0.1', 54321))
+        with mock.patch.object(
+                server.BandHandler, 'modem_health',
+                return_value={"status": "ok", "transport": "qmi",
+                              "lte_bands": 1, "nr_bands": 0,
+                              "md_session_owner": None}):
+            status, _ = run_api('/api/health?action=health', 'GET',
+                                addr=('127.0.0.1', 54321))
         self.assertEqual(status, 200)
 
     def test_ipv6_loopback_read_only_exempt(self):
         server.SETTINGS = self.lan
-        status, _ = run_api('/api/health?action=health', 'GET',
-                            addr=('::1', 54321))
+        with mock.patch.object(
+                server.BandHandler, 'modem_health',
+                return_value={"status": "ok", "transport": "qmi",
+                              "lte_bands": 1, "nr_bands": 0,
+                              "md_session_owner": None}):
+            status, _ = run_api('/api/health?action=health', 'GET',
+                                addr=('::1', 54321))
         self.assertEqual(status, 200)
 
     def test_loopback_state_change_requires_token(self):
@@ -364,10 +374,15 @@ class TestAuth(SettingsFileCase):
 
     def test_lan_correct_token_ok(self):
         server.SETTINGS = self.lan
-        status, _ = run_api('/api/health?action=health', 'GET',
-                            headers={'Authorization':
-                                     'Bearer sekret-token'},
-                            addr=('192.168.1.42', 54321))
+        with mock.patch.object(
+                server.BandHandler, 'modem_health',
+                return_value={"status": "ok", "transport": "qmi",
+                              "lte_bands": 1, "nr_bands": 0,
+                              "md_session_owner": None}):
+            status, _ = run_api('/api/health?action=health', 'GET',
+                                headers={'Authorization':
+                                         'Bearer sekret-token'},
+                                addr=('192.168.1.42', 54321))
         self.assertEqual(status, 200)
 
     def test_lan_wrong_token_unauthorized(self):
@@ -379,8 +394,13 @@ class TestAuth(SettingsFileCase):
 
     def test_lan_disabled_no_gate(self):
         server.SETTINGS = {"bind": "127.0.0.1", "token": "sekret-token"}
-        status, _ = run_api('/api/health?action=health', 'GET',
-                            addr=('192.168.1.42', 54321))
+        with mock.patch.object(
+                server.BandHandler, 'modem_health',
+                return_value={"status": "ok", "transport": "qmi",
+                              "lte_bands": 1, "nr_bands": 0,
+                              "md_session_owner": None}):
+            status, _ = run_api('/api/health?action=health', 'GET',
+                                addr=('192.168.1.42', 54321))
         self.assertEqual(status, 200)
 
     def test_lan_without_configured_token_rejects_all(self):
@@ -420,11 +440,19 @@ class TestAuth(SettingsFileCase):
 
     def test_http_correct_token_passes_gate(self):
         server.SETTINGS = self.lan
-        status, _ = run_api('/api/health?action=health', 'GET',
+        # /api/read answers 200 with the carrier fallback (no modem here),
+        # so it is the right probe for the auth gate — /api/health would
+        # legitimately answer 503 when no transport is reachable (A-02).
+        status, _ = run_api('/api/read?action=read', 'GET',
                             headers={"Authorization": "Bearer sekret-token"},
                             addr=('192.168.1.42', 9999))
         self.assertEqual(status, 200)
 
+    def test_loopback_request_not_gated_end_to_end(self):
+        server.SETTINGS = self.lan
+        status, _ = run_api('/api/read?action=read', 'GET',
+                            addr=('127.0.0.1', 9999))
+        self.assertEqual(status, 200)
     def test_get_settings_exempt_from_auth(self):
         """Bootstrap: a fresh laptop page can read token_required with no
         stored token, and no token material is leaked."""
@@ -436,15 +464,16 @@ class TestAuth(SettingsFileCase):
         self.assertNotIn("token", res)
 
     def test_bare_settings_get_exempt(self):
-        """A-158: the auth exemption is path-based, so the documented bare
-        GET /api/settings is not 401-gated for a remote LAN client (the
-        route still needs the ?action= settings param to dispatch, which
-        is the API's existing convention)."""
+        """A-158 + A-65: the auth exemption is path-based, so the documented
+        bare GET /api/settings is not 401-gated for a remote LAN client, and
+        the action is derived from the path (A-65) so the bare route
+        dispatches and answers with the settings payload (no token value)."""
         server.SETTINGS = self.lan
         status, res = run_api('/api/settings', 'GET',
                               addr=('192.168.1.42', 9999))
-        self.assertNotEqual(status, 401)
-        self.assertEqual(res, {"error": "unknown action"})
+        self.assertEqual(status, 200)
+        self.assertEqual(res, {"ok": True, "lan_enabled": True,
+                               "token_required": True})
 
     def test_post_settings_still_gated_in_lan_mode(self):
         server.SETTINGS = self.lan
@@ -530,14 +559,24 @@ class TestEffectiveBindAuth(SettingsFileCase):
         status, _ = run_api('/api/health?action=health', 'GET',
                             addr=('192.168.1.42', 9999))
         self.assertEqual(status, 401)
-        status, _ = run_api('/api/health?action=health', 'GET',
-                            headers={'Authorization': 'Bearer tok'},
-                            addr=('192.168.1.42', 9999))
+        with mock.patch.object(
+                server.BandHandler, 'modem_health',
+                return_value={"status": "ok", "transport": "qmi",
+                              "lte_bands": 1, "nr_bands": 0,
+                              "md_session_owner": None}):
+            status, _ = run_api('/api/health?action=health', 'GET',
+                                headers={'Authorization': 'Bearer tok'},
+                                addr=('192.168.1.42', 9999))
         self.assertEqual(status, 200)
 
     def test_loopback_read_only_still_exempt(self):
-        status, _ = run_api('/api/health?action=health', 'GET',
-                            addr=('127.0.0.1', 9999))
+        with mock.patch.object(
+                server.BandHandler, 'modem_health',
+                return_value={"status": "ok", "transport": "qmi",
+                              "lte_bands": 1, "nr_bands": 0,
+                              "md_session_owner": None}):
+            status, _ = run_api('/api/health?action=health', 'GET',
+                                addr=('127.0.0.1', 9999))
         self.assertEqual(status, 200)
 
 
@@ -793,9 +832,14 @@ class TestHostValidation(unittest.TestCase):
     def test_loopback_host_allowed(self):
         for host in ('localhost:8080', '127.0.0.1:8080', '[::1]:8080',
                      '127.0.0.2'):
-            status, _ = run_api('/api/health?action=health', 'GET',
-                                headers={'Host': host},
-                                addr=('127.0.0.1', 54321))
+            with mock.patch.object(
+                    server.BandHandler, 'modem_health',
+                    return_value={"status": "ok", "transport": "qmi",
+                                  "lte_bands": 1, "nr_bands": 0,
+                                  "md_session_owner": None}):
+                status, _ = run_api('/api/health?action=health', 'GET',
+                                    headers={'Host': host},
+                                    addr=('127.0.0.1', 54321))
             self.assertEqual(status, 200, host)
 
 
@@ -956,12 +1000,12 @@ class TestGuardedParse(unittest.TestCase):
 
     def test_non_api_path_unknown_action(self):
         status, res = run_api('/etc/passwd', 'GET')
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 400)
         self.assertEqual(res, {"error": "unknown action"})
 
     def test_unknown_action(self):
         status, res = run_api('/api/foo?action=nope', 'GET')
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 400)
         self.assertEqual(res, {"error": "unknown action"})
 
     def test_write_body_null_error_not_crash(self):
@@ -1734,6 +1778,638 @@ class TestDropLogConcurrency(unittest.TestCase):
         self.assertEqual(
             server.SETTINGS["drop_log"],
             json.loads(server.SETTINGS_FILE.read_text())["drop_log"])
+
+
+class TestTransportErrorStatus(unittest.TestCase):
+    """A-02: signal/registration/health transport failures must be
+    surfaced as non-200 so the UI's r.ok check shows the error instead of
+    rendering healthy/neutral states."""
+
+    def test_signal_dumpsys_failure_is_503(self):
+        with mock.patch.object(server, '_run_dumpsys',
+                               side_effect=RuntimeError('boom')):
+            status, res = run_api('/api/signal?action=signal')
+        self.assertEqual(status, 503)
+        self.assertIn('error', res)
+
+    def test_signal_no_data_is_503(self):
+        with mock.patch.object(server, '_run_dumpsys', return_value=''):
+            status, _ = run_api('/api/signal?action=signal')
+        self.assertEqual(status, 503)
+
+    def test_registration_failure_is_503(self):
+        with mock.patch.object(server, '_run_dumpsys',
+                               side_effect=RuntimeError('boom')):
+            status, res = run_api('/api/registration?action=registration')
+        self.assertEqual(status, 503)
+        self.assertIn('error', res)
+
+    def test_health_error_status_is_503(self):
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(None, '')), \
+             mock.patch.object(server, 'read_bands',
+                               side_effect=RuntimeError('no diag')):
+            status, res = run_api('/api/health?action=health')
+        self.assertEqual(status, 503)
+        self.assertEqual(res['status'], 'error')
+
+    def test_health_degraded_stays_200(self):
+        # A transport that answers but has no bands is degraded, not an
+        # error — the frontend must still render it.
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, 'LTE bands: (none)\n'
+                                              'NR5G SA bands: (none)\n')):
+            status, res = run_api('/api/health?action=health')
+        self.assertEqual(status, 200)
+        self.assertEqual(res['status'], 'degraded')
+
+    def test_camping_read_failure_is_503(self):
+        # A-142: a read failure must not look like an empty sample list.
+        with mock.patch.object(server.BandHandler, 'read_band_camping',
+                               return_value={"ok": False,
+                                             "error": "read failed"}):
+            status, res = run_api('/api/band-camping?action=band-camping')
+        self.assertEqual(status, 503)
+        self.assertFalse(res['ok'])
+
+
+class TestRegistrationLabels(unittest.TestCase):
+    """A-47: modern network-type labels with punctuation (LTE_CA, HSPA+)
+    must parse instead of being dropped to null."""
+
+    def test_lte_ca_label_parsed(self):
+        svc = "{mVoiceRegState=0(IN_SERVICE), mDataRegState=0(IN_SERVICE), " \
+              "getRilDataRadioTechnology=19(LTE_CA)}"
+        reg = server._parse_service_state(svc, svc)
+        self.assertEqual(reg['network_type'], 'LTE_CA')
+
+    def test_hspa_plus_label_parsed(self):
+        svc = "{mVoiceRegState=0(IN_SERVICE), mDataRegState=0(IN_SERVICE), " \
+              "getRilVoiceRadioTechnology=15(HSPA+)}"
+        reg = server._parse_service_state(svc, svc)
+        self.assertEqual(reg['network_type'], 'HSPA+')
+
+    def test_end_to_end_dump(self):
+        dump = "mServiceState={mVoiceRegState=0(IN_SERVICE), " \
+               "mDataRegState=0(IN_SERVICE), " \
+               "getRilDataRadioTechnology=19(LTE_CA), " \
+               "mOperatorAlphaLong=ROGERS}\n"
+        reg = server._parse_registration(dump)
+        self.assertEqual(reg['network_type'], 'LTE_CA')
+        self.assertEqual(reg['service_state'], 'IN_SERVICE')
+
+
+class TestDualSimPreference(unittest.TestCase):
+    """A-50: with separate Phone Id blocks, the IN_SERVICE subscription
+    (registration and signal) must win over the first, out-of-service
+    record."""
+
+    def test_registration_prefers_in_service_phone(self):
+        dump = (" Phone Id=0\n"
+                " mServiceState={mVoiceRegState=1(OUT_OF_SERVICE), "
+                "mDataRegState=1(OUT_OF_SERVICE), mOperatorAlphaLong=ROGERS}\n"
+                " Phone Id=1\n"
+                " mServiceState={mVoiceRegState=0(IN_SERVICE), "
+                "mDataRegState=0(IN_SERVICE), mOperatorAlphaLong=BELL}\n")
+        reg = server._parse_registration(dump)
+        self.assertEqual(reg['service_state'], 'IN_SERVICE')
+        self.assertEqual(reg['operator'], 'BELL')
+
+    def test_single_phone_keeps_first_record(self):
+        dump = ("mServiceState={mVoiceRegState=1(OUT_OF_SERVICE), "
+                "mDataRegState=1(OUT_OF_SERVICE)}\n")
+        reg = server._parse_registration(dump)
+        self.assertEqual(reg['service_state'], 'OUT_OF_SERVICE')
+
+    def test_signal_prefers_in_service_phone(self):
+        sigdump = (" Phone Id=0\n"
+                   " mServiceState={mVoiceRegState=1(OUT_OF_SERVICE)}\n"
+                   " mSignalStrength=SignalStrength:{primary=CellSignalStrengthLte, "
+                   "mLte=CellSignalStrengthLte: rssi=-111 rsrp=-125 rsrq=-15 level=1}\n"
+                   " Phone Id=1\n"
+                   " mServiceState={mVoiceRegState=0(IN_SERVICE)}\n"
+                   " mSignalStrength=SignalStrength:{primary=CellSignalStrengthLte, "
+                   "mLte=CellSignalStrengthLte: rssi=-99 rsrp=-85 rsrq=-8 level=4}\n")
+        sig = server._parse_signal_strength(sigdump)
+        self.assertEqual(sig['rsrp_dbm'], -85)
+        self.assertEqual(sig['level'], 4)
+
+
+class TestCarrierDetection(unittest.TestCase):
+    """A-72: mixed-SIM operator numerics must not trigger Rogers-specific
+    band exclusions; a single Rogers slot still does."""
+
+    def test_single_rogers_slot_is_rogers(self):
+        self.assertEqual(server.carrier_for_mccmnc('302720'), 'rogers')
+        self.assertEqual(server.carrier_for_mccmnc('302720,'), 'rogers')
+
+    def test_mixed_sims_are_other(self):
+        self.assertEqual(server.carrier_for_mccmnc('302720,310260'), 'other')
+        self.assertEqual(server.carrier_for_mccmnc('310260,302720'), 'other')
+
+    def test_other_and_empty_are_other(self):
+        self.assertEqual(server.carrier_for_mccmnc('310260'), 'other')
+        self.assertEqual(server.carrier_for_mccmnc(''), 'other')
+        self.assertEqual(server.carrier_for_mccmnc(None), 'other')
+
+
+class TestSignalValidation(unittest.TestCase):
+    """A-133/A-140: sentinel levels and non-sentinel junk metrics must not
+    reach the UI as live measurements."""
+
+    def test_sentinel_level_normalized_to_none(self):
+        obj = ("SignalStrength:{primary=CellSignalStrengthLte, "
+               "mLte=CellSignalStrengthLte: rssi=-99 rsrp=-95 rsrq=-10 "
+               "level=2147483647}")
+        sig = server._parse_signal_object(obj)
+        self.assertEqual(sig['rsrp_dbm'], -95)
+        self.assertIsNone(sig['level'])
+
+    def test_out_of_domain_level_normalized_to_none(self):
+        obj = ("SignalStrength:{primary=CellSignalStrengthLte, "
+               "mLte=CellSignalStrengthLte: rssi=-99 rsrp=-95 rsrq=-10 level=9}")
+        self.assertIsNone(server._parse_signal_object(obj)['level'])
+
+    def test_junk_rsrp_rsrq_rejected(self):
+        obj = ("SignalStrength:{primary=CellSignalStrengthLte, "
+               "mLte=CellSignalStrengthLte: rssi=0 rsrp=0 rsrq=50 level=9}")
+        self.assertIsNone(server._parse_signal_object(obj))
+
+    def test_legacy_99_rejected(self):
+        self.assertFalse(server._valid_signal(99))
+        self.assertFalse(server._valid_signal(2147483647))
+        self.assertTrue(server._valid_signal(-95))
+
+
+class TestNrCsiFallback(unittest.TestCase):
+    """A-99: valid csiRsrp/csiRsrq must be used when the SS measurements
+    are sentinels/unavailable."""
+
+    def test_csi_used_when_ss_sentinel(self):
+        obj = ("SignalStrength:{primary=CellSignalStrengthNr, "
+               "mNr=CellSignalStrengthNr:{ csiRsrp = -95 csiRsrq = -10 "
+               "ssRsrp = 2147483647 ssRsrq = 2147483647 level = 3 }}")
+        sig = server._parse_signal_object(obj)
+        self.assertEqual(sig['tech'], 'NR')
+        self.assertEqual(sig['rsrp_dbm'], -95)
+        self.assertEqual(sig['rsrq_db'], -10)
+
+    def test_ss_preferred_when_valid(self):
+        obj = ("SignalStrength:{primary=CellSignalStrengthNr, "
+               "mNr=CellSignalStrengthNr:{ csiRsrp = -95 csiRsrq = -10 "
+               "ssRsrp = -90 ssRsrq = -8 level = 3 }}")
+        sig = server._parse_signal_object(obj)
+        self.assertEqual(sig['rsrp_dbm'], -90)
+        self.assertEqual(sig['rsrq_db'], -8)
+
+
+class TestRadioRegStateLegacy(unittest.TestCase):
+    """A-98: modem-reset verification must accept the bare legacy numeric
+    registration form, not only the parenthesized object form."""
+
+    def test_bare_numeric_state(self):
+        with mock.patch.object(server, '_run_dumpsys',
+                               return_value="mServiceState={mVoiceRegState=3}"):
+            self.assertEqual(server._radio_reg_state(), 'POWER_OFF')
+
+    def test_parenthesized_state(self):
+        with mock.patch.object(server, '_run_dumpsys',
+                               return_value="mVoiceRegState=3(POWER_OFF)"):
+            self.assertEqual(server._radio_reg_state(), 'POWER_OFF')
+
+
+class TestMdSessionOwner(unittest.TestCase):
+    """A-143: the ioctl's in-place buffer mutation must be unpacked, not
+    treated as a return value."""
+
+    def test_owner_pid_extracted(self):
+        import struct
+        def fake_ioctl(fd, req, buf):
+            struct.pack_into('<IIiI', buf, 0, 1, 0, 4242, 0)
+            return 0
+        with mock.patch('fcntl.ioctl', side_effect=fake_ioctl), \
+             mock.patch('os.open', return_value=3), \
+             mock.patch('os.close'):
+            self.assertEqual(server._query_md_pid('/dev/diag'), 4242)
+
+
+class TestModemResetSerialized(unittest.TestCase):
+    """A-51: a second concurrent modem-reset must be refused, not raced."""
+
+    def test_concurrent_reset_refused(self):
+        server._MODEM_RESET_LOCK.acquire()
+        try:
+            with mock.patch.object(server, '_cmd_available',
+                                   return_value=False):
+                res = server.BandHandler.modem_reset(None)
+        finally:
+            server._MODEM_RESET_LOCK.release()
+        self.assertFalse(res['ok'])
+        self.assertIn('already in progress', res['error'])
+
+    def test_reset_runs_after_lock_released(self):
+        with mock.patch.object(server, '_cmd_available',
+                               return_value=False):
+            res = server.BandHandler.modem_reset(None)
+        self.assertFalse(res['ok'])
+        self.assertNotIn('already in progress', res['error'])
+
+
+class TestPollGuard(unittest.TestCase):
+    """A-34: a concurrent poll reuses the last successful result instead
+    of stacking a second dumpsys; errors are never cached."""
+
+    def setUp(self):
+        self._orig_sig = server._SIGNAL_READ['last']
+        self._orig_reg = server._REG_READ['last']
+        server._SIGNAL_READ['last'] = None
+        server._REG_READ['last'] = None
+
+    def tearDown(self):
+        server._SIGNAL_READ['last'] = self._orig_sig
+        server._REG_READ['last'] = self._orig_reg
+
+    def test_busy_returns_cached_result(self):
+        server._SIGNAL_READ['last'] = {"rsrp_dbm": -95, "rsrq_db": -10,
+                                       "level": 3, "tech": "LTE",
+                                       "timestamp": 1}
+        server._SIGNAL_READ['lock'].acquire()
+        try:
+            with mock.patch.object(server, '_run_dumpsys',
+                                   side_effect=AssertionError('no dumpsys')):
+                res = server.BandHandler.read_signal(None)
+        finally:
+            server._SIGNAL_READ['lock'].release()
+        self.assertEqual(res['rsrp_dbm'], -95)
+
+    def test_success_cached_error_not(self):
+        calls = {'n': 0}
+        def fn():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return {"error": "boom"}
+            return {"rsrp_dbm": -80, "rsrq_db": -7, "level": 4,
+                    "tech": "LTE", "timestamp": 2}
+        first = server._poll_once(server._SIGNAL_READ, fn)
+        second = server._poll_once(server._SIGNAL_READ, fn)
+        self.assertIn('error', first)
+        self.assertEqual(server._SIGNAL_READ['last'], second)
+        self.assertNotIn('error', second)
+
+
+class TestBareRoutes(unittest.TestCase):
+    """A-65: documented bare routes (no ?action=) must dispatch, and
+    unknown actions must be a real client error (400), not a 200."""
+
+    def test_bare_read_route(self):
+        status, res = run_api('/api/read', 'GET')
+        self.assertEqual(status, 200)
+        self.assertIn('source', res)
+
+    def test_bare_defaults_route(self):
+        status, res = run_api('/api/defaults', 'GET')
+        self.assertEqual(status, 200)
+        self.assertEqual(res['carrier'], 'other')
+
+    def test_bare_settings_route(self):
+        status, res = run_api('/api/settings', 'GET')
+        self.assertEqual(status, 200)
+        self.assertTrue(res['ok'])
+
+    def test_bare_camping_route_with_limit(self):
+        status, res = run_api('/api/band-camping?limit=5', 'GET')
+        self.assertEqual(status, 200)
+        self.assertIn('samples', res)
+
+
+class TestBandCampingRead(unittest.TestCase):
+    """A-74/A-200: the camping endpoint serializes (log path is a string,
+    never a pathlib.Path); A-136/A-139: sentinel EARFCN and invalid bands
+    are not rendered as camped cells."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.BAND_CAMPING_LOG
+        server.BAND_CAMPING_LOG = Path(self._tmp.name) / 'band_camping.log'
+
+    def tearDown(self):
+        server.BAND_CAMPING_LOG = self._orig
+        self._tmp.cleanup()
+
+    def test_endpoint_returns_samples_and_str_path(self):
+        server.BAND_CAMPING_LOG.write_text(
+            "1750000000000,2050,4\n1750000005000,2050,\n")
+        status, res = run_api('/api/band-camping?action=band-camping&limit=5')
+        self.assertEqual(status, 200)
+        self.assertTrue(res['ok'])
+        self.assertIsInstance(res['log'], str)
+        self.assertEqual(res['samples'],
+                         [{'timestamp': 1750000000000, 'earfcn': 2050,
+                           'band': 4},
+                          {'timestamp': 1750000005000, 'earfcn': 2050,
+                           'band': None}])
+
+    def test_absent_log_is_empty_not_error(self):
+        status, res = run_api('/api/band-camping?action=band-camping')
+        self.assertEqual(status, 200)
+        self.assertEqual(res['samples'], [])
+        self.assertIsInstance(res['log'], str)
+
+    def test_earfcn_sentinel_not_a_cell(self):
+        self.assertEqual(
+            server._parse_band_camping(
+                "mCellIdentity=CellIdentityLte:{ mEarfcn=2147483647, mBands=[4] }"),
+            (None, None))
+
+    def test_earfcn_out_of_domain_not_a_cell(self):
+        self.assertEqual(
+            server._parse_band_camping(
+                "mCellIdentity=CellIdentityLte:{ mEarfcn=70000, mBands=[4] }"),
+            (None, None))
+
+    def test_invalid_band_identities_rejected(self):
+        self.assertEqual(
+            server._parse_band_camping(
+                "mCellIdentity=CellIdentityLte:{ mEarfcn=2050, mBands=[0] }"),
+            (2050, None))
+        self.assertEqual(
+            server._parse_band_camping(
+                "mCellIdentity=CellIdentityLte:{ mEarfcn=2050, mBands=[999] }"),
+            (2050, None))
+
+    def test_valid_cell_parsed(self):
+        self.assertEqual(
+            server._parse_band_camping(
+                "mCellIdentity=CellIdentityLte:{ mEarfcn=2050, mBands=[4] }"),
+            (2050, 4))
+
+
+class TestCampingLogBounded(unittest.TestCase):
+    """A-28: reads use only the log tail, and the sampler trims the log to
+    a bounded size."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_log = server.BAND_CAMPING_LOG
+        server.BAND_CAMPING_LOG = Path(self._tmp.name) / 'camp.log'
+
+    def tearDown(self):
+        server.BAND_CAMPING_LOG = self._orig_log
+        self._tmp.cleanup()
+
+    def test_read_tail_returns_last_lines(self):
+        log = Path(self._tmp.name) / 'camp.log'
+        lines = ["{},{},{}".format(1750000000000 + i, 2000 + i,
+                                   (i % 79) + 1) for i in range(5000)]
+        log.write_text("\n".join(lines) + "\n")
+        tail = server._read_tail(log, 50)
+        self.assertEqual(len(tail), 50)
+        self.assertEqual(tail[-1], lines[-1])
+        self.assertEqual(tail[0], lines[-50])
+
+    def test_read_tail_small_file(self):
+        log = Path(self._tmp.name) / 'camp.log'
+        log.write_text("a,b,c\n")
+        self.assertEqual(server._read_tail(log, 5), ["a,b,c"])
+
+    def test_trim_caps_line_count(self):
+        log = Path(self._tmp.name) / 'big.log'
+        log.write_text("\n".join("line{}".format(i) for i in range(10000))
+                       + "\n")
+        server._trim_band_camping_log(log, max_lines=10)
+        self.assertEqual(len(log.read_text().splitlines()), 10)
+
+    def test_sample_appends_csv_line(self):
+        with mock.patch.object(server, '_run_dumpsys',
+                               return_value="mCellIdentity="
+                               "CellIdentityLte:{ mEarfcn=2050, mBands=[4] }"):
+            self.assertTrue(server._band_camping_sample())
+        line = server.BAND_CAMPING_LOG.read_text().strip()
+        parts = line.split(',')
+        self.assertEqual(parts[1:], ['2050', '4'])
+        self.assertTrue(parts[0].isdigit())
+
+
+class TestCampingToggle(unittest.TestCase):
+    """A-120/A-201: the sampler is gated on a persisted settings toggle
+    with a POST endpoint (like the drop logger), and GET reports it."""
+
+    def setUp(self):
+        self._orig = server.SETTINGS.get("band_camping")
+        server.SETTINGS["band_camping"] = True
+
+    def tearDown(self):
+        server.SETTINGS["band_camping"] = self._orig
+
+    def test_post_toggles_and_persists(self):
+        body = json.dumps({'enabled': False}).encode()
+        with mock.patch.object(server, '_save_settings') as save:
+            status, payload = run_api('/api/band-camping?action=band-camping',
+                                      'POST',
+                                      headers=FakeHeaders(
+                                          {'Content-Length': str(len(body))}),
+                                      body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['ok'])
+        self.assertFalse(payload['enabled'])
+        self.assertFalse(server.SETTINGS['band_camping'])
+        save.assert_called_once()
+
+    def test_post_rejects_non_bool(self):
+        body = json.dumps({'enabled': 'yes'}).encode()
+        with mock.patch.object(server, '_save_settings'):
+            status, payload = run_api(
+                '/api/band-camping?action=band-camping', 'POST',
+                headers=FakeHeaders({'Content-Length': str(len(body))}),
+                body=body)
+        self.assertEqual(status, 200)
+        self.assertFalse(payload['ok'])
+
+    def test_get_reports_enabled(self):
+        status, payload = run_api('/api/band-camping?action=band-camping')
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['enabled'])
+
+
+class TestExport(unittest.TestCase):
+    """A-82/A-135: exports are atomic (no partial file on interruption)
+    and pruned to the newest EXPORT_KEEP files."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.EXPORT_DIR
+        server.EXPORT_DIR = self._tmp.name
+        self.h = server.BandHandler.__new__(server.BandHandler)
+
+    def tearDown(self):
+        server.EXPORT_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_interrupted_write_leaves_no_partial_export(self):
+        before = set(os.listdir(server.EXPORT_DIR))
+        with mock.patch('json.dump',
+                        side_effect=RuntimeError('interrupted')):
+            res = self.h.export_config({"lte": [1]})
+        self.assertFalse(res['ok'])
+        self.assertEqual(set(os.listdir(server.EXPORT_DIR)), before)
+        self.assertEqual([f for f in os.listdir(server.EXPORT_DIR)
+                          if f.endswith('.tmp')], [])
+
+    def test_exports_pruned_to_newest(self):
+        for i in range(12):
+            p = os.path.join(server.EXPORT_DIR,
+                             "bandctl-export-20260813-{:02d}00.json".format(i))
+            with open(p, 'w') as f:
+                json.dump({"lte": [1]}, f)
+        res = self.h.export_config({"lte": ["1"], "nr": []})
+        self.assertTrue(res['ok'])
+        exports = sorted(f for f in os.listdir(server.EXPORT_DIR)
+                         if f.startswith('bandctl-export-'))
+        self.assertEqual(len(exports), server.EXPORT_KEEP)
+        self.assertEqual(exports[-1], os.path.basename(res['path']))
+
+    def test_export_writes_valid_json(self):
+        res = self.h.export_config({"lte": ["1"], "nr": ["77"]})
+        self.assertTrue(res['ok'])
+        self.assertTrue(os.path.exists(res['path']))
+        # A-155: the export validates like /api/write, so numeric strings
+        # are normalized to ints in the persisted file.
+        self.assertEqual(json.load(open(res['path'])),
+                         {"lte": [1], "nr": [77]})
+
+
+class TestSeedRepair(unittest.TestCase):
+    """A-134: an interrupted install-time seed (truncated bands.json) is
+    repaired at startup; a valid user config is never touched."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.CONFIG_FILE
+        server.CONFIG_FILE = Path(self._tmp.name) / 'bands.json'
+
+    def tearDown(self):
+        server.CONFIG_FILE = self._orig
+        self._tmp.cleanup()
+
+    def test_truncated_file_repaired(self):
+        server.CONFIG_FILE.write_text('{"lte":')
+        with mock.patch.object(server, '_get_prop', return_value='302720'):
+            server.seed_config_if_absent()
+        data = json.loads(server.CONFIG_FILE.read_text())
+        self.assertIn('lte', data)
+        self.assertEqual(data['lte'], server._ROGERS_BANDS['lte'])
+
+    def test_valid_config_kept(self):
+        server.CONFIG_FILE.write_text(json.dumps({"lte": ["1"], "nr": []}))
+        with mock.patch.object(server, '_get_prop', return_value='302720'):
+            server.seed_config_if_absent()
+        self.assertEqual(json.loads(server.CONFIG_FILE.read_text()),
+                         {"lte": ["1"], "nr": []})
+
+    def test_non_rogers_not_seeded(self):
+        server.CONFIG_FILE.write_text('{"lte":')
+        with mock.patch.object(server, '_get_prop',
+                               return_value='310260'):
+            server.seed_config_if_absent()
+        self.assertEqual(server.CONFIG_FILE.read_text(), '{"lte":')
+
+
+class TestBootApplyNoSeed(unittest.TestCase):
+    """A-216: boot apply is read-only w.r.t. the config — it must not
+    seed/recreate bands.json, so deleting the file stays a skip."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.CONFIG_FILE
+        server.CONFIG_FILE = Path(self._tmp.name) / 'bands.json'
+
+    def tearDown(self):
+        server.CONFIG_FILE = self._orig
+        self._tmp.cleanup()
+
+    def test_boot_apply_does_not_seed(self):
+        with mock.patch.object(server, 'seed_config_if_absent') as seed:
+            res = server.BandHandler.boot_apply(None)
+        self.assertEqual(res, {"ok": True, "skipped": True})
+        seed.assert_not_called()
+
+
+class TestHttpSemantics(unittest.TestCase):
+    """A-60/A-168/A-169: bounded connection timeout, no version
+    fingerprinting, HTTP/1.1 keep-alive, and explicit chunked rejection."""
+
+    def test_connection_timeout_set(self):
+        self.assertIsNotNone(server.BandHandler.timeout)
+        self.assertGreater(server.BandHandler.timeout, 0)
+
+    def test_version_string_does_not_fingerprint_python(self):
+        h = make_handler()
+        self.assertEqual(h.version_string(), 'Bandctl/2.6')
+        self.assertNotIn('Python', h.version_string())
+
+    def test_protocol_version_http11(self):
+        self.assertEqual(server.BandHandler.protocol_version, 'HTTP/1.1')
+
+    def test_chunked_body_rejected_501(self):
+        status, res = run_api(
+            '/api/write?action=write', 'POST',
+            headers=FakeHeaders({'Transfer-Encoding': 'chunked'}),
+            body=b'4\r\ntest\r\n0\r\n\r\n')
+        self.assertEqual(status, 501)
+        self.assertFalse(res['ok'])
+        self.assertIn('chunked', res['error'])
+
+    def test_unread_body_closes_connection(self):
+        # Error paths that skip the body (chunked, 401, unknown action)
+        # must disable keep-alive so leftover bytes are not misparsed as a
+        # pipelined request.
+        def _run(path, command, headers, body=b''):
+            h = make_handler(path=path, command=command, headers=headers,
+                             body=body)
+            h.handle_api()
+            return h
+
+        h = _run('/api/write?action=write', 'POST',
+                 {'Transfer-Encoding': 'chunked'})
+        self.assertTrue(h.close_connection)
+
+        h = _run('/api/nope?action=nope', 'POST',
+                 {'Content-Length': '5'}, body=b'hello')
+        self.assertTrue(h.close_connection)
+
+        h = _run('/api/nope?action=nope', 'GET', {})
+        self.assertFalse(getattr(h, 'close_connection', False))
+
+        h = _run('/api/write?action=write', 'POST',
+                 {'Content-Length': str(server.MAX_BODY_BYTES + 1)},
+                 body=b'')
+        self.assertTrue(h.close_connection)
+
+    def test_401_with_body_closes_connection(self):
+        server.SETTINGS = {"bind": "0.0.0.0", "token": "sekret"}
+        try:
+            body = b'{"lan_enabled": true}'
+            h = make_handler('/api/settings?action=settings', 'POST',
+                             headers={'Content-Length': str(len(body))},
+                             addr=('192.168.1.42', 9999), body=body)
+            h.handle_api()
+            self.assertEqual(
+                int(h.wfile.getvalue().split(b'\r\n', 1)[0].split()[1]), 401)
+            self.assertTrue(h.close_connection)
+        finally:
+            server.SETTINGS = {"bind": "127.0.0.1", "token": None}
+
+
+class TestQmiNrSort(unittest.TestCase):
+    """A-221: the NR union is sorted numerically, matching the LTE order."""
+
+    def test_nr_sorted_numerically(self):
+        out = ("    LTE bands: 1 2\n"
+               "    NR5G SA bands: 1 10\n"
+               "    NR5G NSA bands: 2 3\n")
+        parsed = server._parse_qmi_get(out)
+        self.assertEqual(parsed['nr'], ['1', '2', '3', '10'])
+        self.assertEqual(parsed['lte'], ['1', '2'])
 
 
 if __name__ == '__main__':
