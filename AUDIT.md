@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-201
+## Continuation audit (2026-08-10) — findings A-150..A-203
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3085,6 +3085,18 @@ Evidence: `web/server.py:241,1490,1502`; `index.html:995,1129,1454,1478-1481`; *
 `_band_camping_loop` starts at server boot with no settings toggle (`web/server.py:1631`), unlike the v2.5 drop logger: it runs `_run_dumpsys("telephony.registry")` — a full binder dump — every `BAND_CAMPING_INTERVAL` = 5s, 24/7, for the lifetime of the module, and appends one CSV line per poll (`:926-939`) with no rotation, cap, or size limit: ~17,280 lines/day of unbounded growth in the config tree (A-180's 777 directory). The only consumer is the endpoint that crashes (A-200), so the entire feature is dead weight: a permanent system_server/binder load added to the very radio stack being diagnosed, plus unbounded disk growth, serving a reader nobody can use.
 
 Evidence: `web/server.py:242,920-939,1631` (no gate), A-200 (dead reader), A-180 (config dir). Affected: every installed module, always on. Remediation: gate the sampler on a settings toggle (like drop-log), rotate/trim the log, or defer polling to the UI request. Confirmed (code trace).
+
+### A-202 — saveBands' confirmation read-back clobbers the user's selection and corrupts the userTouched guard (P3)
+
+After a successful write, `saveBands` confirms by polling /api/read once and applies the result unconditionally — `applyConfig(d2.lte, d2.nr, d2.source)` (`web/index.html:1301-1306`) — with NO `userTouched` guard. The guard exists exactly for this: `loadBands` (`:1263-1265`) — "Never clobber an in-progress selection" — only updates the source when `userTouched` is set, leaving the user's selection intact on every other refresh path. `saveBands` is the ONE path that clobbers: the user just toggled bands (userTouched=true), saves, and the read-back replaces their selection with the modem's report. With A-150 (no NV echo validation) and A-151 (root mirror masking a failed/partial apply), the read-back can show the PRE-apply state — the grid reverts to the old bands right after the "Applied (source: …)" toast — and because `userTouched` is still true, every subsequent poll now protects the READ-BACK state instead of the user's selection: the guard's semantics are silently corrupted and the user's edits are lost from view. The confirmation was intended to reflect applied truth; the defect is consuming it through a path that bypasses the very guard the codebase established.
+
+Evidence: `web/index.html:1263-1265` (guarded loadBands) vs `:1301-1306` (unguarded saveBands read-back); A-150/A-151 (unreliable read the read-back consumes). Affected: any save where the modem reports differently than requested (partial apply, mirror staleness, band 66/7 failure). Remediation: guard the read-back with `if (!userTouched)`, or only refresh `source`/summary on the read-back. Confirmed (code trace).
+
+### A-203 — HTTP 401 (auth failure) is routed into serverDown() by every caller: a false "server unreachable" banner plus a fabricated DROP entry while the server is up (P3)
+
+`apiFetch` surfaces 401s as a re-auth prompt (`web/index.html:1837-1841` — `if (r.status === 401) showReAuth(); return r;`) — but every caller then treats the 401 as a generic failure: `if (!r.ok) throw new Error('HTTP ' + r.status)` → the catch funnels it into `serverDown(e)` → `showBanner()` + `logDrop('Server unreachable — HTTP 401')` (`:1343-1349`). With a stale stored token on the LAN page (the token was regenerated on the phone), every poll 401s: the page reports the server DOWN and writes a fabricated "DROP — Server unreachable — HTTP 401" history entry — a third source of false drops (A-190: restart/disconnect, A-193: user modem reset, A-203: auth failure) — while the server is up and merely rejecting the credentials. The re-auth mechanism is undermined: the user sees the server-down banner + a DROP alongside the token prompt. `saveLanToken` recovers the banner (`:1908-1912`) but the false DROP entry and the misleading banner remain logged.
+
+Evidence: `web/index.html:1837-1841` (apiFetch 401 → showReAuth), `:1264-1270` (loadBands catch → serverDown), `:1375-1382` (pollSignal catch → serverDown), `:1343-1349` (serverDown → logDrop), A-190/A-193 (prior false-drop sources). Affected: LAN pages with a missing/stale token — every 401 → false DROP + banner. Remediation: distinguish 401 from network failure (check `r.status === 401` in the callers before throwing), or make `serverDown` accept a "not-auth" marker. Confirmed (code trace).
 
 ## Not yet fixed
 
