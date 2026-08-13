@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-195
+## Continuation audit (2026-08-10) — findings A-150..A-197
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3042,6 +3042,20 @@ Evidence: `qmi/qmi_band.c:608-673` (fixed `time(NULL)+3` wait, per-call discover
 `bands.png`, `diag.png`, and the settings screenshot referenced in the README were captured from the dark v2.5 skin; v2.6 shipped the white mobile skin (and the stale dark `index.html` remains at the repo root, A-157). A reader following the README sees a dark UI that no shipped artifact produces (root excepted). A-19 flagged the settings.png staleness; the same drift now applies to all three screenshots after the skin change, and the tracked PNGs predate the white tokens (`web/index.html:649-672`).
 
 Evidence: tracked `bands.png`/`diag.png` (dark-skin captures), README screenshot references, A-19, A-157. Affected: documentation accuracy. Remediation: re-capture the three screenshots from the v2.6 white skin (or the WebUI). Confirmed (tracked assets predate the white skin; v2.6 zip carries only code, no PNGs).
+
+### A-196 — Drop detection and modem recovery exist but are never connected: no auto self-heal (P2)
+
+The module has both halves of a self-healing loop and connects neither. Detection: the drop watchdog (`_drop_log_loop`, `web/server.py:347-403`) recognizes OUT_OF_SERVICE/POWER_OFF/EMERGENCY_ONLY. Recovery: the `modem_reset` endpoint (`:1500-1557`) performs the device-verified airplane-mode toggle / radio power cycle that the device notes show is the ONLY thing that brings the radio back ("Recovery ONLY after external airplane toggle (no auto self-heal)", 2026-07-14 drop investigation). Nothing calls `modem_reset` from the watchdog, and nothing in the drop logger attempts recovery — the user's core pain (radio dies, must manually toggle airplane mode, no self-heal) is a shipped behavior, not a limitation of the API. The drop logger exists to correlate the drop; the reset exists to fix it; the module ships with the two features permanently unconnected.
+
+This is a designed omission, not a crash — but it is the module's central user story (the device evidence drove the v2.5 logger), and the pieces (detection state, reset endpoint, `wait_radio` precedent in service.sh) are all present. Remediation (with the loop-guard caveat): a bounded auto-recovery — on drop detection, after a grace period, invoke the reset path once per episode (rate-limited, e.g. max N resets/hour) and re-check IN_SERVICE; the reset's success criterion must extend to recovery (A-197) or the auto-recovery would declare success while the radio is still dead.
+
+Evidence: `web/server.py:347-403` (watchdog never calls reset), `:1500-1557` (reset exists), service.sh `wait_radio` (the bounded-wait precedent), device notes ("no auto self-heal"). Confirmed (code + device evidence).
+
+### A-197 — The modem-reset success criterion is "radio powered off", not "radio recovered" (P3)
+
+Both reset paths verify the radio reached POWER_OFF (via `_wait_for_radio_state("POWER_OFF")`) and then report `{"ok": True}` immediately after re-enabling — neither waits for the radio to leave POWER_OFF or reach IN_SERVICE. The docstring says exactly this: "The radio is verified to reach POWER_OFF before success is reported." Re-camping takes 30s+ after a power cycle; a user reading `ok: true` after a reset that powered the radio off and back on believes the drop is fixed while the radio may still be OUT_OF_SERVICE — the reset reports success for a recovery it never observed. This compounds A-196: an auto-recovery wired to this endpoint would terminate (and rate-limit against) recoveries that never happened.
+
+Evidence: `web/server.py:1516-1517` (radio-power path returns ok:true after `radio power on`, no state wait), `:1548-1551` (airplane path returns ok:true after `_disable_airplane()`, no IN_SERVICE wait), `:1526-1528` (docstring states POWER_OFF-only criterion). Affected: reset UX and any future auto-recovery. Remediation: after re-enabling, wait bounded for IN_SERVICE (or at minimum for non-POWER_OFF) before reporting ok:true, mirroring `wait_radio`; report the observed post-reset state otherwise. Confirmed (code read).
 
 ## Not yet fixed
 
