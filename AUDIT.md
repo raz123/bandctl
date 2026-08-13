@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-197
+## Continuation audit (2026-08-10) — findings A-150..A-199
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3056,6 +3056,23 @@ Evidence: `web/server.py:347-403` (watchdog never calls reset), `:1500-1557` (re
 Both reset paths verify the radio reached POWER_OFF (via `_wait_for_radio_state("POWER_OFF")`) and then report `{"ok": True}` immediately after re-enabling — neither waits for the radio to leave POWER_OFF or reach IN_SERVICE. The docstring says exactly this: "The radio is verified to reach POWER_OFF before success is reported." Re-camping takes 30s+ after a power cycle; a user reading `ok: true` after a reset that powered the radio off and back on believes the drop is fixed while the radio may still be OUT_OF_SERVICE — the reset reports success for a recovery it never observed. This compounds A-196: an auto-recovery wired to this endpoint would terminate (and rate-limit against) recoveries that never happened.
 
 Evidence: `web/server.py:1516-1517` (radio-power path returns ok:true after `radio power on`, no state wait), `:1548-1551` (airplane path returns ok:true after `_disable_airplane()`, no IN_SERVICE wait), `:1526-1528` (docstring states POWER_OFF-only criterion). Affected: reset UX and any future auto-recovery. Remediation: after re-enabling, wait bounded for IN_SERVICE (or at minimum for non-POWER_OFF) before reporting ok:true, mirroring `wait_radio`; report the observed post-reset state otherwise. Confirmed (code read).
+
+### A-198 — The root-exec boundary widens to third-party runtimes in the fallback chain, with no integrity check (P2)
+
+The server runs as root and execs three non-module paths when the bundled artifacts are absent, with no hash/ownership verification of what it runs:
+
+- `QMI_BIN` fallback: `web/server.py:225-227` — when the module's `qmi/qmi_band` is missing, the server silently execs `/data/local/tmp/qmi_band` as root.
+- Python fallback chain: `service.sh:20-23` — bundled → `/data/data/com.termux/files/usr/bin/python3` (Termux app) → `/data/local/tmp/pyroot/usr/bin/python3.14` (a manually-planted runtime in the shared adb temp dir). The whole server runs from whichever lands, as root.
+
+The device's own observed state was "bundled python missing, using pyroot fallback" (v2.5 install — A-152/A-177) — the module was executing its HTTP server from `/data/local/tmp/pyroot`, a directory the module's own deployment workflow treats as adb-push scratch (`/sdcard` push is broken post-reboot). A tampered or planted `/data/local/tmp/qmi_band` or pyroot tree (adb left open, a compromised shell script, another module's payload) executes as root with zero verification — the module's root-exec surface is not its own directory. This is distinct from A-180 (config perms) and A-178 (loopback API): it is the *binary* trust boundary.
+
+Evidence: `web/server.py:225-227` (QMI fallback), `service.sh:20-23` (python fallbacks), on-device log "using pyroot fallback". Affected: any device with the module installed where the bundled artifacts are missing. Remediation: refuse non-module runtimes by default (log loudly instead of silently substituting), verify the fallback binary against the shipped hash, or restrict fallbacks to a developer flag. Confirmed (code + observed device state).
+
+### A-199 — A transient IN_SERVICE blip closes the drop episode and stamps a false recovery (P3 extension of A-181)
+
+The watchdog's recovery branch fires on ANY non-drop state, including a real-but-transient `IN_SERVICE` (a flicker between two OUT_OF_SERVICE polls): the episode is closed, `=== RECOVERED (duration Ns) ===` is stamped, and the next poll (radio down again) opens a brand-new episode. The 10s polling cannot distinguish a blip from a recovery, so a flickering drop produces a false short-duration recovery plus episode fragmentation (compounding A-187's multi-file and A-181's dumpsys-None false recovery). The drop duration recorded is the blip, not the outage.
+
+Evidence: `web/server.py:386-393` (recovery branch on any non-drop state), A-181 (None case, same branch), A-187 (episode fragmentation). Affected: drop-duration accuracy on flickering outages. Remediation: require N consecutive non-drop polls (hysteresis) before stamping recovery, matching the drop-detection latency. Confirmed (code trace).
 
 ## Not yet fixed
 
