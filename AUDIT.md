@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-199
+## Continuation audit (2026-08-10) — findings A-150..A-201
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3073,6 +3073,18 @@ Evidence: `web/server.py:225-227` (QMI fallback), `service.sh:20-23` (python fal
 The watchdog's recovery branch fires on ANY non-drop state, including a real-but-transient `IN_SERVICE` (a flicker between two OUT_OF_SERVICE polls): the episode is closed, `=== RECOVERED (duration Ns) ===` is stamped, and the next poll (radio down again) opens a brand-new episode. The 10s polling cannot distinguish a blip from a recovery, so a flickering drop produces a false short-duration recovery plus episode fragmentation (compounding A-187's multi-file and A-181's dumpsys-None false recovery). The drop duration recorded is the blip, not the outage.
 
 Evidence: `web/server.py:386-393` (recovery branch on any non-drop state), A-181 (None case, same branch), A-187 (episode fragmentation). Affected: drop-duration accuracy on flickering outages. Remediation: require N consecutive non-drop polls (hysteresis) before stamping recovery, matching the drop-detection latency. Confirmed (code trace).
+
+### A-200 — /api/band-camping always errors: a pathlib.Path is returned un-stringified in the JSON (P1)
+
+`BAND_CAMPING_LOG` is a `pathlib.Path` (`web/server.py:241`, `MODDIR / "config" / "band_camping.log"`), and both return paths of `read_band_camping` return it raw — `{"log": BAND_CAMPING_LOG}` at `:1490` and `:1502`. `json.dumps` raises `TypeError: Object of type PosixPath is not JSON serializable`, `handle_api`'s catch turns it into `{"ok": false, "error": "Object of type PosixPath is not JSON serializable"}`, and the endpoint fails on EVERY call, on every platform, in every shipped version. The UI polls it every 5s (`index.html:1129,1346-1349`), `updateCamping` throws on `!r.ok` (`:1478-1481`), so the "Camped" live chip (`:995`) shows "—" and the "Band camping" list shows the empty state "No serving-cell samples yet." (`:1454`) forever — while the background sampler keeps writing the log (A-201). The feature's documented purpose (server.py:238-240: "so a band force can be validated offline — does the modem ever camp on a banned band?") is completely unfulfilled, and the misleading empty state masks the error. No test covers the endpoint (A-184's gap — the camping reader is one of the untested paths).
+
+Evidence: `web/server.py:241,1490,1502`; `index.html:995,1129,1454,1478-1481`; **live probe reproduced: `GET /api/band-camping?action=band-camping&limit=1` → `{"ok": false, "error": "Object of type PosixPath is not JSON serializable"}`**. Affected: every user of the camping UI + offline validation. Remediation: `str(BAND_CAMPING_LOG)` in both returns, or return a `path` field; add an endpoint test (A-184). Confirmed (code + live probe).
+
+### A-201 — The band-camping sampler runs unconditionally every 5s forever, writing an unrotated log, with no way to disable it (P3)
+
+`_band_camping_loop` starts at server boot with no settings toggle (`web/server.py:1631`), unlike the v2.5 drop logger: it runs `_run_dumpsys("telephony.registry")` — a full binder dump — every `BAND_CAMPING_INTERVAL` = 5s, 24/7, for the lifetime of the module, and appends one CSV line per poll (`:926-939`) with no rotation, cap, or size limit: ~17,280 lines/day of unbounded growth in the config tree (A-180's 777 directory). The only consumer is the endpoint that crashes (A-200), so the entire feature is dead weight: a permanent system_server/binder load added to the very radio stack being diagnosed, plus unbounded disk growth, serving a reader nobody can use.
+
+Evidence: `web/server.py:242,920-939,1631` (no gate), A-200 (dead reader), A-180 (config dir). Affected: every installed module, always on. Remediation: gate the sampler on a settings toggle (like drop-log), rotate/trim the log, or defer polling to the UI request. Confirmed (code trace).
 
 ## Not yet fixed
 
