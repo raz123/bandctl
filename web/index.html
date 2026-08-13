@@ -643,10 +643,17 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
 
 /* ============ REDUCED MOTION ============ */
 @media (prefers-reduced-motion: reduce) {
+  /* A-027: keep intentional state-change feedback (calm 150ms opacity/color
+     fades for toasts, status, hover/active states) but remove spatial
+     movement (transforms, tab-underline scale, slider slide) entirely. */
   *, *::before, *::after {
-    transition-duration: 0.01ms !important;
-    animation: none !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-property: opacity, background-color, color, border-color, box-shadow, filter !important;
+    transition-duration: 150ms !important;
+    transition-timing-function: ease-out !important;
   }
+  .tab-panel.active { animation: none; }
 }
 
 /* ============ WHITE MOBILE INSTRUMENT SKIN ============ */
@@ -659,26 +666,32 @@ button:focus-visible, [role="button"]:focus-visible, input:focus-visible {
   --ink: #111a24;
   --ink-strong: #111a24;
   --muted: #64707a;
-  --accent: #079eb3;
+  /* A-29/A-162: darker teal — white text on it is 5.03:1 and it stays >=4.5:1
+     on the #e4f8fb/#f1fcfd active-state fills. */
+  --accent: #067a8d;
   --accent-ink: #ffffff;
-  --success: #1b8d47;
+  /* A-79: darkened state palette — each passes 4.5:1 on its light surfaces. */
+  --success: #16793a;
   --success-ink: #ffffff;
-  --danger: #d93f37;
-  --danger-ink: #d93f37;
-  --warn: #a96d09;
-  --warn-ink: #a96d09;
-  --focus: #079eb3;
+  --danger: #c22f28;
+  --danger-ink: #c22f28;
+  --warn: #96620a;
+  --warn-ink: #96620a;
+  --focus: #067a8d;
   --r-sm: 9px;
   --r-md: 10px;
   --r-lg: 14px;
-  --header-h: 78px;
+  /* A-077: the actual white header is ~90px tall (22 pad-top + 24/1.05 title
+     + 7 gap + 13/1.2 subline + 20 pad-bottom); the sticky tabbar sits below it. */
+  --header-h: 90px;
+  /* A-018: the skin's transitions reference this token; it was never defined. */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-html { min-width: 320px; background: #e8efec; }
+html { background: #e8efec; } /* A-055: no hard min-width — sub-320px viewports reflow */
 body {
   width: min(100%, 430px);
   max-width: none;
-  min-width: 320px;
   margin: 0 auto;
   padding: 0 0 calc(46px + env(safe-area-inset-bottom, 0px));
   background: #e8efec;
@@ -689,7 +702,11 @@ body {
 body > .app {
   width: 100%;
   min-height: 100vh;
+  /* A-005: overflow:hidden turned .app into the (non-scrolling) scroll
+     container, so the sticky header/tabbar never stuck. clip keeps the
+     rounded-corner clipping without creating a scroll container. */
   overflow: hidden;
+  overflow: clip;
   border: 1px solid #dfe8e4;
   border-radius: 25px 25px 0 0;
   background: var(--bg);
@@ -702,7 +719,7 @@ button, input { font: inherit; }
   top: 0;
   z-index: var(--z-sticky);
   margin: 0;
-  padding: 22px 20px 20px;
+  padding: calc(22px + env(safe-area-inset-top, 0px)) 20px 20px; /* A-083 */
   border: 0;
   background: var(--bg);
 }
@@ -734,6 +751,7 @@ button, input { font: inherit; }
   align-items: center;
   justify-content: center;
   gap: 9px;
+  min-width: 0;
   min-height: 54px;
   padding: 0 4px;
   border: 0;
@@ -744,11 +762,12 @@ button, input { font: inherit; }
   font-weight: 600;
   transition: color .18s var(--ease), background .18s var(--ease);
 }
+.tabbar button span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* A-055: narrow-viewport reflow */
 .tab-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .tab-icon.gear-icon { width: 26px; height: 26px; stroke-width: 1.7; }
 .tabbar button::after { content: ""; position: absolute; right: 18px; bottom: -1px; left: 18px; height: 3px; transform: scaleX(0); border-radius: 3px 3px 0 0; background: var(--accent); transition: transform .2s var(--ease); }
 .tabbar button:hover { background: var(--surface); color: var(--ink); }
-.tabbar button.active { background: transparent; color: #087f91; font-weight: 600; }
+.tabbar button.active { background: transparent; color: var(--accent); font-weight: 600; }
 .tabbar button.active::after { transform: scaleX(1); }
 
 #server-banner {
@@ -764,7 +783,7 @@ button, input { font: inherit; }
   line-height: 1.35;
 }
 #server-banner[style*="display: block"] { display: flex !important; }
-#server-banner button { min-height: 32px; margin-left: auto; padding: 5px 10px; border: 1px solid currentColor; border-radius: 8px; background: transparent; color: inherit; font-size: 11px; font-weight: 750; }
+#server-banner button { min-height: 44px; margin-left: auto; padding: 5px 10px; border: 1px solid currentColor; border-radius: 8px; background: transparent; color: inherit; font-size: 11px; font-weight: 750; } /* A-076 */
 
 .tab-panel { display: none; padding: 22px 20px 46px; }
 .tab-panel.active { display: block; animation: tabIn .22s var(--ease); }
@@ -774,7 +793,7 @@ button, input { font: inherit; }
 .section-head h2, .section-heading h2 { margin: 0; font-size: 18px; line-height: 1.2; letter-spacing: -.025em; }
 .section-title { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
 .section-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: var(--success); stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.9; }
-.section-heading .count, .section-head .count, .section-heading .meta, .canvas-meta { color: #087f91; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.section-heading .count, .section-head .count, .section-heading .meta, .canvas-meta { color: var(--accent); font-size: 12px; font-weight: 700; white-space: nowrap; }
 .section-heading .meta, .canvas-meta { color: var(--muted); font-weight: 500; }
 .hint { margin: -2px 0 11px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 
@@ -788,11 +807,12 @@ button, input { font: inherit; }
 .band-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
 .band { min-width: 0; min-height: 58px; padding: 8px 4px 7px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--muted); text-align: center; transition: transform .16s var(--ease), border-color .16s var(--ease), background .16s var(--ease), color .16s var(--ease); }
 .band:hover { transform: translateY(-1px); border-color: #9edee5; color: var(--ink); }
-.band.active { border-color: #a9e6eb; background: #e4f8fb; color: #087f91; }
-.band.active::after { top: 6px; right: 7px; width: 5px; height: 5px; background: #087f91; opacity: .55; }
+.band.active { border-color: #a9e6eb; background: #e4f8fb; color: var(--accent); }
+.band.active::after { top: 6px; right: 7px; width: 5px; height: 5px; background: var(--accent); opacity: .55; }
 .band .name { display: block; color: currentColor; font-size: 14px; font-weight: 800; line-height: 1; }
 .band .freq { display: block; margin-top: 7px; color: currentColor; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; opacity: .72; }
 .band.active .name, .band.active .freq { color: currentColor; }
+.band.active .freq { opacity: 1; } /* A-162: 9px active-state freq must not be faded */
 
 .button-stack { display: grid; gap: 9px; margin-top: 20px; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
@@ -800,15 +820,15 @@ button, input { font: inherit; }
 .btn-row .btn { flex: 1 1 145px; margin-top: 0; }
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: auto; min-height: 48px; margin-top: 0; padding: 9px 13px; border: 1px solid transparent; border-radius: 10px; background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; transition: background .18s var(--ease), border-color .18s var(--ease), color .18s var(--ease), transform .18s var(--ease), opacity .18s var(--ease); }
 .btn.primary { width: 100%; }
-.btn:hover { transform: translateY(-1px); background: #087f91; }
+.btn:hover { transform: translateY(-1px); background: #055f70; }
 .btn:disabled, .btn.loading { cursor: wait; opacity: .65; transform: none; pointer-events: none; }
-.btn.ghost { border-color: var(--line); background: var(--bg); color: #087f91; }
+.btn.ghost { border-color: var(--line); background: var(--bg); color: var(--accent); }
 .btn.ghost:hover { background: #e4f8fb; border-color: #b6e5e9; }
 .btn.danger { border-color: #ffc7c3; background: #fff0ee; color: var(--danger); }
 .btn.danger:hover { background: #ffe3df; }
 .btn.danger-outline { border-color: var(--danger); background: var(--bg); color: var(--danger); }
 .btn.danger-outline:hover { background: #fff0ee; }
-.btn.small { min-height: 36px; padding: 7px 10px; border-radius: 8px; font-size: 12px; }
+.btn.small { min-height: 44px; padding: 7px 10px; border-radius: 8px; font-size: 12px; } /* A-076 */
 .btn-icon { width: 20px; height: 20px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .button-with-icon { gap: 9px; }
 .status { display: none; margin-top: 10px; padding: 10px 12px; border-radius: 9px; background: #e9f6e8; color: var(--success); font-size: 11px; line-height: 1.4; }
@@ -830,7 +850,7 @@ button, input { font: inherit; }
 .chip { min-width: 0; min-height: 70px; padding: 11px 10px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink); }
 .chip .state-chip-top { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
 .chip .label { display: block; min-width: 0; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.chip .chipval { display: block; margin-top: 5px; overflow: hidden; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.chip .chipval { display: block; margin-top: 5px; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; line-height: 1.3; overflow-wrap: break-word; } /* A-003: show full state, wrap instead of truncating */
 .state-icon { flex: 0 0 auto; width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .state-icon.check-icon circle { fill: transparent; stroke: var(--line-strong); }
 .state-icon.check-icon path { stroke: transparent; }
@@ -839,10 +859,10 @@ button, input { font: inherit; }
 .chip.bad .state-icon.check-icon circle { fill: var(--danger); stroke: var(--danger); }
 .state-icon.bars-icon { fill: currentColor; stroke: none; }
 .chip.good .state-icon, .chip.good .chipval { color: var(--success); }
-.chip.accent .state-icon, .chip.accent .chipval { color: #087f91; }
+.chip.accent .state-icon, .chip.accent .chipval { color: var(--accent); }
 .chip.selected { border-color: #a9e4eb; background: #f1fcfd; }
 .chip.amber { border-color: #f3dfaa; background: #fff4d6; }
-.chip.amber .chipval { color: #a96d09; }
+.chip.amber .chipval { color: var(--warn); }
 
 .camping-list, .hist { border-top: 1px solid var(--line); }
 .camping-row, .hist-item { display: grid; align-items: center; gap: 8px; padding: 12px 0; border-bottom: 1px solid #eef3f1; }
@@ -852,7 +872,7 @@ button, input { font: inherit; }
 .camping-row:first-child .marker { background: var(--accent); }
 .camping-row time, .hist-time { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-variant-numeric: tabular-nums; }
 .camping-row strong { min-width: 0; overflow: hidden; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.camping-row em { color: #087f91; font-size: 11px; font-style: normal; font-weight: 700; white-space: nowrap; }
+.camping-row em { color: var(--accent); font-size: 11px; font-style: normal; font-weight: 700; white-space: nowrap; }
 .hist { max-height: 280px; overflow-y: auto; margin-top: 4px; }
 .hist-item { grid-template-columns: 46px 70px minmax(0, 1fr); }
 .tag { display: inline-flex; justify-content: center; min-height: 24px; padding: 4px 5px; border-radius: 6px; background: #e9f6e8; color: var(--success); font-size: 10px; font-weight: 750; letter-spacing: 0; text-transform: uppercase; }
@@ -878,9 +898,9 @@ button, input { font: inherit; }
 .network-block { padding-top: 2px; }
 .network-row { align-items: flex-start; }
 .network-row > span:first-child { max-width: 280px; color: var(--ink); font-weight: 650; }
-.switch { position: relative; flex: 0 0 auto; width: 45px; height: 26px; }
+.switch { position: relative; flex: 0 0 auto; width: 52px; height: 44px; } /* A-076: 44px hit area; slider keeps its 45x26 look */
 .switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
-.slider { position: absolute; inset: 0; border-radius: 999px; background: #dce5e2; transition: background .18s var(--ease); }
+.slider { position: absolute; top: 9px; right: 3.5px; bottom: 9px; left: 3.5px; border-radius: 999px; background: #dce5e2; transition: background .18s var(--ease); }
 .slider::before { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(17, 26, 36, .18); transition: transform .18s var(--ease); }
 .switch input:checked + .slider { background: var(--accent); }
 .switch input:checked + .slider::before { transform: translateX(19px); }
@@ -888,9 +908,10 @@ button, input { font: inherit; }
 .network-details[style*="display: block"] { display: block !important; }
 .token-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding-bottom: 10px; }
 .token-row label { color: var(--muted); font-size: 11px; }
+#lan-token-input { min-height: 44px; } /* A-172 */
 .token-code { min-width: 0; overflow: hidden; padding: 7px 8px; border-radius: 7px; background: var(--surface); color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.token-actions { display: flex; align-items: center; gap: 5px; }
-.icon-btn { display: inline-grid; width: 36px; min-height: 36px; padding: 0; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: #087f91; transition: background .18s var(--ease), border-color .18s var(--ease), transform .18s var(--ease); }
+.token-actions { display: flex; align-items: center; gap: 8px; } /* A-076 */
+.icon-btn { display: inline-grid; width: 44px; min-height: 44px; padding: 0; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--accent); transition: background .18s var(--ease), border-color .18s var(--ease), transform .18s var(--ease); } /* A-076/A-162 */
 .icon-btn:hover { transform: translateY(-1px); border-color: #b6e5e9; background: #e4f8fb; }
 .icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .network-details .btn-row { margin: 0 0 4px; }
@@ -900,7 +921,19 @@ button, input { font: inherit; }
 
 #toast { right: 16px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); left: 16px; max-width: 398px; margin: 0 auto; padding: 11px 13px; border: 0; border-radius: 10px; background: #18252b; color: #fff; box-shadow: 0 12px 30px rgba(0,0,0,.2); font-size: 11px; line-height: 1.35; }
 #toast.err { background: var(--danger); color: #fff; }
-.modal-overlay { align-items: flex-end; padding: 16px; background: rgba(0,0,0,.25); }
+/* A-107: visually hidden text alternative for the signal graph */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+.modal-overlay { align-items: flex-end; padding: 16px; padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px)); background: rgba(0,0,0,.25); } /* A-095 */
 .modal { width: min(100%,398px); max-width: none; padding: 18px; border: 1px solid var(--line); border-radius: 18px; background: #fff; box-shadow: 0 20px 60px rgba(0,0,0,.2); }
 .modal h3 { margin: 0 0 8px; color: var(--ink); font-size: 17px; letter-spacing: -.025em; }
 .modal p { margin: 8px 0 14px; color: var(--muted); font-size: 12px; line-height: 1.45; }
@@ -914,6 +947,7 @@ button, input { font: inherit; }
 @media (max-width: 370px) {
   .app-header { padding-inline: 15px; }
   .brand-row { gap: 8px; }
+  .brand-row h1 { font-size: 22px; } /* A-055: keep the connection line on-screen at sub-320px widths */
   .connection-line { font-size: 11px; }
   .tab-panel { padding-inline: 15px; }
   .band-grid { gap: 5px; }
@@ -971,7 +1005,7 @@ button, input { font: inherit; }
       <button type="button" class="btn ghost" id="refresh-btn">Refresh from modem</button>
     </div>
   </div>
-  <div id="status" class="status"></div>
+  <div id="status" class="status" role="status"></div>
 </div>
 
 <!-- ============ DIAGNOSTICS ============ -->
@@ -981,7 +1015,8 @@ button, input { font: inherit; }
       <h2>Signal — RSRP over time</h2>
       <span class="canvas-meta">Updated <span id="sig-time">—</span></span>
     </div>
-    <div class="canvas-wrap"><canvas id="signal-canvas"></canvas></div>
+    <div class="canvas-wrap"><canvas id="signal-canvas" role="img" aria-label="Signal strength (RSRP) over time"></canvas></div>
+    <p class="sr-only" id="signal-summary">No signal data yet.</p>
     <div class="readouts">
       <div class="readout"><div class="label">RSRP</div><div class="value" id="sig-rsrp">—</div><span class="unit">dBm</span></div>
       <div class="readout"><div class="label">RSRQ</div><div class="value" id="sig-rsrq">—</div><span class="unit">dB</span></div>
@@ -1040,8 +1075,8 @@ button, input { font: inherit; }
     <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9a14 14 0 0 1 18 0M6 13a9 9 0 0 1 12 0M9.5 17a4 4 0 0 1 5 0"></path><circle cx="12" cy="20" r="1"></circle></svg><span>Network access</span></h2></div>
     <div class="set-row network-row">
       <span>Allow access from other devices on your network (LAN)</span>
-      <label class="switch" aria-label="Enable LAN access">
-        <input type="checkbox" id="lan-toggle">
+      <label class="switch">
+        <input type="checkbox" id="lan-toggle" aria-label="Enable LAN access">
         <span class="slider"></span>
       </label>
     </div>
@@ -1056,7 +1091,8 @@ button, input { font: inherit; }
         </div>
       </div>
       <div class="set-row" id="lan-token-entry" style="display:none">
-        <input type="text" id="lan-token-input" placeholder="Paste the access token" autocomplete="off" spellcheck="false">
+        <input type="password" id="lan-token-input" placeholder="Paste the access token" autocomplete="off" spellcheck="false" aria-label="Access token">
+        <button type="button" class="btn small ghost" id="lan-token-input-toggle" aria-label="Show or hide access token">Show</button>
         <button type="button" class="btn small" id="lan-token-save">Save token</button>
       </div>
       <div class="btn-row">
@@ -1069,8 +1105,8 @@ button, input { font: inherit; }
     <h3 class="subsection-title">Debug</h3>
     <div class="set-row network-row">
       <span>Drop logging — snapshot radio drops (registration, Wi-Fi, data) to the module config dir</span>
-      <label class="switch" aria-label="Enable drop logging">
-        <input type="checkbox" id="drop-log-toggle">
+      <label class="switch">
+        <input type="checkbox" id="drop-log-toggle" aria-label="Enable drop logging">
         <span class="slider"></span>
       </label>
     </div>
@@ -1080,14 +1116,14 @@ button, input { font: inherit; }
 
 </div>
 
-<div id="toast"></div>
+<div id="toast" role="status"></div>
 
 <!-- ============ In-page modals (WebView-safe; no alert/confirm/prompt) ============ -->
 <div class="modal-overlay" id="preset-modal" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">
   <div class="modal">
     <h3 id="preset-modal-title">Save preset</h3>
     <p>Name this band configuration so you can restore it later.</p>
-    <input type="text" id="preset-name-input" placeholder="Preset name" maxlength="40" autocomplete="off">
+    <input type="text" id="preset-name-input" placeholder="Preset name" maxlength="40" autocomplete="off" aria-label="Preset name">
     <div class="btn-row">
       <button class="btn" id="preset-modal-save">Save</button>
       <button class="btn ghost" id="preset-modal-cancel">Cancel</button>
@@ -1102,6 +1138,17 @@ button, input { font: inherit; }
     <div class="btn-row">
       <button class="btn ghost" id="reset-modal-cancel">Cancel</button>
       <button class="btn danger" id="reset-modal-confirm">Reset</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+  <div class="modal">
+    <h3 id="delete-modal-title">Delete preset?</h3>
+    <p id="delete-modal-text">This permanently removes the preset from this device.</p>
+    <div class="btn-row">
+      <button class="btn ghost" id="delete-modal-cancel">Cancel</button>
+      <button class="btn danger" id="delete-modal-confirm">Delete</button>
     </div>
   </div>
 </div>
@@ -1262,6 +1309,8 @@ function switchTab(name) {
     var isActive = b.dataset.tab === name;
     b.classList.toggle('active', isActive);
     b.setAttribute('aria-selected', String(isActive));
+    // A-086: roving tabindex — only the selected tab stays in the Tab order
+    b.setAttribute('tabindex', isActive ? '0' : '-1');
   });
   if (name === 'diag') drawGraph();
   window.scrollTo(0, 0);
@@ -1483,6 +1532,10 @@ function serverDown(err) {
   stopPolling();
   applyConnectionState();
   showBanner();
+  // A-111: mark the outage as a gap so the graph line breaks instead of
+  // connecting the last pre-outage point to the first post-outage one.
+  signalHistory.push({ t: Date.now(), rsrp: null });
+  if (signalHistory.length > GRAPH_POINTS) signalHistory.shift();
   // A-193: a restart the user triggered takes the server down on
   // purpose — the banner shows that, the history must not call it a DROP.
   if (userInitiatedOp) {
@@ -1560,6 +1613,7 @@ async function pollSignal() {
     $('sig-tech').textContent = d.tech || '—';
     $('sig-level').textContent = d.level == null ? '—' : String(d.level);
     $('sig-time').textContent = fmtTime(d.timestamp || now);
+    updateSignalSummary(d);
     applyConnectionState();
     drawGraph();
   } catch (e) {
@@ -1680,11 +1734,21 @@ function isIwlan(d) {
   var transports = d.transports || [];
   return transports.some(function (t) { return t && t.tech === 'IWLAN'; });
 }
+function regDesc(r) {
+  var parts = [];
+  if (r.service) parts.push(r.service);
+  if (r.data) parts.push('data ' + r.data);
+  if (r.net) parts.push(r.net);
+  if (r.op) parts.push(r.op);
+  if (r.roam != null) parts.push(r.roam ? 'roaming' : 'home');
+  return parts.length ? parts.join(' · ') : 'unknown';
+}
 function checkRegChange(d) {
-  var cur = { service: d.service_state, net: d.network_type, transports: d.transports || [] };
+  // A-081: also track data/roaming/operator transitions, not just service+net.
+  var cur = { service: d.service_state, data: d.data_state, net: d.network_type, roam: d.roaming, op: d.operator, transports: d.transports || [] };
   if (!lastReg) {
-    logEntry('REG', 'Initial state: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
-  } else if (cur.service !== lastReg.service || cur.net !== lastReg.net || isIwlan(d) !== isIwlan(lastReg)) {
+    logEntry('REG', 'Initial state: ' + regDesc(cur));
+  } else if (cur.service !== lastReg.service || cur.net !== lastReg.net || cur.data !== lastReg.data || cur.roam !== lastReg.roam || cur.op !== lastReg.op || isIwlan(d) !== isIwlan(lastReg)) {
     var wasIn = lastReg.service === 'IN_SERVICE';
     var isIn = cur.service === 'IN_SERVICE';
     if (!isIn && wasIn) {
@@ -1693,14 +1757,14 @@ function checkRegChange(d) {
       if (userInitiatedOp) {
         logEntry('REG', 'Service state → ' + (d.service_state || 'unknown') + ' (reset in progress)');
       } else {
-        logDrop('Service lost: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+        logDrop('Service lost: ' + regDesc(cur));
       }
     } else if (isIn && wasIn && (cur.net === 'IWLAN' || isIwlan(d) || isIwlan(lastReg))) {
       // IWLAN/VoWiFi handover with both states IN_SERVICE — the drop
       // precursor the service-only gate missed (A-182).
       logDrop('Wi-Fi calling handover: ' + (cur.net || 'unknown'));
     } else {
-      logEntry('REG', 'Service state → ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+      logEntry('REG', 'State → ' + regDesc(cur));
     }
   }
   // A-193: any IN_SERVICE poll ends the reset window — the radio is back.
@@ -1708,12 +1772,17 @@ function checkRegChange(d) {
   lastReg = cur;
 }
 function logEntry(tag, text) {
+  appendHist(fmtClock(), tag, text);
+  persistHistory();
+}
+function logDrop(text) { logEntry('DROP', text); }
+function appendHist(timeText, tag, text) {
   var list = $('history-list');
   var item = document.createElement('div');
   item.className = 'hist-item';
   var time = document.createElement('span');
   time.className = 'hist-time';
-  time.textContent = fmtClock();
+  time.textContent = timeText;
   var tagEl = document.createElement('span');
   tagEl.className = 'tag ' + tag;
   tagEl.textContent = tag;
@@ -1727,51 +1796,51 @@ function logEntry(tag, text) {
   while (list.children.length > HISTORY_MAX) list.removeChild(list.lastChild);
   persistHistory(); // A-182: survive reloads
 }
-function logDrop(text) { logEntry('DROP', text); }
 function persistHistory() {
-  // A-182: mirror the DOM history (newest first) into localStorage so a
-  // page reload does not erase the visible drop record.
-  try {
-    var list = $('history-list');
-    var entries = [];
-    for (var i = 0; i < list.children.length && i < HISTORY_MAX; i++) {
-      var item = list.children[i];
-      var tagEl = item.querySelector('.tag');
-      var timeEl = item.querySelector('.hist-time');
-      var txtEl = item.querySelector('.hist-text');
-      entries.push({ tag: tagEl ? tagEl.textContent : '', time: timeEl ? timeEl.textContent : '', text: txtEl ? txtEl.textContent : '' });
-    }
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(entries));
-  } catch (e) { /* storage full/blocked — history stays DOM-only */ }
-}
-function restoreHistory() {
-  try {
-    var raw = localStorage.getItem(HISTORY_KEY);
-    if (!raw) return;
-    var entries = JSON.parse(raw);
-    if (!Array.isArray(entries)) return;
-    var list = $('history-list');
-    entries.forEach(function (entry) {
-      var item = document.createElement('div');
-      item.className = 'hist-item';
-      var time = document.createElement('span');
-      time.className = 'hist-time';
-      time.textContent = entry.time || '';
-      var tagEl = document.createElement('span');
-      tagEl.className = 'tag ' + (entry.tag || 'REG');
-      tagEl.textContent = entry.tag || 'REG';
-      var txt = document.createElement('span');
-      txt.className = 'hist-text';
-      txt.textContent = entry.text || '';
-      item.appendChild(tagEl);
-      item.appendChild(time);
-      item.appendChild(txt);
-      list.appendChild(item);
+  var list = $('history-list');
+  var saved = [];
+  Array.prototype.forEach.call(list.children, function (child) {
+    saved.push({
+      time: child.querySelector('.hist-time').textContent,
+      tag: child.querySelector('.tag').textContent,
+      text: child.querySelector('.hist-text').textContent
     });
-  } catch (e) { /* corrupted storage — start fresh */ }
+  });
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(saved.slice(0, HISTORY_MAX))); }
+  catch (e) { /* storage unavailable (private mode) — session-only fallback */ }
+}
+function loadHistory() {
+  var saved = [];
+  try { saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); }
+  catch (e) { saved = []; }
+  // saved is newest-first; insert oldest first so the newest ends up on top
+  for (var i = saved.length - 1; i >= 0; i--) {
+    var h = saved[i];
+    if (!h || !h.tag || !h.text) continue;
+    appendHist(h.time || '', h.tag, h.text);
+  }
 }
 
 /* ============ Signal graph (plain canvas, auto-scale) ============ */
+function updateSignalSummary(d) {
+  var el = $('signal-summary');
+  if (!el) return;
+  var parts = [];
+  var now = Date.now();
+  var recent = signalHistory.filter(function (p) { return p.t >= now - GRAPH_WINDOW_MS && p.rsrp != null; });
+  if (recent.length) {
+    var lo = Math.min.apply(null, recent.map(function (p) { return p.rsrp; }));
+    var hi = Math.max.apply(null, recent.map(function (p) { return p.rsrp; }));
+    parts.push(lo === hi ? 'RSRP steady at ' + lo + ' dBm' : 'RSRP over the last 4 minutes ranges from ' + lo + ' to ' + hi + ' dBm');
+  } else {
+    parts.push(d.rsrp_dbm == null ? 'RSRP no data' : 'RSRP ' + d.rsrp_dbm + ' dBm');
+  }
+  if (d.rsrq_db != null) parts.push('RSRQ ' + d.rsrq_db + ' dB');
+  if (d.tech) parts.push(d.tech);
+  if (d.level != null) parts.push('level ' + d.level);
+  if (d.timestamp) parts.push('updated ' + fmtTime(d.timestamp));
+  el.textContent = 'Signal graph: ' + parts.join(', ') + '.';
+}
 function drawGraph() {
   var canvas = $('signal-canvas');
   var w = canvas.clientWidth;
@@ -1794,12 +1863,15 @@ function drawGraph() {
   ctx.fillRect(padL, padT, pw, ph);
 
   var now = Date.now();
-  var tMin = now - GRAPH_WINDOW_MS;
-  if (signalHistory.length) tMin = Math.min(tMin, signalHistory[0].t);
-  var tMax = Math.max(now, signalHistory.length ? signalHistory[signalHistory.length - 1].t : now);
+  // A-111: only draw the last GRAPH_WINDOW_MS — stale pre-outage points must
+  // not stretch the time axis or fake continuity after reconnection.
+  var cutoff = now - GRAPH_WINDOW_MS;
+  var visible = signalHistory.filter(function (p) { return p.t >= cutoff; });
+  var tMin = cutoff;
+  var tMax = Math.max(now, visible.length ? visible[visible.length - 1].t : now);
   var spanT = Math.max(tMax - tMin, 1);
 
-  var vals = signalHistory.filter(function (p) { return p.rsrp != null; }).map(function (p) { return p.rsrp; });
+  var vals = visible.filter(function (p) { return p.rsrp != null; }).map(function (p) { return p.rsrp; });
   var yMin, yMax;
   if (vals.length) {
     yMin = Math.min.apply(null, vals);
@@ -1818,7 +1890,7 @@ function drawGraph() {
 
   // horizontal grid + Y labels
   ctx.fillStyle = '#7a878d';
-  ctx.fillText('dBm', 2, 9);
+  ctx.fillText('dBm', 2, 6); // A-006: keep clear of the top tick label (baseline 15)
   var TICKS = 4, i;
   for (i = 0; i <= TICKS; i++) {
     var v = yMin + (yMax - yMin) * i / TICKS;
@@ -1842,22 +1914,22 @@ function drawGraph() {
 
   if (vals.length) {
     // signal line with gaps on null values
-    ctx.strokeStyle = '#079eb3';
+    ctx.strokeStyle = '#067a8d';
     ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
     ctx.beginPath();
     var pen = false;
-    for (var j = 0; j < signalHistory.length; j++) {
-      var p = signalHistory[j];
+    for (var j = 0; j < visible.length; j++) {
+      var p = visible[j];
       if (p.rsrp == null) { pen = false; continue; }
       var x = X(p.t), y = Y(p.rsrp);
       if (pen) { ctx.lineTo(x, y); } else { ctx.moveTo(x, y); pen = true; }
     }
     ctx.stroke();
     // current-value dot
-    var last = signalHistory[signalHistory.length - 1];
+    var last = visible[visible.length - 1];
     if (last && last.rsrp != null) {
-      ctx.fillStyle = '#079eb3';
+      ctx.fillStyle = '#067a8d';
       ctx.beginPath();
       ctx.arc(X(last.t), Y(last.rsrp), 3.5, 0, Math.PI * 2);
       ctx.fill();
@@ -1992,6 +2064,28 @@ function loadPreset(i) {
   // active tab's button is not left a dead tap.
   if (location.hash !== '#bands') location.hash = 'bands';
   toast('Preset "' + p.name + '" loaded — press Save & Apply to push');
+}
+var pendingDeleteIndex = null;
+function requestDeletePreset(i) {
+  var p = getPresets()[i];
+  if (!p) return;
+  pendingDeleteIndex = i;
+  $('delete-modal-text').textContent = 'This permanently removes "' + p.name + '" from this device.';
+  openModal('delete-modal');
+}
+function confirmDeletePreset() {
+  if (pendingDeleteIndex == null) return;
+  var i = pendingDeleteIndex;
+  pendingDeleteIndex = null;
+  closeModal('delete-modal');
+  deletePreset(i);
+  // The row was re-rendered; park focus on the replacement row's first button.
+  var rows = document.querySelectorAll('#preset-list .preset-item');
+  var target = rows[Math.min(i, rows.length - 1)];
+  if (target) {
+    var btn = target.querySelector('button');
+    if (btn) btn.focus();
+  }
 }
 function deletePreset(i) {
   var list = getPresets();
@@ -2222,6 +2316,8 @@ function saveLanToken() {
   if (!val) { toast('Paste the access token first', true); return; }
   setStoredToken(val);
   $('lan-token-input').value = '';
+  $('lan-token-input').type = 'password'; // A-191: re-mask after saving
+  $('lan-token-input-toggle').textContent = 'Show';
   lanTokenShown = false;
   renderTokenDisplay(val); // also hides the paste form (A-101)
   // The page may have stopped polling on the pre-token 401s — resume now.
@@ -2484,10 +2580,24 @@ function showBanner() { $('server-banner').style.display = 'block'; }
 function hideBanner() { $('server-banner').style.display = 'none'; }
 
 /* ============ In-page modals (WebView-safe) ============ */
-function openModal(id) { $(id).classList.add('open'); }
-function closeModal(id) { $(id).classList.remove('open'); }
+var lastFocused = null;
+function openModal(id) {
+  lastFocused = document.activeElement;
+  var overlay = $(id);
+  overlay.classList.add('open');
+  // A-040: move focus into the dialog on open
+  var focusable = overlay.querySelectorAll('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])');
+  var target = focusable.length ? focusable[0] : overlay;
+  if (target && target.focus) target.focus();
+}
+function closeModal(id) {
+  $(id).classList.remove('open');
+  // A-040: restore focus to the trigger on close
+  if (lastFocused && lastFocused.focus) lastFocused.focus();
+  lastFocused = null;
+}
 function closeModals() {
-  ['preset-modal', 'reset-modal'].forEach(function (id) { closeModal(id); });
+  ['preset-modal', 'reset-modal', 'delete-modal'].forEach(function (id) { closeModal(id); });
 }
 
 /* ============ Delegated events ============ */
@@ -2495,18 +2605,64 @@ document.addEventListener('click', function (e) {
   var tab = e.target.closest('.tabbar button[data-tab]');
   if (tab) { location.hash = tab.dataset.tab; return; }
   var band = e.target.closest('[data-band]');
-  if (band) { toggleBand(band.dataset.band, band.dataset.type); return; }
+  if (band) {
+    toggleBand(band.dataset.band, band.dataset.type);
+    // A-121: renderBands() rebuilds the grids — re-query the tile and keep focus on it
+    var tile = document.querySelector('.band[data-band="' + band.dataset.band + '"][data-type="' + band.dataset.type + '"]');
+    if (tile) tile.focus();
+    return;
+  }
   var preset = e.target.closest('[data-action]');
   if (preset) {
     var i = parseInt(preset.dataset.index, 10);
-    if (preset.dataset.action === 'load') loadPreset(i); else deletePreset(i);
+    if (preset.dataset.action === 'load') loadPreset(i); else requestDeletePreset(i); // A-192: confirm before delete
   }
 });
 document.addEventListener('keydown', function (e) {
-  var band = e.target.closest('[data-band]');
+  // e.target can be the document/window when nothing holds focus; guard closest()
+  var target = (e.target && e.target.closest) ? e.target : null;
+  // A-040: keep Tab inside an open modal
+  if (e.key === 'Tab') {
+    var overlay = document.querySelector('.modal-overlay.open');
+    if (overlay) {
+      var focusables = overlay.querySelectorAll('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])');
+      if (focusables.length) {
+        var first = focusables[0];
+        var last = focusables[focusables.length - 1];
+        var inside = overlay.contains(document.activeElement);
+        if (e.shiftKey && (!inside || document.activeElement === first)) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && (!inside || document.activeElement === last)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    }
+  }
+  var band = target && target.closest('[data-band]');
   if (band && (e.key === 'Enter' || e.key === ' ')) {
     e.preventDefault();
     toggleBand(band.dataset.band, band.dataset.type);
+    // A-121: restore keyboard focus to the re-rendered tile
+    var tile = document.querySelector('.band[data-band="' + band.dataset.band + '"][data-type="' + band.dataset.type + '"]');
+    if (tile) tile.focus();
+    return;
+  }
+  // A-086: Arrow/Home/End navigation for the tabset
+  var tabBtn = target && target.closest('.tabbar button[data-tab]');
+  if (tabBtn && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End')) {
+    e.preventDefault();
+    var tabs = Array.prototype.slice.call(document.querySelectorAll('.tabbar button[data-tab]'));
+    var idx = tabs.indexOf(tabBtn);
+    var next;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = tabs.length - 1;
+    else if (e.key === 'ArrowLeft') next = (idx - 1 + tabs.length) % tabs.length;
+    else next = (idx + 1) % tabs.length;
+    tabs[next].focus();
+    location.hash = tabs[next].dataset.tab;
+    return;
   }
   if (e.key === 'Escape') closeModals();
   if (e.key === 'Enter' && $('preset-modal').classList.contains('open') && e.target === $('preset-name-input')) {
@@ -2535,6 +2691,14 @@ function init() {
   $('lan-restart').addEventListener('click', restartServer);
   $('lan-token-save').addEventListener('click', saveLanToken);
   $('lan-token-show').addEventListener('click', toggleTokenShown);
+  $('lan-token-input-toggle').addEventListener('click', function () {
+    var input = $('lan-token-input');
+    var show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    this.textContent = show ? 'Hide' : 'Show';
+  });
+  $('delete-modal-confirm').addEventListener('click', confirmDeletePreset);
+  $('delete-modal-cancel').addEventListener('click', function () { closeModal('delete-modal'); });
   $('token-copy').addEventListener('click', copyToken);
   $('token-share').addEventListener('click', shareToken);
   $('drop-log-toggle').addEventListener('change', toggleDropLog);
@@ -2556,8 +2720,8 @@ function init() {
   });
 
   onHash();
+  loadHistory(); // A-094/A-182: restore persisted event history
   renderPresets();
-  restoreHistory(); // A-182: reload the persisted event history
   renderCamping([]);
   updateSummary();
   loadBands();
