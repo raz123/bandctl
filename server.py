@@ -112,6 +112,7 @@ import http.server
 import fcntl
 import hmac
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -147,8 +148,10 @@ SETTINGS_FILE = MODDIR / "config" / "settings.json"
 DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None, "drop_log": False}
 
 # Serialize config/settings writes so concurrent saves cannot interleave
-# (each save is temp-file + os.replace, atomic per write).
-_CONFIG_WRITE_LOCK = threading.Lock()
+# (each save is temp-file + os.replace, atomic per write). RLock so a
+# mutation+save critical section can hold the lock while _save_settings
+# re-acquires it inside _atomic_write_json (A-116).
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 # Request bodies are clamped to 1 MiB before parsing (M6 guard).
 MAX_BODY_BYTES = 1 * 1024 * 1024
@@ -295,26 +298,72 @@ QMI_SET_TIMEOUT = 8
 # Fallback config file for persistence
 CONFIG_FILE = MODDIR / "config" / "bands.json"
 
+# Persistent data dir OUTSIDE the module dir (A-173): a KernelSU module
+# update replaces MODDIR wholesale, wiping config/drop_log and any
+# exports. /data/local/tmp/bandctl/ survives updates on-device; dev/test
+# checkouts without that path fall back to the module config dir.
+def _persistent_data_dir():
+    alt = Path("/data/local/tmp/bandctl")
+    try:
+        if alt.parent.is_dir():
+            alt.mkdir(parents=True, exist_ok=True)
+            return alt
+    except OSError:
+        pass
+    return MODDIR / "config"
+
+PERSIST_DIR = _persistent_data_dir()
+
 # Export dir for WebView-compatible config export (the Manager WebView
 # drops blob downloads, so export writes a timestamped file on-device).
-EXPORT_DIR = MODDIR / "config"
+EXPORT_DIR = PERSIST_DIR
 
 # Band-camping sampler (findings 5c): append `timestamp,earfcn,band` CSV
 # lines every BAND_CAMPING_INTERVAL seconds so a band force can be
 # validated offline (does the modem ever camp on a banned band?).
-BAND_CAMPING_LOG = MODDIR / "config" / "band_camping.log"
+BAND_CAMPING_LOG = PERSIST_DIR / "band_camping.log"
 BAND_CAMPING_INTERVAL = 5
+# Wall-clock ms can step backwards (NTP/carrier time sync), which would
+# make the CSV / last-N chart show time going backwards (A-154). Keep the
+# written timestamp strictly monotonic by clamping to last+1.
+_BAND_CAMPING_LAST_MS = [0]
 
 # v2.5 drop logger: when enabled (Settings > Debug > Drop logging), a
-# daemon watchdog stamps every radio drop (OUT_OF_SERVICE / POWER_OFF /
-# EMERGENCY_ONLY) with correlation context — registration, call state,
-# wifi link/AP, data counters, radio-buffer tail — and records the
-# recovery duration. Snapshots go to config/drop_log/ (module config dir,
-# survives reboot; the logger itself survives reboot because the server
-# starts at boot and re-reads the persisted setting).
-DROP_LOG_DIR = MODDIR / "config" / "drop_log"
-DROP_POLL_INTERVAL = 10
+# daemon watchdog stamps every radio drop (voice or data registration
+# out of service, radio powered off, emergency-only, or an IWLAN/VoWiFi
+# transport handover — A-085/A-108/A-176) with correlation context —
+# registration, call state, wifi link/AP, data counters, and a redacted
+# radio-buffer summary (A-219) — and records the recovery duration.
+# Snapshots live in PERSIST_DIR/drop_log (survives module updates and
+# reboot; the logger itself survives reboot because the server starts at
+# boot and re-reads the persisted setting).
+DROP_LOG_DIR = PERSIST_DIR / "drop_log"
+DROP_POLL_INTERVAL = 5  # seconds between registration polls (A-112: 10s
+                        # samples miss sub-interval blips entirely; 5s
+                        # shrinks the blind window — true sub-sample
+                        # outages remain invisible to any poller)
 DROP_SNAP_GAP = 60  # min seconds between snapshots of one episode
+DROP_RECOVERY_CONFIRM = 2  # consecutive non-drop polls before RECOVERED
+                           # is stamped (A-199: a single IN_SERVICE blip
+                           # between drops must not close the episode)
+DROP_LOG_MAX_FILES = 40  # retention cap for episode files (A-043/A-207)
+_ACTIVE_EPISODE_FILE = ".active_episode"  # A-188: persisted episode state
+_EPISODE_COUNTER = itertools.count()      # per-process unique episode id
+
+# A-196: bounded auto self-heal. After AUTO_RECOVER_GRACE of sustained
+# drop, invoke the modem reset once per episode, rate-limited to
+# AUTO_RECOVER_MAX_PER_HOUR (monotonic window). The reset itself must
+# observe the radio return to service before reporting success (A-197).
+AUTO_RECOVER_GRACE = 120
+AUTO_RECOVER_MAX_PER_HOUR = 2
+AUTO_RECOVER_WINDOW = 3600
+_AUTO_RECOVER_TIMES = []
+_AUTO_RECOVER_LOCK = threading.Lock()
+
+# Registration states that mean "the radio is down" (A-085: data-state
+# counts too; A-108: SERVICE_EMERGENCY is a real outage).
+_DROP_STATES = ("POWER_OFF", "OUT_OF_SERVICE", "EMERGENCY_ONLY",
+                "SERVICE_EMERGENCY")
 
 
 class _DropWatch(object):
@@ -324,8 +373,12 @@ class _DropWatch(object):
 
     def __init__(self):
         self.in_drop = False
-        self.drop_start = None
+        self.drop_start = None          # time.monotonic() at detection (A-154)
+        self.last_snap = None           # time.monotonic() of last snapshot write
         self.episode_file = None
+        self.episode_id = None          # per-process unique episode id (A-128)
+        self.recovery_polls = 0         # consecutive non-drop polls (A-199)
+        self.auto_recover_attempted = False  # once per episode (A-196)
         self.lock = threading.Lock()
 
 
@@ -387,110 +440,299 @@ def _drop_state():
 
 def _drop_snapshot_text(reg):
     """Correlation context for a drop: registration, call state, wifi,
-    counters, and the last PHONE0 radio-buffer lines."""
+    counters, and a REDACTED radio-buffer summary.
+
+    The PHONE0 radio-buffer lines carry raw RIL traffic (IMSI, dialed
+    numbers, cell IDs), so the snapshot must not persist them (A-185 /
+    A-219): only the line count is recorded, never the payload."""
     lines = ["registration: {}".format(json.dumps(reg))]
     call = _call_state()
     if call is not None:
         lines.append("call_state: {}".format(call))
     lines.append("wifi: {}".format(_wifi_status()))
     lines.append("counters: {}".format(_net_counters()))
-    # A-185: the radio buffer is root/radio-group protected precisely
-    # because it carries IMSI and phone numbers. Never persist raw RIL
-    # lines into world-reachable files; record an explicit marker instead.
-    lines.append("radio tail: omitted (privacy — raw RIL lines not "
-                 "persisted)")
+    try:
+        tail = _run_cmd(["/system/bin/logcat", "-b", "radio", "-d",
+                         "-v", "threadtime", "-t", "300"], timeout=5)
+        ph0 = [ln for ln in tail.splitlines() if "PHONE0" in ln][-40:]
+        if ph0:
+            lines.append("radio tail: {} PHONE0 line(s) omitted "
+                         "(privacy redacted)".format(len(ph0)))
+        else:
+            lines.append("radio tail: (no PHONE0 lines)")
+    except Exception as e:
+        lines.append("radio tail unavailable: {}".format(e))
     return "\n".join(lines) + "\n"
+
+
+def _reg_drop_state(reg):
+    """True when the registration indicates a drop: voice or data
+    registration in a failure state (A-085 data-only outages, A-108
+    SERVICE_EMERGENCY), or the network transport on IWLAN/VoWiFi — the
+    field-observed precursor to the collapse (A-176), visible either as
+    network_type == "IWLAN" or as a WLAN/IWLAN entry inside
+    mNetworkRegistrationInfos (A-208)."""
+    svc = (reg or {}).get("service_state")
+    data = (reg or {}).get("data_state")
+    net = (reg or {}).get("network_type")
+    if svc in _DROP_STATES or data in _DROP_STATES:
+        return True
+    if net == "IWLAN":
+        return True
+    transports = (reg or {}).get("transports") or []
+    if any(t.get("tech") == "IWLAN" for t in transports):
+        return True
+    return False
+
+
+def _new_episode_path(episode_id):
+    """Unique per-episode path (A-128/A-214/A-215): the wall-clock stamp
+    is for readability only; pid + per-process counter guarantee no
+    same-second or cross-loop collision."""
+    return DROP_LOG_DIR / "drop_{}_{}_{}.txt".format(
+        time.strftime("%Y%m%d_%H%M%S"), os.getpid(), episode_id)
+
+
+def _write_detection(w, reg):
+    with open(w.episode_file, 'w') as f:
+        f.write("=== DROP DETECTED {} (episode {}) ===\n".format(
+            time.strftime("%Y-%m-%d %H:%M:%S"), w.episode_id))
+        f.write(_drop_snapshot_text(reg))
+
+
+def _append_refresh(w, reg):
+    """Long-episode refresh: append to the SAME episode file so one
+    outage stays one file and the recovery stamp lands on the original
+    (A-059/A-187)."""
+    with open(w.episode_file, 'a') as f:
+        f.write("--- snapshot refresh {} (episode {}) ---\n".format(
+            time.strftime("%Y-%m-%d %H:%M:%S"), w.episode_id))
+        f.write(_drop_snapshot_text(reg))
+
+
+def _write_recovery(w, now):
+    """Stamp RECOVERED on the episode file, then clear episode state.
+
+    The marker is written BEFORE the state is cleared (A-115): if the
+    append fails, the exception propagates, the episode stays open, and
+    the next poll retries — the recovery boundary is never silently
+    lost. Duration comes from monotonic time (A-154)."""
+    path = w.episode_file
+    if path is None:
+        return
+    duration = int(now - w.drop_start) if w.drop_start else 0
+    with open(path, 'a') as f:
+        f.write("=== RECOVERED {} (duration {}s) ===\n".format(
+            time.strftime("%Y-%m-%d %H:%M:%S"), duration))
+    print("Drop episode recorded: {} ({}s)".format(path, duration))
+    w.in_drop = False
+    w.drop_start = None
+    w.last_snap = None
+    w.episode_file = None
+    w.episode_id = None
+    w.recovery_polls = 0
+    _clear_active_marker()
+
+
+def _close_episode_on_disable(w):
+    """A-093: when drop logging is turned off mid-episode, close the
+    open episode with a duration-bearing marker instead of silently
+    discarding the record. Best-effort — never raises."""
+    with w.lock:
+        if not w.in_drop:
+            return
+        path = w.episode_file
+        duration = int(time.monotonic() - w.drop_start) if w.drop_start else 0
+        try:
+            if path:
+                with open(path, 'a') as f:
+                    f.write("=== EPISODE CLOSED {} (duration {}s, drop "
+                            "logging disabled) ===\n".format(
+                                time.strftime("%Y-%m-%d %H:%M:%S"),
+                                duration))
+        except Exception as e:
+            print("Drop episode close-on-disable failed: {}".format(e))
+        w.in_drop = False
+        w.drop_start = None
+        w.last_snap = None
+        w.episode_file = None
+        w.episode_id = None
+        w.recovery_polls = 0
+        _clear_active_marker()
+
+
+def _write_active_marker(w):
+    """A-188: persist the open episode (file + wall start) so a server
+    restart can reconcile it instead of orphaning the snapshot."""
+    try:
+        if w.episode_file is None:
+            return
+        data = {"file": w.episode_file.name,
+                "start": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "pid": os.getpid()}
+        _atomic_write_json(DROP_LOG_DIR / _ACTIVE_EPISODE_FILE, data)
+    except Exception:
+        pass
+
+
+def _clear_active_marker():
+    try:
+        p = DROP_LOG_DIR / _ACTIVE_EPISODE_FILE
+        if p.exists():
+            p.unlink()
+    except OSError:
+        pass
+
+
+def _reconcile_open_episode():
+    """A-188: a previous server process may have died mid-episode (API
+    restart, boot). If an active-episode marker survives, close that
+    orphan file with an explicit EPISODE INTERRUPTED line so it is not
+    mistaken for an un-recovered drop, then clear the marker. Never
+    raises."""
+    try:
+        p = DROP_LOG_DIR / _ACTIVE_EPISODE_FILE
+        if not p.exists():
+            return
+        data = json.loads(p.read_text())
+        name = data.get("file")
+        if name:
+            path = DROP_LOG_DIR / name
+            if path.exists():
+                with open(path, 'a') as f:
+                    f.write("=== EPISODE INTERRUPTED (server restart) "
+                            "{} ===\n".format(
+                                time.strftime("%Y-%m-%d %H:%M:%S")))
+        p.unlink()
+    except Exception as e:
+        print("Drop episode reconcile failed: {}".format(e))
+
+
+def _rotate_drop_log():
+    """A-043/A-207: keep only the newest DROP_LOG_MAX_FILES episode
+    files. The API listing cap was display-only; the files themselves
+    accumulated forever. Called after a new episode file is written."""
+    try:
+        if not os.path.isdir(DROP_LOG_DIR):
+            return
+        names = sorted(n for n in os.listdir(DROP_LOG_DIR)
+                       if n.startswith("drop_") and n.endswith(".txt"))
+        for old in names[:-DROP_LOG_MAX_FILES]:
+            try:
+                os.unlink(os.path.join(DROP_LOG_DIR, old))
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _maybe_auto_recover(w, now):
+    """A-196: bounded auto self-heal. Once an episode has lasted past
+    AUTO_RECOVER_GRACE, invoke the modem reset once per episode,
+    rate-limited to AUTO_RECOVER_MAX_PER_HOUR. The reset itself waits
+    for the radio to return to service (A-197) before reporting success,
+    and the episode only closes on an explicit recovery poll."""
+    if w.auto_recover_attempted or not w.in_drop or w.drop_start is None:
+        return
+    if now - w.drop_start < AUTO_RECOVER_GRACE:
+        return
+    with _AUTO_RECOVER_LOCK:
+        recent = [t for t in _AUTO_RECOVER_TIMES
+                  if now - t < AUTO_RECOVER_WINDOW]
+        if len(recent) >= AUTO_RECOVER_MAX_PER_HOUR:
+            return
+        _AUTO_RECOVER_TIMES[:] = recent
+        _AUTO_RECOVER_TIMES.append(now)
+    w.auto_recover_attempted = True
+    threading.Thread(target=_auto_recover_worker, daemon=True).start()
+
+
+def _auto_recover_worker():
+    try:
+        result = _modem_reset()
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        print("Auto modem recovery: {}".format("ok" if ok else result))
+    except Exception as e:
+        print("Auto modem recovery failed: {}".format(e))
+
+
+def _drop_log_poll(w=None):
+    """One watchdog poll iteration. Returns the seconds to sleep before
+    the next poll.
+
+    Separated from the daemon loop so tests can drive the watchdog
+    deterministically. Never raises — failures fall through to the
+    loop's guard."""
+    w = w if w is not None else _DROP_WATCH
+    if not SETTINGS.get("drop_log"):
+        # A-093: disabling mid-episode must not discard the record.
+        _close_episode_on_disable(w)
+        return 5
+    reg = _drop_state()
+    if reg is None or reg.get("service_state") is None:
+        # Telemetry failure / unparseable dump: the radio state is
+        # UNKNOWN, not recovered (A-053/A-181/A-144). Skip the poll
+        # without touching episode state.
+        return DROP_POLL_INTERVAL
+    now = time.monotonic()
+    if _reg_drop_state(reg):
+        with w.lock:
+            w.recovery_polls = 0
+            if not w.in_drop:
+                w.in_drop = True
+                w.drop_start = now
+                w.last_snap = now
+                w.auto_recover_attempted = False
+                os.makedirs(DROP_LOG_DIR, exist_ok=True)
+                w.episode_id = next(_EPISODE_COUNTER)
+                w.episode_file = _new_episode_path(w.episode_id)
+                _write_detection(w, reg)
+                _write_active_marker(w)
+                _rotate_drop_log()
+            elif now - w.last_snap >= DROP_SNAP_GAP:
+                # Long episode: refresh the snapshot in the SAME file so
+                # the tail stays relevant and one outage stays one file
+                # (A-059/A-187).
+                _append_refresh(w, reg)
+                w.last_snap = now
+        _maybe_auto_recover(w, now)
+        return DROP_POLL_INTERVAL
+    # Explicit non-drop state: recovery, with hysteresis (A-199) — a
+    # single IN_SERVICE blip between drops must not close the episode.
+    with w.lock:
+        if w.in_drop:
+            w.recovery_polls += 1
+            if w.recovery_polls >= DROP_RECOVERY_CONFIRM:
+                _write_recovery(w, now)
+        else:
+            w.recovery_polls = 0
+    return DROP_POLL_INTERVAL
 
 
 def _drop_log_loop():
     """Watchdog (daemon): while drop_log is enabled, watch the radio
-    registration. On a drop, write a context snapshot to config/drop_log/
-    and append the recovery duration to the same file. Live-toggles with
-    the SETTINGS flag (no restart needed). Never raises."""
-    w = _DROP_WATCH
+    registration. On a drop, write a context snapshot to the drop_log
+    dir and append the recovery duration to the same episode file.
+    Live-toggles with the SETTINGS flag (no restart needed). Never
+    raises."""
+    _reconcile_open_episode()
     while True:
         try:
-            if not SETTINGS.get("drop_log"):
-                with w.lock:
-                    w.in_drop = False
-                    w.drop_start = None
-                    w.episode_file = None
-                time.sleep(5)
-                continue
-            reg = _drop_state()
-            state = (reg or {}).get("service_state")
-            now = time.time()
-            if state in ("POWER_OFF", "OUT_OF_SERVICE", "EMERGENCY_ONLY"):
-                with w.lock:
-                    if not w.in_drop:
-                        w.in_drop = True
-                        w.drop_start = now
-                        # A-180/A-185: snapshots live in a root-private dir,
-                        # are written 0o600 with O_NOFOLLOW (a planted
-                        # symlink cannot redirect the write), and never
-                        # clobber an existing file (O_EXCL).
-                        _ensure_private_dir(DROP_LOG_DIR)
-                        w.episode_file = DROP_LOG_DIR / "drop_{}.txt".format(
-                            time.strftime("%Y%m%d_%H%M%S"))
-                    elif now - w.drop_start >= DROP_SNAP_GAP:
-                        # Long episode: refresh the snapshot so the tail
-                        # stays relevant.
-                        w.episode_file = DROP_LOG_DIR / "drop_{}.txt".format(
-                            time.strftime("%Y%m%d_%H%M%S"))
-                    if w.episode_file and not w.episode_file.exists():
-                        fd = os.open(str(w.episode_file),
-                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL |
-                                     getattr(os, "O_NOFOLLOW", 0), 0o600)
-                        try:
-                            with os.fdopen(fd, 'w') as f:
-                                f.write("=== DROP DETECTED {} ===\n".format(
-                                    time.strftime("%Y-%m-%d %H:%M:%S")))
-                                f.write(_drop_snapshot_text(reg))
-                        except BaseException:
-                            try:
-                                os.close(fd)
-                            except OSError:
-                                pass
-                            raise
-                time.sleep(DROP_POLL_INTERVAL)
-            else:
-                with w.lock:
-                    if w.in_drop:
-                        duration = (now - w.drop_start) if w.drop_start else 0
-                        path = w.episode_file
-                        w.in_drop = False
-                        w.drop_start = None
-                        w.episode_file = None
-                        if path:
-                            fd = os.open(str(path),
-                                         os.O_WRONLY | os.O_APPEND |
-                                         os.O_CREAT |
-                                         getattr(os, "O_NOFOLLOW", 0), 0o600)
-                            try:
-                                with os.fdopen(fd, 'a') as f:
-                                    f.write("=== RECOVERED {} (duration {}s) ===\n".format(
-                                        time.strftime("%Y-%m-%d %H:%M:%S"),
-                                        int(duration)))
-                            except BaseException:
-                                try:
-                                    os.close(fd)
-                                except OSError:
-                                    pass
-                                raise
-                            print("Drop episode recorded: {} ({}s)".format(
-                                path, int(duration)))
-                time.sleep(DROP_POLL_INTERVAL)
+            time.sleep(_drop_log_poll())
         except Exception as e:
             print("Drop logger failed: {}".format(e))
             time.sleep(DROP_POLL_INTERVAL)
 
 
 def _drop_log_files():
-    """Snapshot filenames in config/drop_log, newest first."""
+    """Episode filenames in the drop_log dir, newest first (UI cap 20;
+    the on-disk cap is _rotate_drop_log, A-043/A-207)."""
     try:
         if not os.path.isdir(DROP_LOG_DIR):
             return []
-        return sorted(os.listdir(DROP_LOG_DIR), reverse=True)[:20]
+        names = [n for n in os.listdir(DROP_LOG_DIR)
+                 if n.startswith("drop_") and n.endswith(".txt")]
+        return sorted(names, reverse=True)[:20]
     except Exception:
         return []
 
@@ -918,7 +1160,60 @@ def _parse_registration(text):
                 "0": "DISCONNECTED", "1": "CONNECTING",
                 "2": "CONNECTED", "3": "SUSPENDED",
             }.get(m.group(1))
+
+    # A-144: a snapshot that parsed nothing is NOT valid telemetry — the
+    # modem state is unavailable, so report a failure instead of a
+    # deceptively all-null success (read_registration errors, and the
+    # drop watchdog treats None as "unknown", never as "recovered").
+    if all(reg[k] is None for k in (
+            "service_state", "data_state", "network_type",
+            "operator", "roaming")):
+        return None
+
+    # A-208: capture the IWLAN/WLAN transport context. The real registry
+    # carries mNetworkRegistrationInfos entries (nested braces) inside
+    # mServiceState; the WLAN/IWLAN entry that precedes every observed
+    # drop must survive into the structured snapshot even when
+    # getRil*RadioTechnology reads 0(Unknown) at the collapse.
+    transports = _parse_registration_infos(svc)
+    if transports is not None:
+        reg["transports"] = transports
+        if reg["network_type"] in (None, "Unknown") and any(
+                t.get("tech") == "IWLAN" for t in transports):
+            reg["network_type"] = "IWLAN"
     return reg
+
+
+def _parse_registration_infos(svc):
+    """Extract mNetworkRegistrationInfos transport entries (A-208).
+
+    The infos value is a bracket-nested list whose entries themselves
+    contain nested braces and empty [] fields, so it is scanned
+    brace/bracket-aware to the matching close bracket. Returns a list of
+    {"transport": ..., "tech": ...} dicts, or None when the field is
+    absent from the service-state block.
+    """
+    m = re.search(r'mNetworkRegistrationInfos=\[', svc)
+    if not m:
+        return None
+    depth = 1
+    i = m.end()
+    j = i
+    while j < len(svc) and depth:
+        if svc[j] == '[':
+            depth += 1
+        elif svc[j] == ']':
+            depth -= 1
+        j += 1
+    block = svc[i:j - 1] if depth == 0 else svc[i:]
+    transports = [mm.group(1) for mm in re.finditer(
+        r'transportType=(\w+)', block)]
+    techs = [mm.group(1) for mm in re.finditer(
+        r'accessNetworkTechnology=(\w+)', block)]
+    if not transports and not techs:
+        return []
+    return [{"transport": t, "tech": c}
+            for t, c in zip(transports, techs)]
 
 
 def _radio_reg_state():
@@ -938,6 +1233,82 @@ def _wait_for_radio_state(expected, attempts=4, interval=1):
             return True
         time.sleep(interval)
     return False
+
+
+def _wait_for_radio_recovery(attempts=30, interval=2):
+    """A-197: after a reset re-enables the radio, wait (bounded) for it
+    to return to IN_SERVICE — re-camping takes 30s+ after a power cycle,
+    and a reset that powered the radio off and on has NOT recovered until
+    the radio camps again. Returns True when IN_SERVICE is observed,
+    False otherwise (callers report the observed post-reset state)."""
+    for _ in range(attempts):
+        if _radio_reg_state() == "IN_SERVICE":
+            return True
+        time.sleep(interval)
+    return _radio_reg_state() == "IN_SERVICE"
+
+
+def _modem_reset():
+    """Soft modem reset (module-level so the drop watchdog's auto-
+    recovery A-196 can invoke the same path as the API endpoint).
+
+    Preferred: `cmd phone radio power` off/on (3s apart), used only
+    when `cmd phone help` actually lists the subcommand. Fallback:
+    airplane-mode toggle (`cmd connectivity airplane-mode` enable, 3s,
+    disable). Success requires the radio to reach POWER_OFF and then to
+    RETURN to IN_SERVICE within a bounded wait (A-197); otherwise an
+    honest ok:false with the observed post-reset state is returned —
+    a reset that never recovered is not reported as success.
+    """
+    # Preferred mechanism: cmd phone radio power (only if listed in help)
+    if _cmd_available("phone", "radio power"):
+        try:
+            _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "off"], timeout=10)
+            time.sleep(3)
+            if _wait_for_radio_state("POWER_OFF"):
+                _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "on"], timeout=10)
+                if _wait_for_radio_recovery():
+                    return {"ok": True}
+                state = _radio_reg_state()
+                return {"ok": False,
+                        "error": "radio did not return to service (state: {})".format(
+                            state or "unknown")}
+            _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "on"], timeout=10)
+            return {"ok": False, "error": "radio power off did not take effect"}
+        except Exception as e:
+            print(f"Modem reset via radio power failed: {e}")
+
+    # Fallback: airplane-mode toggle. Airplane mode is ALWAYS turned
+    # back off with verification — a reset that leaves airplane mode on
+    # would silently kill all connectivity (v2.4 hardening). The
+    # enable/disable commands are separate, so even a mid-toggle
+    # exception still runs the cleanup before reporting.
+    if _cmd_available("connectivity", "airplane-mode"):
+        try:
+            _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "enable"], timeout=10)
+            time.sleep(3)
+            powered_off = _wait_for_radio_state("POWER_OFF")
+            # Guaranteed cleanup: disable + verify, retried.
+            if not _disable_airplane():
+                return {"ok": False,
+                        "error": "airplane mode left on after modem reset (disable failed)"}
+            if powered_off:
+                if _wait_for_radio_recovery():
+                    return {"ok": True}
+                state = _radio_reg_state()
+                return {"ok": False,
+                        "error": "radio did not return to service (state: {})".format(
+                            state or "unknown")}
+            return {"ok": False, "error": "airplane-mode toggle did not power off the radio"}
+        except Exception as e:
+            # Mid-toggle failure: try to leave the radio on before
+            # reporting, so a stuck airplane mode is never silent.
+            if _airplane_on() and not _disable_airplane():
+                return {"ok": False,
+                        "error": f"airplane mode left on after modem reset: {e}"}
+            return {"ok": False, "error": f"modem reset failed: {e}"}
+
+    return {"ok": False, "error": "modem reset unavailable on this build"}
 
 
 def _query_md_pid(device):
@@ -1016,6 +1387,12 @@ def _band_camping_loop():
             earfcn, band = _parse_band_camping(
                 _run_dumpsys("telephony.registry"))
             if earfcn is not None:
+                # A-154: keep CSV timestamps strictly increasing even if
+                # the wall clock steps backwards (NTP/carrier sync) — the
+                # last-N chart must never show time going backwards.
+                raw = int(time.time() * 1000)
+                ms = max(raw, _BAND_CAMPING_LAST_MS[0] + 1)
+                _BAND_CAMPING_LAST_MS[0] = ms
                 line = "{},{},{}\n".format(
                     int(time.time() * 1000), earfcn,
                     band if band is not None else "")
@@ -1793,53 +2170,9 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "error": str(e)}
 
     def modem_reset(self):
-        """Soft modem reset.
-
-        Preferred: `cmd phone radio power` off/on (3s apart), used only
-        when `cmd phone help` actually lists the subcommand. Fallback:
-        airplane-mode toggle (`cmd connectivity airplane-mode` enable, 3s,
-        disable). The radio is verified to reach POWER_OFF before success
-        is reported; otherwise an honest ok:false is returned.
-        """
-        # Preferred mechanism: cmd phone radio power (only if listed in help)
-        if _cmd_available("phone", "radio power"):
-            try:
-                _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "off"], timeout=10)
-                time.sleep(3)
-                if _wait_for_radio_state("POWER_OFF"):
-                    _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "on"], timeout=10)
-                    return {"ok": True}
-                _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "on"], timeout=10)
-                return {"ok": False, "error": "radio power off did not take effect"}
-            except Exception as e:
-                print(f"Modem reset via radio power failed: {e}")
-
-        # Fallback: airplane-mode toggle. Airplane mode is ALWAYS turned
-        # back off with verification — a reset that leaves airplane mode on
-        # would silently kill all connectivity (v2.4 hardening). The
-        # enable/disable commands are separate, so even a mid-toggle
-        # exception still runs the cleanup before reporting.
-        if _cmd_available("connectivity", "airplane-mode"):
-            try:
-                _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "enable"], timeout=10)
-                time.sleep(3)
-                powered_off = _wait_for_radio_state("POWER_OFF")
-                # Guaranteed cleanup: disable + verify, retried.
-                if not _disable_airplane():
-                    return {"ok": False,
-                            "error": "airplane mode left on after modem reset (disable failed)"}
-                if powered_off:
-                    return {"ok": True}
-                return {"ok": False, "error": "airplane-mode toggle did not power off the radio"}
-            except Exception as e:
-                # Mid-toggle failure: try to leave the radio on before
-                # reporting, so a stuck airplane mode is never silent.
-                if _airplane_on() and not _disable_airplane():
-                    return {"ok": False,
-                            "error": f"airplane mode left on after modem reset: {e}"}
-                return {"ok": False, "error": f"modem reset failed: {e}"}
-
-        return {"ok": False, "error": "modem reset unavailable on this build"}
+        """Soft modem reset — delegates to the module-level _modem_reset
+        so the drop watchdog's auto-recovery (A-196) uses the same path."""
+        return _modem_reset()
 
     def modem_health(self):
         """Get modem health status. Never raises - always returns a
