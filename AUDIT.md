@@ -2351,7 +2351,7 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
-## Continuation audit (2026-08-10) — findings A-150..A-203
+## Continuation audit (2026-08-10) — findings A-150..A-205
 
 Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
 `audit/2026-08-deep`). The tree is byte-identical to the audited
@@ -3097,6 +3097,18 @@ Evidence: `web/index.html:1263-1265` (guarded loadBands) vs `:1301-1306` (unguar
 `apiFetch` surfaces 401s as a re-auth prompt (`web/index.html:1837-1841` — `if (r.status === 401) showReAuth(); return r;`) — but every caller then treats the 401 as a generic failure: `if (!r.ok) throw new Error('HTTP ' + r.status)` → the catch funnels it into `serverDown(e)` → `showBanner()` + `logDrop('Server unreachable — HTTP 401')` (`:1343-1349`). With a stale stored token on the LAN page (the token was regenerated on the phone), every poll 401s: the page reports the server DOWN and writes a fabricated "DROP — Server unreachable — HTTP 401" history entry — a third source of false drops (A-190: restart/disconnect, A-193: user modem reset, A-203: auth failure) — while the server is up and merely rejecting the credentials. The re-auth mechanism is undermined: the user sees the server-down banner + a DROP alongside the token prompt. `saveLanToken` recovers the banner (`:1908-1912`) but the false DROP entry and the misleading banner remain logged.
 
 Evidence: `web/index.html:1837-1841` (apiFetch 401 → showReAuth), `:1264-1270` (loadBands catch → serverDown), `:1375-1382` (pollSignal catch → serverDown), `:1343-1349` (serverDown → logDrop), A-190/A-193 (prior false-drop sources). Affected: LAN pages with a missing/stale token — every 401 → false DROP + banner. Remediation: distinguish 401 from network failure (check `r.status === 401` in the callers before throwing), or make `serverDown` accept a "not-auth" marker. Confirmed (code trace).
+
+### A-204 — The UI ships three times with no sync mechanism; the root copy is already stale, and the zip ships it twice (P3)
+
+The UI exists in three committed copies: root `index.html` (stale — A-157), `web/index.html` (served by the python server), and `webroot/index.html` (the KernelSU Manager WebUI). The zip ships TWO of them (`web/` and `webroot/` — verified from `bandctl-v2.6.zip`), and the repo a third. The web/webroot copies are byte-identical today, but the design has no sync step: a UI change must be applied to multiple committed copies by hand, and the root copy's staleness (A-157) is that failure mode already manifest. A future web/index.html edit that forgets webroot/ silently ships the Manager a different UI than the server page — and the module's own README ("webroot/ (KernelSU Manager WebUI)") describes them as distinct things, hiding the duplication. The drift risk is real and has already occurred once (the root copy).
+
+Evidence: `bandctl-v2.6.zip` entries (`web/index.html` + `webroot/index.html`), `git ls-files` (root `index.html` + `web/index.html` + `webroot/index.html`), `diff web webroot` (identical except `server.py`), A-157 (root copy stale). Affected: any future UI change; the Manager and the server page diverge silently. Remediation: generate `webroot/index.html` from `web/index.html` in the build (or make one a symlink), and delete the root copy. Confirmed (tree + zip listing).
+
+### A-205 — The project's own Makefile `push` target feeds the A-198 root-exec fallback (P3)
+
+`qmi/Makefile`'s `push` target runs `adb push qmi_band /data/local/tmp/` + `adb shell chmod 755 /data/local/tmp/qmi_band` — dropping the freshly-built binary into exactly the path the server's `QMI_BIN` fallback execs as root when the module binary is missing (`web/server.py:225-227`). The A-198 fallback is not a hypothetical attacker surface: it is the project's own documented dev workflow (the README's `adb forward` testing + this Makefile target, and the module's own convention of pushing to `/data/local/tmp` because `/sdcard` push is broken post-reboot). The dev tooling legitimizes a world-adjacent root-exec target, and a stale/planted binary there (from any earlier build, another project, or an attacker with shell access) is silently exec'd by the root server — the very "tampered binary executes as root" scenario A-198 describes, made routine by the build system.
+
+Evidence: `qmi/Makefile` (push target), `web/server.py:225-227` (fallback), A-198 (root-exec boundary). Affected: any dev machine or device where the fallback path contains a binary. Remediation: push to a module-private path, or verify the binary hash before exec (A-198's remediation). Confirmed (Makefile + code).
 
 ## Not yet fixed
 
