@@ -1242,10 +1242,19 @@ var NR_BANDS = [
   {n:71,f:'600'},{n:77,f:'3500+'},{n:78,f:'3500'},{n:79,f:'4700'}
 ];
 
+/* Per-RAT display catalogs as fast-lookup sets (A-010/A-170): the UI can
+   only render/edit these bands, so any value outside them is filtered out
+   with a visible warning instead of being silently saved. */
+var LTE_CATALOG = new Set(LTE_BANDS.map(function (b) { return String(b.n); }));
+var NR_CATALOG = new Set(NR_BANDS.map(function (b) { return String(b.n); }));
+
 /* Unrestricted fallback while defaults load (or server unreachable) —
-   carrier-aware defaults come from /api/defaults */
-var DEFAULT_LTE = ['1','2','3','4','5','7','8','12','13','14','17','20','25','26','28','29','30','38','40','41','42','43','48','66','71'];
-var DEFAULT_NR = ['1','2','3','5','7','8','20','25','28','38','40','41','66','71','77','78','79'];
+   carrier-aware defaults come from /api/defaults. Bands 7 and 66 are
+   intentionally excluded (A-186): the documented SM8250 crash pair
+   (66<->7 handover) must not appear in any default path — they stay
+   reachable only as explicit user selections in the tile grid. */
+var DEFAULT_LTE = ['1','2','3','4','5','8','12','13','14','17','20','25','26','28','29','30','38','40','41','42','43','48','71'];
+var DEFAULT_NR = ['1','2','3','5','8','20','25','28','38','40','41','71','77','78','79'];
 
 /* ============ State ============ */
 var lteEnabled = new Set();
@@ -1256,6 +1265,7 @@ var defaultsNr = DEFAULT_NR;
 var carrierInfo = null; // {carrier:'rogers'|'other', operator?, lte?, nr?} from /api/defaults
 var userTouched = false; // true once the user changes the selection; guards refreshes from clobbering it
 var bootstrapped = false; // true once an authoritative config (modem read or carrier defaults) is in hand
+var lastRev = null;      // A-097: config revision from the last read/write (CAS token)
 var serverDownReported = false;
 var radioOutage = false;  // A-102: last registration reported an explicit service-loss state
 var consecutivePollFailures = 0; // A-025: single-endpoint hiccups must not stop every monitor
@@ -1342,15 +1352,70 @@ function toggleBand(n, type) {
   renderBands();
   updateSummary();
 }
+// Parse a raw band value the way the server's _normalize_bands does:
+// plain ints 1..79 (numeric strings accepted). Returns the int, or null
+// for booleans, floats, non-numeric strings, and out-of-range values.
+function parseBand(v) {
+  if (typeof v === 'boolean') return null;
+  var n;
+  if (typeof v === 'number') {
+    n = v;
+  } else if (typeof v === 'string') {
+    var s = v.trim();
+    if (!/^\d+$/.test(s)) return null;
+    n = parseInt(s, 10);
+  } else {
+    return null;
+  }
+  if (typeof n !== 'number' || !isFinite(n) || Math.floor(n) !== n) return null;
+  if (n < 1 || n > 79) return null;
+  return n;
+}
+// Split a raw band list into {kept, dropped, invalid}: kept are catalog
+// bands (deduped, order preserved), dropped are valid 1-79 values the
+// catalog cannot display, invalid are malformed/out-of-range values.
+function splitBands(type, raw) {
+  var cat = type === 'lte' ? LTE_CATALOG : NR_CATALOG;
+  var kept = [], dropped = [], invalid = [], seen = {};
+  (Array.isArray(raw) ? raw : []).forEach(function (v) {
+    var n = parseBand(v);
+    if (n === null) { invalid.push(String(v)); return; }
+    var key = String(n);
+    if (seen[key]) return;              // dedupe, order preserved
+    seen[key] = true;
+    if (cat.has(key)) kept.push(key); else dropped.push(key);
+  });
+  return { kept: kept, dropped: dropped, invalid: invalid };
+}
+// Set the selection from raw lists, filtering to the display catalogs.
+// Returns {lte, nr} arrays of the filtered-out values so callers can
+// surface a visible warning (A-010/A-170) instead of saving bands the
+// user can neither see nor edit.
 function setBands(lte, nr) {
-  lteEnabled = new Set((lte || []).map(String));
-  nrEnabled = new Set((nr || []).map(String));
+  var l = splitBands('lte', lte);
+  var n = splitBands('nr', nr);
+  lteEnabled = new Set(l.kept);
+  nrEnabled = new Set(n.kept);
+  return {
+    lte: l.dropped.concat(l.invalid),
+    nr: n.dropped.concat(n.invalid)
+  };
 }
 function applyConfig(lte, nr, src) {
-  setBands(lte, nr);
+  var dropped = setBands(lte, nr);
   source = src || source;
   renderBands();
   updateSummary();
+  return dropped;
+}
+// Honest source label for the status line (A-104): only qmi/diag are a
+// live modem read; config_file/default are persisted intent or carrier
+// defaults and must not be advertised as modem state.
+function sourceLabel(src) {
+  if (src === 'qmi' || src === 'diag') return 'modem (' + src + ')';
+  if (src === 'config_file') return 'saved config (config_file)';
+  if (src === 'default') return 'carrier defaults (default)';
+  return src || 'unknown';
 }
 function applyDefaults() {
   applyConfig(defaultsLte, defaultsNr, 'default');
@@ -1372,6 +1437,19 @@ async function loadBands() {
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    if (!d || d.ok === false) {
+      // A-100: an app-level read failure (HTTP-200 JSON error) is NOT a
+      // successful modem load — never derive empty sets from it.
+      var e = new Error((d && d.error) || 'read failed');
+      e.app = true;
+      throw e;
+    }
+    if (!Array.isArray(d.lte) || !Array.isArray(d.nr)) {
+      var e2 = new Error('read response is missing band lists');
+      e2.app = true;
+      throw e2;
+    }
+    var dropped = { lte: [], nr: [] };
     bootstrapped = true; // mark authoritative BEFORE rendering so the first
     // paint after a successful read already reflects the loaded state
     if (userTouched) {
@@ -1380,7 +1458,8 @@ async function loadBands() {
       source = d.source || source;
       updateSummary();
     } else {
-      applyConfig(d.lte, d.nr, d.source);
+      dropped = applyConfig(d.lte, d.nr, d.source);
+      if (d.rev != null) lastRev = d.rev;   // A-097: CAS token for the next save
     }
     if (serverDownReported) {
       serverDownReported = false;
@@ -1389,18 +1468,30 @@ async function loadBands() {
     consecutivePollFailures = 0;
     applyConnectionState();
     startPolling();
-    showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
+    var summary = ' — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands';
+    var skipped = dropped.lte.concat(dropped.nr);
+    if (skipped.length) {
+      // A-170: bands the catalog cannot display must never be saved
+      // invisibly — say which ones were skipped.
+      showStatus('Loaded from ' + sourceLabel(source) + ' — skipped bands not in the catalog: ' + skipped.join(', '), true);
+    } else {
+      showStatus('Loaded from ' + sourceLabel(source) + summary, false);
+    }
     return true;
   } catch (e) {
-    serverDown(e);
+    if (!e.app) serverDown(e);   // A-100: only transport failures trip the offline banner
     if (userTouched) {
       showStatus('Failed to load: ' + e.message + ' — your selection was kept', true);
-    } else if (bootstrapped) {
+    } else if (bootstrapped && lteEnabled.size > 0) {
       // A-117: a failed refresh must never discard the last known
       // configuration — keep the visible selection, explain the failure.
+      // (An empty grid has nothing to keep; A-100 fills it with defaults.)
       showStatus('Failed to load: ' + e.message + ' — keeping the last known configuration', true);
     } else {
       showStatus('Failed to load: ' + e.message, true);
+      // Fill the grid only when nothing is displayed yet — a read failure
+      // must never erase a visible selection (A-100).
+      if (lteEnabled.size === 0) applyDefaults();
     }
     return false;
   } finally {
@@ -1421,11 +1512,13 @@ async function saveBands() {
       snapshot.lte.some(function (b) { return !lteEnabled.has(String(b)); }) ||
       snapshot.nr.some(function (b) { return !nrEnabled.has(String(b)); });
   }
+  var data = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
+  if (lastRev != null) data.rev = lastRev;   // A-097: CAS token from the last read/write
   try {
     var r = await apiFetch(API_WRITE, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(snapshot)
+      body: JSON.stringify(data)
     });
     if (r.status === 401) {
       // A-203: auth failure — server is up, credentials are stale.
@@ -1447,20 +1540,41 @@ async function saveBands() {
         // the modem; clear the dirty guard so later refreshes show the
         // modem's actual state instead of a stale in-memory copy.
         userTouched = false;
-        // Confirm applied state by polling /api/read once — safe now that
-        // the in-memory selection still equals what was submitted.
+        if (d.rev != null) lastRev = d.rev;
+        showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
+        // Confirm applied state by polling /api/read once — but only ever
+        // refine the display with a verified payload that still contains the
+        // just-saved bands (A-036): an HTTP-200 error body or a lagging modem
+        // read-back must not clobber the selection the user just saved.
         try {
           var r2 = await apiFetch(API_READ);
           if (r2.status === 401) { /* re-auth surfaced by apiFetch */ }
           else if (r2.ok) {
             var d2 = await r2.json();
-            applyConfig(d2.lte, d2.nr, d2.source);
+            if (d2 && d2.ok !== false && Array.isArray(d2.lte) && Array.isArray(d2.nr)) {
+              if (d2.rev != null) lastRev = d2.rev;
+              var d2lte = d2.lte.map(String);
+              var d2nr = d2.nr.map(String);
+              var lteSeen = data.lte.every(function (b) { return d2lte.indexOf(String(b)) >= 0; });
+              var nrSeen = data.nr.every(function (b) { return d2nr.indexOf(String(b)) >= 0; });
+              if (lteSeen && nrSeen) applyConfig(d2.lte, d2.nr, d2.source);
+            }
           }
         } catch (e2) { /* confirmation read is best-effort */ }
-        showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
       }
     } else {
-      showStatus('Error: ' + (d.error || 'unknown'), true);
+      // A-097/A-036: never present a failed write as success, and never
+      // clobber the staged selection. Refresh the CAS token so the next
+      // save can retry cleanly (still conflict-protected).
+      showStatus('Save failed: ' + (d.error || 'unknown') + ' — your selection was kept', true);
+      toast('Save failed: ' + (d.error || 'unknown'), true);
+      try {
+        var rv = await apiFetch(API_READ);
+        if (rv.ok) {
+          var dv = await rv.json();
+          if (dv && dv.ok && dv.rev != null) lastRev = dv.rev;
+        }
+      } catch (e3) { /* best-effort rev refresh */ }
     }
   } catch (e) {
     showStatus('Failed to save: ' + e.message, true);
@@ -1656,12 +1770,13 @@ function setChip(id, txt, tone) {
   if (id === 'chip-camped' && txt !== '—') el.classList.add('selected');
 }
 var SVC_BAD = { POWER_OFF: 1, OUT_OF_SERVICE: 1, EMERGENCY_ONLY: 1, SERVICE_EMERGENCY: 1 };
+var DATA_GOOD = { IN_SERVICE: 1, CONNECTED: 1 }; // A-087: legacy mDataConnectionState=2 maps to CONNECTED
 function updateChips(d) {
   var svc = d.service_state || '—';
   // Only explicit service-loss states are 'bad'; unknown/'—' stays neutral, never red.
   setChip('chip-svc', svc, svc === 'IN_SERVICE' ? 'good' : (SVC_BAD[svc] ? 'bad' : null));
   var data = d.data_state || '—';
-  setChip('chip-data', data, data === 'IN_SERVICE' ? 'good' : (SVC_BAD[data] ? 'bad' : null));
+  setChip('chip-data', data, (DATA_GOOD[data] ? 'good' : (SVC_BAD[data] ? 'bad' : null)));
   setChip('chip-net', d.network_type || '—', d.network_type ? 'accent' : null);
   setChip('chip-op', d.operator || '—');
   setChip('chip-roam', d.roaming == null ? '—' : (d.roaming ? 'Roaming' : 'Home'), d.roaming ? 'amber' : null);
@@ -2055,7 +2170,7 @@ function loadPreset(i) {
     toast('Preset "' + String(p.name == null ? '?' : p.name) + '" is corrupted — delete and recreate it', true);
     return;
   }
-  setBands(p.lte.map(String), p.nr.map(String));
+  var dropped = setBands(p.lte, p.nr);
   userTouched = true;
   renderBands();
   updateSummary();
@@ -2063,7 +2178,14 @@ function loadPreset(i) {
   // A-223: keep the tab bar in sync with location.hash so the previously
   // active tab's button is not left a dead tap.
   if (location.hash !== '#bands') location.hash = 'bands';
-  toast('Preset "' + p.name + '" loaded — press Save & Apply to push');
+  var skipped = dropped.lte.concat(dropped.nr);
+  if (skipped.length) {
+    // A-170: catalog-absent bands are skipped with a visible warning so
+    // the saved set is exactly the visible set.
+    toast('Preset loaded — skipped band(s) not in the catalog: ' + skipped.join(', ') + '. Press Save & Apply', true);
+  } else {
+    toast('Preset "' + p.name + '" loaded — press Save & Apply to push');
+  }
 }
 var pendingDeleteIndex = null;
 function requestDeletePreset(i) {
@@ -2109,35 +2231,37 @@ function exportConfig() {
     lte: Array.from(lteEnabled),
     nr: Array.from(nrEnabled)
   };
-  if (typeof window.ksu !== 'undefined') {
-    // Manager WebView drops blob downloads — have the server write the
-    // file on-device and toast the path instead.
-    apiFetch(API_EXPORT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    }).then(function (r) {
-      return r.json().then(function (d) { return { status: r.status, data: d }; });
-    }).then(function (res) {
-      if (res.data.ok) {
-        toast('Exported to ' + res.data.path);
+  // A-161: always default to the reliable on-device server export (which
+  // writes the file and returns its path) and verify d.ok — never claim
+  // success from a click that may have been dropped. The Manager WebView
+  // drops blob downloads, and the ksu bridge sniff is host/version
+  // dependent, so the server path is the only verifiable one.
+  apiFetch(API_EXPORT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function (r) {
+    return r.json().then(function (d) {
+      if (d && d.ok) {
+        toast('Exported to ' + d.path);
       } else {
-        toast('Export failed: ' + (res.data.error || 'HTTP ' + res.status), true);
+        toast('Export failed: ' + ((d && d.error) || 'HTTP ' + r.status), true);
       }
-    }).catch(function (e) {
-      toast('Export failed: ' + e.message, true);
-      serverDown(e);
     });
-    return;
-  }
-  var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  var a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'band-config.json';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
-  toast('Config exported (' + payload.lte.length + ' LTE, ' + payload.nr.length + ' NR)');
+  }).catch(function (e) {
+    // Server export unreachable — offer a local blob copy as a best
+    // effort, but say so: WebViews/download-blocking hosts drop it, so
+    // this is not a verified export.
+    serverDown(e);
+    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'band-config.json';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    toast('Server export unavailable — local download attempted; verify the file was saved', true);
+  });
 }
 
 function onImportFile(file) {
@@ -2151,9 +2275,17 @@ function onImportFile(file) {
     try {
       var d = JSON.parse(reader.result);
       if (!d || !Array.isArray(d.lte) || !Array.isArray(d.nr)) throw new Error('expected { lte: [...], nr: [...] }');
-      var lte = d.lte.map(String).filter(function (v) { return /^\d+$/.test(v); });
-      var nr = d.nr.map(String).filter(function (v) { return /^\d+$/.test(v); });
-      setBands(lte, nr);
+      var l = splitBands('lte', d.lte);
+      var n = splitBands('nr', d.nr);
+      var bad = l.invalid.concat(n.invalid);
+      if (bad.length) {
+        // A-010: malformed/out-of-range values are rejected, never
+        // silently filtered — the user must see exactly what the file
+        // contained.
+        throw new Error('invalid band value(s): ' + bad.join(', ') + ' — bands must be integers 1-79');
+      }
+      if (!l.kept.length) throw new Error('no usable LTE bands in the file (must be 1-79 and non-empty)');
+      setBands(l.kept, n.kept);
       // A-009: mark the selection touched so a concurrent/follow-up Refresh
       // cannot clobber the imported config before it is applied.
       userTouched = true;
@@ -2162,7 +2294,14 @@ function onImportFile(file) {
       switchTab('bands');
       // A-223: keep the tab bar in sync with location.hash.
       if (location.hash !== '#bands') location.hash = 'bands';
-      toast('Config imported — ' + lte.length + ' LTE, ' + nr.length + ' NR bands. Press Save & Apply to push');
+      var skipped = l.dropped.concat(n.dropped);
+      if (skipped.length) {
+        // A-170: catalog-absent bands are skipped with a visible warning
+        // so the saved set is exactly the visible set.
+        toast('Imported — skipped band(s) not in the catalog: ' + skipped.join(', ') + '. Press Save & Apply', true);
+      } else {
+        toast('Config imported — ' + l.kept.length + ' LTE, ' + n.kept.length + ' NR bands. Press Save & Apply to push');
+      }
     } catch (e) {
       toast('Import failed: ' + e.message, true);
     }
@@ -2181,9 +2320,22 @@ function getStoredToken() {
   try { return localStorage.getItem(TOKEN_KEY) || null; }
   catch (e) { return null; }
 }
+// Returns true only when the credential is actually persisted (A-146): a
+// quota/blocked-storage failure must be surfaced, not silently swallowed.
 function setStoredToken(t) {
-  if (!t) return;
-  try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* ignore */ }
+  if (!t) return false;
+  try { localStorage.setItem(TOKEN_KEY, t); return true; }
+  catch (e) { return false; }
+}
+// A-146: localStorage failed — the token exists server-side but cannot be
+// persisted, so it must be shown for manual copying before it is lost.
+function showUnsavedToken(token) {
+  $('lan-token-entry').style.display = 'none';
+  $('lan-token').textContent = token;
+  $('lan-token-show').textContent = 'Hide';
+  $('lan-token-show').style.display = 'inline-block';
+  if ($('token-actions')) $('token-actions').style.display = 'flex';
+  toast('Could not save the token to this browser — copy it now; it is lost on reload', true);
 }
 // Routes every API call through the bearer token when one is stored, and
 // surfaces 401s as a re-auth prompt instead of a generic failure. A-084:
@@ -2221,7 +2373,11 @@ var lanEnabled = false;   // server-side LAN setting, refreshed from /api/settin
 var lanTokenShown = false; // whether the stored token is unmasked in the UI
 
 function renderSettings(d) {
-  lanEnabled = !!d.lan_enabled;
+  // A-103: never coerce a missing/invalid lan_enabled to false — a bad
+  // payload must leave the panel untouched, not uncheck LAN and hide the
+  // token recovery surface.
+  if (!d || typeof d.lan_enabled !== 'boolean') return;
+  lanEnabled = d.lan_enabled;
   $('lan-toggle').checked = lanEnabled;
   var sec = $('lan-token-section');
   sec.style.display = lanEnabled ? 'block' : 'none';
@@ -2314,7 +2470,13 @@ async function shareToken() {
 function saveLanToken() {
   var val = $('lan-token-input').value.trim();
   if (!val) { toast('Paste the access token first', true); return; }
-  setStoredToken(val);
+  if (!setStoredToken(val)) {
+    // A-146: the credential was NOT persisted — the app cannot use it on
+    // the next page load or the next protected request. Never claim
+    // "Token saved"; keep the input populated so nothing is lost.
+    toast('Token could not be saved to this browser (storage unavailable) — it will not survive a reload', true);
+    return;
+  }
   $('lan-token-input').value = '';
   $('lan-token-input').type = 'password'; // A-191: re-mask after saving
   $('lan-token-input-toggle').textContent = 'Show';
@@ -2346,10 +2508,14 @@ function fetchSettings() {
     // A-125: a delayed bootstrap GET must not roll back a newer LAN change
     // (e.g. the user enabling LAN while this read was still in flight).
     if (seq !== settingsSeq) return;
+    // A-103: an HTTP-200 {ok:false,...} error payload must not be rendered
+    // — a failed read must never uncheck the LAN toggle or hide the token
+    // section the user needs to recover access.
+    if (!d || d.ok === false) throw new Error((d && d.error) || 'settings read failed');
     renderSettings(d);
   }).catch(function () {
     // 401s are already surfaced by apiFetch (showReAuth); network errors
-    // leave the panel untouched.
+    // and ok:false payloads leave the panel untouched.
   });
 }
 
@@ -2412,11 +2578,26 @@ async function toggleLan() {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     if (seq !== settingsSeq) return; // superseded by a newer action
+    // A-103: an HTTP-200 {ok:false,...} error payload must not be rendered.
+    if (!d || d.ok === false) throw new Error((d && d.error) || 'settings update failed');
     if (d.token) setStoredToken(d.token);
     renderSettings(d);
+    if (d.token) {
+      if (setStoredToken(d.token)) renderTokenDisplay(d.token);
+      else showUnsavedToken(d.token);   // A-146: never lose a freshly created credential
+    }
     toast('Network access changed — restart the server to apply');
   } catch (e) {
     toast('Failed to change network access: ' + e.message, true);
+    // A-160: a transport failure must not leave the switch flipped against
+    // the server state — resync the toggle/token surface like toggleDropLog.
+    try {
+      var rs = await apiFetch(API_SETTINGS);
+      if (rs.ok) {
+        var ds = await rs.json();
+        if (ds && ds.ok) renderSettings(ds);
+      }
+    } catch (e2) { /* server unreachable — the poll loop owns the offline state */ }
   }
 }
 async function regenerateToken() {
@@ -2434,23 +2615,39 @@ async function regenerateToken() {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     if (seq !== settingsSeq) return;
+    // A-103: an HTTP-200 {ok:false,...} error payload must not be rendered.
+    if (!d || d.ok === false) throw new Error((d && d.error) || 'settings update failed');
     if (d.token) setStoredToken(d.token);
     // A-130: a regenerated token must start masked — a reveal from the old
     // token must not carry over to the new secret.
     lanTokenShown = false;
     renderSettings(d);
+    if (d.token) {
+      if (setStoredToken(d.token)) renderTokenDisplay(d.token);
+      else showUnsavedToken(d.token);   // A-146: the new token exists only server-side — show it for copying
+    }
     toast('New token generated');
   } catch (e) {
     toast('Failed to regenerate token: ' + e.message, true);
   }
 }
 function sleep(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
-async function waitForHealth() {
+// A-118: a restart is only proven when /api/health (parsed, not just
+// HTTP-200) reports a non-error status from a DIFFERENT process than the
+// one that answered the restart request. Legacy servers without a pid
+// fall back to status-only acceptance.
+async function waitForHealth(prevPid) {
   var deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     try {
       var r = await apiFetch(API_HEALTH);
-      if (r.ok) return true;
+      if (r.ok) {
+        var d = await r.json().catch(function () { return null; });
+        if (d && typeof d.status === 'string' && d.status !== 'error') {
+          if (d.pid == null) return true;                          // legacy server: no pid to compare
+          if (prevPid == null || d.pid !== prevPid) return true;   // new process proves the restart
+        }
+      }
     } catch (e) { /* server bouncing — retry */ }
     await sleep(2000);
   }
@@ -2464,13 +2661,20 @@ async function restartServer() {
   // A-190: this outage is user-initiated and expected — don't record it as
   // a false "DROP"/NET event in Event History.
   suppressOutageLog = true;
+  var prevPid = null;
   try {
     var r = await apiFetch(API_RESTART, { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json().catch(function () { return null; });
+    if (d && d.ok === false) {
+      toast('Restart failed: ' + (d.error || 'unknown'), true);
+      return;
+    }
+    prevPid = (d && d.pid != null) ? d.pid : null;   // A-118: baseline pid of the pre-restart process
   } catch (e) {
     // The server may already be tearing down — the health poll below decides.
   }
-  var ok = await waitForHealth();
+  var ok = await waitForHealth(prevPid);
   suppressOutageLog = false;
   if (ok && serverDownReported) {
     // The polls may have tripped the server-down state during the bounce —
@@ -2551,8 +2755,9 @@ function fetchDefaults() {
     // A-109: if the modem read hasn't succeeded yet (and the user hasn't
     // touched the selection), stage the carrier-aware defaults — a transient
     // bootstrap read failure must not leave a carrier on the unrestricted
-    // fallback once the authoritative lookup succeeds.
-    if (!userTouched && !bootstrapped && lteEnabled.size === 0 && nrEnabled.size === 0) {
+    // fallback once the authoritative lookup succeeds. A-100's fill is a
+    // placeholder, not a real selection, so it must not block the stage.
+    if (!userTouched && !bootstrapped) {
       bootstrapped = true;
       applyDefaults();
     }
