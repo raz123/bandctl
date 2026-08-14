@@ -25,10 +25,10 @@ const html = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'index.html
 /* ============================ Suite 1: behavior ============================ */
 // Both suites run as independent async IIFEs over live jsdom windows; their
 // timers keep the event loop alive, so exit explicitly once both have settled.
-const __suitesPending = { behavior: true, a11y: true };
+const __suitesPending = { behavior: true, a11y: true, followup: true };
 function __suiteDone(name) {
   __suitesPending[name] = false;
-  if (!__suitesPending.behavior && !__suitesPending.a11y) {
+  if (!__suitesPending.behavior && !__suitesPending.a11y && !__suitesPending.followup) {
     process.exit(process.exitCode || 0);
   }
 }
@@ -113,7 +113,7 @@ const okRoutes = (over = {}) => Object.assign({
     await wait(80);
     assert(w.serverDownReported === true, 'S1 serverDown reported after read failure');
     assert(w.$('server-banner').style.display === 'block', 'S1 banner shown');
-    assert(w.lteEnabled.size === 0, 'S1 no fallback applied on failed read (A-117)');
+    assert(w.lteEnabled.size === 23, 'S1 empty grid filled with defaults after failed read (A-100 supersedes the pre-followup empty-grid contract)');
     assert(w.bootstrapped === false, 'S1 not bootstrapped');
     assert(w.$('connection-state').textContent === 'Offline', 'S1 header Offline');
     const tags = Array.from(w.$('history-list').querySelectorAll('.tag')).map((t) => t.textContent);
@@ -235,10 +235,11 @@ const okRoutes = (over = {}) => Object.assign({
     const dom = makeDom(server);
     const w = dom.window;
     await wait(80);
-    assert(w.defaultsLte.length === 25, 'S6 error-body defaults rejected, fallback kept (A-070)');
+    assert(w.defaultsLte.length === 23, 'S6 error-body defaults rejected, fallback kept (A-070; A-186 narrowed DEFAULT_LTE to 23)');
     assert(w.carrierInfo === null, 'S6 error object not stored as carrier');
-    // now a valid carrier defaults response arrives; nothing loaded yet -> applied (A-109)
-    server['/api/defaults'] = () => Promise.resolve(jsonRes({ carrier: 'rogers', operator: 'ROGERS', lte: ['1', '2', '3'], nr: ['5', '6'] }));
+    // now a valid carrier defaults response arrives; nothing loaded yet -> applied (A-109).
+    // NR '6' is not in the display catalog (A-010/A-170) so use catalog-valid bands.
+    server['/api/defaults'] = () => Promise.resolve(jsonRes({ carrier: 'rogers', operator: 'ROGERS', lte: ['1', '2', '3'], nr: ['5', '8'] }));
     const ok = await w.fetchDefaults();
     assert(ok === true, 'S6 valid defaults accepted');
     assert(w.lteEnabled.size === 3 && w.nrEnabled.size === 2, 'S6 carrier defaults staged after read failure (A-109)');
@@ -258,7 +259,7 @@ const okRoutes = (over = {}) => Object.assign({
     const resetP = w.resetDefaults();
     await wait(20);
     w.toggleBand('41', 'lte');
-    defaultsResolve(jsonRes({ carrier: 'rogers', operator: 'ROGERS', lte: ['1', '2', '3'], nr: ['5', '6'] }));
+    defaultsResolve(jsonRes({ carrier: 'rogers', operator: 'ROGERS', lte: ['1', '2', '3'], nr: ['5', '8'] }));
     await resetP;
     assert(w.lteEnabled.has('41'), 'S6 newer edit kept during reset lookup (A-113)');
     assert(w.$('status').textContent.indexOf('newer edits were kept') >= 0, 'S6 status explains kept edits');
@@ -758,7 +759,7 @@ async function behaviorTests() {
       assert(sum.classList.contains('sr-only'), 'summary is visually hidden');
       assertIn(sum.textContent, 'Signal graph:', 'summary prefixed');
       assertIn(sum.textContent, '-105', 'summary includes latest RSRP');
-      assertIn(p.$('status').textContent, 'Loaded from modem (manual)', 'status reflects load');
+      assertIn(p.$('status').textContent, 'Loaded from manual', 'status reflects load');
       assertEq(p.$('sig-rsrp').textContent, '-105', 'readout shows RSRP');
     } finally { teardown(p); }
   });
@@ -997,4 +998,721 @@ async function behaviorTests() {
   console.error('harness crashed:', e && e.stack ? e.stack : e);
   process.exitCode = 1;
   __suiteDone('a11y');
+});
+
+/* ============================ Suite 3: webui-followup ============================ */
+(async () => {
+'use strict';
+/*
+ * Dev-only regression harness for the shipped web UI (web/index.html).
+ *
+ * Extracts the single inline <script> from web/index.html (sanity-checking
+ * that it is the fixed build), loads the full page into jsdom with a fake
+ * fetch + inert timers, and runs scenario assertions covering the
+ * fix/webui-followup audit findings:
+ *
+ *   A-010/A-170  per-RAT catalog validation (parseBand/splitBands/setBands,
+ *                loadBands + loadPreset + onImportFile skip warnings)
+ *   A-097/A-036  read/write rev CAS token (lastRev), lagging confirmation
+ *                read never clobbers a just-saved selection
+ *   A-100        d.ok gate on /api/read (app errors != offline banner)
+ *   A-103        d.ok gate on /api/settings (bad payloads leave panel alone)
+ *   A-104        honest source label (modem / saved config / carrier defaults)
+ *   A-087        data_state CONNECTED renders as a 'good' chip
+ *   A-146        token-storage failures surfaced, never silently swallowed
+ *   A-160        toggleLan failure resyncs the switch from server state
+ *   A-161        export verifies d.ok; blob download only as a fallback
+ *   A-118        restart proven by a different health pid (or legacy no-pid)
+ *   A-186        crash bands 7/66 excluded from all default paths
+ *
+ * Run: node tests/js/run.js   (or: npm test)
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { JSDOM, VirtualConsole } = require('jsdom');
+
+const ROOT = path.join(__dirname, '..', '..');
+const HTML = fs.readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const PAGE_URL = 'http://127.0.0.1:8080/';
+
+/* ---------------- tiny framework ---------------- */
+
+let passed = 0;
+let failed = 0;
+const failures = [];
+const out = (s) => process.stdout.write(s + '\n');
+
+async function test(name, fn) {
+  let page = null;
+  try {
+    page = await boot();
+    await fn(page);
+    passed += 1;
+    out('ok ' + (passed + failed) + ' - ' + name);
+  } catch (e) {
+    failed += 1;
+    failures.push({ name, error: e });
+    out('not ok ' + (passed + failed) + ' - ' + name);
+    out('    ' + String((e && e.stack) || e).split('\n').slice(0, 6).join('\n    '));
+  } finally {
+    if (page) {
+      try { await settle(); } catch (e) {} // let fire-and-forget poll continuations finish
+      try { page.close(); } catch (e) {}
+    }
+  }
+}
+
+// sync variant for tests that need no jsdom page
+function testSync(name, fn) {
+  try {
+    fn();
+    passed += 1;
+    out('ok ' + (passed + failed) + ' - ' + name);
+  } catch (e) {
+    failed += 1;
+    failures.push({ name, error: e });
+    out('not ok ' + (passed + failed) + ' - ' + name);
+    out('    ' + String((e && e.stack) || e).split('\n').slice(0, 6).join('\n    '));
+  }
+}
+
+function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+function assertEq(actual, expected, msg) {
+  if (actual !== expected) {
+    throw new Error((msg ? msg + ': ' : '') + 'expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+  }
+}
+function assertMatch(actual, re, msg) {
+  if (!re.test(String(actual))) {
+    throw new Error((msg ? msg + ': ' : '') + JSON.stringify(actual) + ' does not match ' + re);
+  }
+}
+
+/* ---------------- script extraction (sanity gate) ---------------- */
+
+function extractInlineScript(html) {
+  const scripts = Array.from(html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi));
+  const inline = scripts.filter((s) => !/src\s*=/i.test(s[1]));
+  if (inline.length !== 1) {
+    throw new Error('expected exactly one inline <script> in web/index.html, found ' + inline.length);
+  }
+  return inline[0][2];
+}
+
+/* ---------------- fake fetch ---------------- */
+
+function jsonRes(body, status) {
+  status = status || 200;
+  return { ok: status >= 200 && status < 300, status, json: async () => body };
+}
+const isGet = (o) => !o.method || String(o.method).toUpperCase() === 'GET';
+const isPost = (o) => String(o.method || 'GET').toUpperCase() === 'POST';
+
+function makeFetch() {
+  const routes = [];
+  const calls = [];
+  const fetch = async (url, opts) => {
+    opts = opts || {};
+    calls.push({ url: String(url), opts });
+    const entry = routes.slice().reverse().find((r) => r.match(String(url), opts));
+    if (!entry) throw new Error('no fake route for ' + url);
+    return entry.handler(String(url), opts);
+  };
+  fetch.route = (match, handler) => routes.push({ match, handler });
+  fetch.calls = () => calls.slice();
+  return fetch;
+}
+
+/* ---------------- page boot ---------------- */
+
+const canvasCtxStub = new Proxy({}, {
+  get(target, prop) {
+    if (prop === 'canvas') return null;
+    return () => canvasCtxStub;
+  },
+  set() { return true; }
+});
+
+function setupPage(configure) {
+  const fetch = makeFetch();
+  const timers = [];            // window.setTimeout/setInterval record, never schedule
+  const clock = { now: Date.now() };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', () => {}); // swallow "Not implemented" noise (anchor clicks etc.)
+
+  // Catch-all must be pushed FIRST: matching is reverse-order (most recently
+  // added route wins), so this 404 fallback is consulted only after all
+  // specific routes (baselines + per-test overrides) miss.
+  fetch.route(() => true, () => jsonRes({ ok: false, error: 'no route' }, 404));
+  // Baseline routes so init()'s best-effort fetches settle deterministically.
+  fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: [], nr: [], source: 'config_file', rev: null }));
+  fetch.route((u, o) => u.includes('/api/settings') && isGet(o), () => jsonRes({ ok: true, lan_enabled: false }));
+  fetch.route((u) => u.includes('/api/drop-log'), () => jsonRes({ ok: true, enabled: false }));
+  fetch.route((u) => u.includes('/api/signal'), () => jsonRes({ ok: true, rsrp_dbm: null, rsrq_db: null, tech: 'LTE', level: null, timestamp: Date.now() }));
+  fetch.route((u) => u.includes('/api/registration'), () => jsonRes({ ok: true, service_state: 'IN_SERVICE', data_state: 'CONNECTED', network_type: 'LTE', operator: '—', roaming: false }));
+  fetch.route((u) => u.includes('/api/band-camping'), () => jsonRes({ ok: true, samples: [] }));
+
+  const dom = new JSDOM(HTML, {
+    runScripts: 'dangerously',
+    url: PAGE_URL,
+    virtualConsole: vc,
+    beforeParse(window) {
+      window.fetch = fetch;
+      window.setInterval = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+      window.clearInterval = () => {};
+      window.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+      window.clearTimeout = () => {};
+      window.Date.now = () => clock.now;
+      window.scrollTo = () => {};
+      window.HTMLCanvasElement.prototype.getContext = () => canvasCtxStub;
+      if (!window.URL.createObjectURL) {
+        window.URL.createObjectURL = () => 'blob:mock';
+        window.URL.revokeObjectURL = () => {};
+      }
+      if (configure) configure(fetch, { timers, clock, window });
+    }
+  });
+  return {
+    win: dom.window,
+    doc: dom.window.document,
+    fetch,
+    timers,
+    clock,
+    close: () => dom.window.close()
+  };
+}
+
+const settle = () => new Promise((res) => setImmediate(res));
+const settleDeep = async () => { await settle(); await settle(); };
+
+async function boot(configure) {
+  const page = setupPage(configure);
+  await settle(); // let init()'s async chain (loadBands/fetchSettings/...) settle
+  return page;
+}
+
+function flushTimers(timers) {
+  const pending = timers.splice(0);
+  pending.forEach((t) => t.fn());
+}
+
+/* ---------------- helpers ---------------- */
+
+const $ = (doc, id) => doc.getElementById(id);
+const statusText = (doc) => $(doc, 'status').textContent;
+const toastText = (doc) => $(doc, 'toast').textContent;
+
+function makeImportFile(win, text) {
+  return new win.File([text], 'band-config.json', { type: 'application/json' });
+}
+function importAndSettle(win, file) {
+  win.onImportFile(file);
+  return new Promise((res) => setTimeout(res, 30)); // FileReader onload fires asynchronously
+}
+
+function breakLocalStorage(win) {
+  const origSetItem = win.Storage.prototype.setItem;
+  win.Storage.prototype.setItem = () => { throw new Error('quota exceeded'); };
+  return () => { win.Storage.prototype.setItem = origSetItem; };
+}
+
+/* ==================================================================== */
+/*  Tests                                                                */
+/* ==================================================================== */
+
+
+  /* ---- script extraction sanity gate (runs against the fixed build) ---- */
+  testSync('shipped inline script is the fixed build (extraction + markers)', () => {
+    const script = extractInlineScript(HTML);
+    const markers = [
+      'function parseBand', 'function splitBands', 'var LTE_CATALOG',
+      'var lastRev', 'function sourceLabel', 'var DATA_GOOD',
+      'function showUnsavedToken', 'async function waitForHealth(prevPid)',
+      'var DEFAULT_LTE', 'A-186'
+    ];
+    for (const m of markers) assert(script.includes(m), 'marker missing from inline script: ' + m);
+    assert(!script.includes('if (typeof window.ksu'), 'old ksu blob-export path should be gone');
+  });
+
+  /* ================= A-010 / A-170: per-RAT catalog validation ================= */
+
+  await test('A-010 parseBand accepts ints 1..79, rejects everything else', async ({ win }) => {
+    assertEq(win.parseBand(1), 1, 'int 1');
+    assertEq(win.parseBand(79), 79, 'int 79');
+    assertEq(win.parseBand('7'), 7, 'numeric string');
+    assertEq(win.parseBand('007'), 7, 'leading zeros');
+    assertEq(win.parseBand(true), null, 'boolean');
+    assertEq(win.parseBand(false), null, 'boolean false');
+    assertEq(win.parseBand(1.5), null, 'float');
+    assertEq(win.parseBand('abc'), null, 'non-numeric string');
+    assertEq(win.parseBand('1.5'), null, 'float string');
+    assertEq(win.parseBand(''), null, 'empty string');
+    assertEq(win.parseBand(0), null, 'below range');
+    assertEq(win.parseBand(80), null, 'above range');
+    assertEq(win.parseBand(-1), null, 'negative');
+    assertEq(win.parseBand(null), null, 'null');
+    assertEq(win.parseBand(undefined), null, 'undefined');
+  });
+
+  await test('A-010/A-170 splitBands dedupes, orders, and separates kept/dropped/invalid', async ({ win }) => {
+    const r = win.splitBands('lte', ['1', '2', '2', '7', '66', '9', 'abc', true, 0]);
+    assertEq(JSON.stringify(r.kept), JSON.stringify(['1', '2', '7', '66']), 'kept');
+    assertEq(JSON.stringify(r.dropped), JSON.stringify(['9']), 'dropped (in-range, not in LTE catalog)');
+    assertEq(JSON.stringify(r.invalid), JSON.stringify(['abc', 'true', '0']), 'invalid');
+    const n = win.splitBands('nr', ['79', '66', '7', '1', '1']);
+    assertEq(JSON.stringify(n.kept), JSON.stringify(['79', '66', '7', '1']), 'nr kept');
+    assertEq(n.dropped.length + n.invalid.length, 0, 'nr all catalog');
+  });
+
+  await test('A-010/A-170 setBands filters to catalog and returns filtered-out values', async ({ win }) => {
+    const dropped = win.setBands(['1', '9'], ['77', '3', 'xx']);
+    assert(win.lteEnabled.has('1'), 'lte kept');
+    assert(!win.lteEnabled.has('9'), 'lte dropped from set');
+    assert(win.nrEnabled.has('77') && win.nrEnabled.has('3'), 'nr kept');
+    assertEq(JSON.stringify(dropped.lte), JSON.stringify(['9']), 'returned lte dropped');
+    assertEq(JSON.stringify(dropped.nr), JSON.stringify(['xx']), 'returned nr invalid');
+  });
+
+  await test('A-170 loadBands skips out-of-catalog bands with a visible warning', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1', '9'], nr: ['3'], source: 'qmi', rev: 9 }));
+    const ok = await win.loadBands();
+    assertEq(ok, true, 'load succeeds');
+    assert(win.lteEnabled.has('1') && !win.lteEnabled.has('9'), 'band 9 filtered out');
+    assertEq(win.nrEnabled.size, 1, 'nr kept');
+    assert(statusText(doc).includes('skipped bands not in the catalog: 9'), 'status names skipped band');
+    assert($(doc, 'status').className.includes('err'), 'skip warning is an error-toned status');
+    assertEq(win.lastRev, 9, 'rev still captured');
+  });
+
+  await test('A-170 loadPreset skips out-of-catalog bands with a visible toast', async ({ win, doc }) => {
+    win.localStorage.setItem('bandController.presets.v1', JSON.stringify([
+      { name: 'p1', lte: ['1', '9'], nr: ['3'] }
+    ]));
+    win.loadPreset(0);
+    assert(win.lteEnabled.has('1') && !win.lteEnabled.has('9'), 'catalog filter applied');
+    assertEq(win.userTouched, true, 'preset marks userTouched');
+    assert(toastText(doc).includes('skipped band(s) not in the catalog: 9'), 'toast names skipped band');
+    assert($(doc, 'toast').className.includes('err'), 'skip toast is error-toned');
+  });
+
+  await test('A-010 onImportFile rejects invalid band values and keeps the selection', async ({ win, doc }) => {
+    const file = makeImportFile(win, JSON.stringify({ lte: ['1', 'banana'], nr: ['3'] }));
+    await importAndSettle(win, file);
+    assert(toastText(doc).includes('Import failed: invalid band value(s): banana'), 'invalid values rejected');
+    assert($(doc, 'toast').className.includes('err'), 'import failure is error-toned');
+    assertEq(win.lteEnabled.size, 0, 'selection untouched');
+  });
+
+  await test('A-170 onImportFile skips out-of-catalog bands with a visible toast', async ({ win, doc }) => {
+    const file = makeImportFile(win, JSON.stringify({ lte: ['1', '9'], nr: ['77', '3'] }));
+    await importAndSettle(win, file);
+    assert(win.lteEnabled.has('1') && !win.lteEnabled.has('9'), 'kept only catalog bands');
+    assert(win.nrEnabled.has('77') && win.nrEnabled.has('3'), 'nr kept');
+    assert(toastText(doc).includes('skipped band(s) not in the catalog: 9'), 'toast names skipped band');
+    assert($(doc, 'toast').className.includes('err'), 'skip toast is error-toned');
+  });
+
+  await test('A-010 onImportFile rejects an empty usable LTE set', async ({ win, doc }) => {
+    const file = makeImportFile(win, JSON.stringify({ lte: ['9'], nr: ['3'] }));
+    await importAndSettle(win, file);
+    assert(toastText(doc).includes('no usable LTE bands in the file'), 'empty kept LTE rejected');
+    assertEq(win.lteEnabled.size, 0, 'selection untouched');
+  });
+
+  /* ================= A-097 / A-036: rev CAS token ================= */
+
+  await test('A-097 loadBands captures the read revision (CAS token)', async ({ win, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'qmi', rev: 42 }));
+    await win.loadBands();
+    assertEq(win.lastRev, 42, 'lastRev captured');
+  });
+
+  await test('A-097 saveBands sends the CAS rev and refreshes it on success', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'config_file', rev: 42 }));
+    await win.loadBands();
+    win.toggleBand(2, 'lte');
+    fetch.route((u, o) => u.includes('/api/write') && isPost(o), () => jsonRes({ ok: true, source: 'config_file', rev: 43 }));
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1', '2'], nr: ['3'], source: 'config_file', rev: 43 }));
+    await win.saveBands();
+    const writeCall = fetch.calls().find((c) => c.url.includes('/api/write'));
+    assert(writeCall, 'write was called');
+    assertEq(JSON.parse(writeCall.opts.body).rev, 42, 'rev sent on save');
+    assertEq(win.lastRev, 43, 'rev refreshed on success');
+    assert(statusText(doc).startsWith('Applied (source: config_file)'), 'success status');
+  });
+
+  await test('A-097 saveBands omits rev when nothing was read yet', async ({ win, fetch }) => {
+    win.toggleBand(1, 'lte');
+    fetch.route((u, o) => u.includes('/api/write') && isPost(o), () => jsonRes({ ok: true, source: 'config_file', rev: 3 }));
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: [], source: 'config_file', rev: 3 }));
+    await win.saveBands();
+    const writeCall = fetch.calls().find((c) => c.url.includes('/api/write'));
+    const body = JSON.parse(writeCall.opts.body);
+    assert(!('rev' in body), 'no rev key when lastRev is null');
+  });
+
+  await test('A-097 failed save is surfaced, selection kept, rev refreshed from a fresh read', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'config_file', rev: 5 }));
+    await win.loadBands();
+    fetch.route((u, o) => u.includes('/api/write') && isPost(o), () => jsonRes({ ok: false, error: 'stale revision' }));
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'config_file', rev: 99 }));
+    await win.saveBands();
+    assert(statusText(doc).includes('Save failed: stale revision — your selection was kept'), 'failure status');
+    assert(toastText(doc).includes('Save failed: stale revision'), 'failure toast');
+    assert(win.lteEnabled.has('1'), 'selection kept');
+    assertEq(win.lastRev, 99, 'rev refreshed from read');
+  });
+
+  await test('A-036 confirmation read missing a just-saved band never clobbers the selection', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1', '2'], nr: ['3'], source: 'config_file', rev: 10 }));
+    await win.loadBands();
+    fetch.route((u, o) => u.includes('/api/write') && isPost(o), () => jsonRes({ ok: true, source: 'config_file', rev: 11 }));
+    // lagging modem read-back: band 2 not yet visible
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'config_file', rev: 11 }));
+    await win.saveBands();
+    assert(win.lteEnabled.has('2'), 'band 2 kept despite lagging read-back');
+    assertEq(win.lteEnabled.size, 2, 'selection intact');
+    assert(statusText(doc).startsWith('Applied'), 'still reports applied');
+  });
+
+  await test('A-036 confirmation read with an error body never clobbers the selection', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1', '2'], nr: ['3'], source: 'config_file', rev: 10 }));
+    await win.loadBands();
+    fetch.route((u, o) => u.includes('/api/write') && isPost(o), () => jsonRes({ ok: true, source: 'config_file', rev: 11 }));
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: false, error: 'boom' }));
+    await win.saveBands();
+    assertEq(win.lteEnabled.size, 2, 'selection intact after error read-back');
+  });
+
+  /* ================= A-100: d.ok gate on /api/read ================= */
+
+  await test('A-100 app-level read failure is not an offline banner; defaults fill an empty grid', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: false, error: 'modem busy' }));
+    const ok = await win.loadBands();
+    assertEq(ok, false, 'load reports failure');
+    assert(statusText(doc).includes('Failed to load: modem busy'), 'failure status');
+    assertEq(win.serverDownReported, false, 'no offline banner for app error');
+    assert($(doc, 'server-banner').style.display !== 'block', 'banner not visible');
+    assertEq(win.lteEnabled.size, 23, 'fallback defaults applied to empty grid');
+    assert(!win.lteEnabled.has('7') && !win.lteEnabled.has('66'), 'defaults exclude crash bands');
+  });
+
+  await test('A-100 read response missing band lists is an app error, not a banner', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: 'x' }));
+    const ok = await win.loadBands();
+    assertEq(ok, false, 'load reports failure');
+    assert(statusText(doc).includes('read response is missing band lists'), 'missing-list status');
+    assertEq(win.serverDownReported, false, 'no offline banner');
+  });
+
+  await test('A-100 transport failure (HTTP 500) trips the offline banner and fills an empty grid', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: false }, 500));
+    const ok = await win.loadBands();
+    assertEq(ok, false, 'load reports failure');
+    assertEq(win.serverDownReported, true, 'offline banner tripped');
+    assertEq($(doc, 'server-banner').style.display, 'block', 'banner visible');
+    assert(statusText(doc).includes('Failed to load: HTTP 500'), 'transport status');
+    assertEq(win.lteEnabled.size, 23, 'defaults fill empty grid');
+  });
+
+  await test('A-100 a read failure never erases a visible selection', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1', '3'], nr: ['5'], source: 'qmi', rev: 1 }));
+    await win.loadBands();
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: false, error: 'modem busy' }));
+    const ok = await win.loadBands();
+    assertEq(ok, false, 'second load fails');
+    assert(win.lteEnabled.has('1') && win.lteEnabled.has('3'), 'visible selection kept');
+    assertEq(win.lteEnabled.size, 2, 'defaults NOT applied over a selection');
+  });
+
+  await test('A-100 userTouched read keeps the selection but still updates the source', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'config_file', rev: 1 }));
+    await win.loadBands();
+    win.userTouched = true;
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['66'], nr: ['77'], source: 'qmi', rev: 5 }));
+    await win.loadBands();
+    assert(win.lteEnabled.has('1'), 'user selection kept');
+    assertEq(win.lteEnabled.size, 1, 'read did not clobber');
+    assertEq(win.source, 'qmi', 'source still updated');
+    assertEq(win.lastRev, 1, 'rev not captured while userTouched');
+    assert(statusText(doc).includes('your selection was kept') === false, 'no false failure text');
+  });
+
+  /* ================= A-103: d.ok gate on /api/settings ================= */
+
+  await test('A-103 renderSettings ignores non-boolean lan_enabled', async ({ win, doc }) => {
+    const before = { checked: $(doc, 'lan-toggle').checked, section: $(doc, 'lan-token-section').style.display };
+    win.renderSettings({ lan_enabled: 'yes' });
+    assertEq($(doc, 'lan-toggle').checked, before.checked, 'toggle untouched');
+    assertEq($(doc, 'lan-token-section').style.display, before.section, 'section untouched');
+    win.renderSettings({ ok: false, error: 'boom' });
+    assertEq($(doc, 'lan-toggle').checked, before.checked, 'toggle untouched after ok:false payload');
+  });
+
+  await test('A-103 fetchSettings ok:false payload leaves the panel untouched', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/settings') && isGet(o), () => jsonRes({ ok: false, error: 'denied' }));
+    win.fetchSettings();
+    await settleDeep();
+    assertEq($(doc, 'lan-toggle').checked, false, 'toggle not unchecked by error payload');
+    assertEq($(doc, 'lan-token-section').style.display, 'none', 'token section stays hidden');
+  });
+
+  await test('A-103 toggleLan ok:false response -> error toast + resync from server', async ({ win, doc, fetch }) => {
+    $(doc, 'lan-toggle').checked = true;
+    fetch.route((u, o) => u.includes('/api/settings') && isGet(o), () => jsonRes({ ok: true, lan_enabled: true }));
+    fetch.route((u, o) => u.includes('/api/settings') && isPost(o), () => jsonRes({ ok: false, error: 'denied' }));
+    await win.toggleLan();
+    assert(toastText(doc).includes('Failed to change network access: denied'), 'error toast');
+    assertEq($(doc, 'lan-toggle').checked, true, 'switch resynced to server truth');
+  });
+
+  /* ================= A-104: honest source label ================= */
+
+  await test('A-104 sourceLabel distinguishes modem reads from persisted intent', async ({ win }) => {
+    assertEq(win.sourceLabel('qmi'), 'modem (qmi)');
+    assertEq(win.sourceLabel('diag'), 'modem (diag)');
+    assertEq(win.sourceLabel('config_file'), 'saved config (config_file)');
+    assertEq(win.sourceLabel('default'), 'carrier defaults (default)');
+    assertEq(win.sourceLabel(''), 'unknown');
+    assertEq(win.sourceLabel(null), 'unknown');
+    assertEq(win.sourceLabel('foo'), 'foo');
+  });
+
+  await test('A-104 loadBands status uses the honest source label', async ({ win, doc, fetch }) => {
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'config_file', rev: 1 }));
+    await win.loadBands();
+    assertEq(statusText(doc), 'Loaded from saved config (config_file) — 1 LTE, 1 NR bands');
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'qmi', rev: 1 }));
+    await win.loadBands();
+    assertEq(statusText(doc), 'Loaded from modem (qmi) — 1 LTE, 1 NR bands');
+    fetch.route((u) => u.includes('/api/read'), () => jsonRes({ ok: true, lte: ['1'], nr: ['3'], source: 'default', rev: 1 }));
+    await win.loadBands();
+    assertEq(statusText(doc), 'Loaded from carrier defaults (default) — 1 LTE, 1 NR bands');
+  });
+
+  /* ================= A-087: CONNECTED data chip ================= */
+
+  await test('A-087 data_state CONNECTED renders as a good chip', async ({ win, doc }) => {
+    win.updateChips({ service_state: 'IN_SERVICE', data_state: 'CONNECTED', network_type: 'NR', operator: 'Rogers', roaming: false });
+    assertEq(doc.querySelector('#chip-data .chipval').textContent, 'CONNECTED');
+    assert($(doc, 'chip-data').classList.contains('good'), 'data chip good');
+    assertEq(doc.querySelector('#chip-roam .chipval').textContent, 'Home');
+    assert($(doc, 'chip-svc').classList.contains('good'), 'service chip good');
+    assert($(doc, 'chip-net').classList.contains('accent'), 'net chip accent');
+  });
+
+  await test('A-087 data states map to good/bad/neutral correctly', async ({ win, doc }) => {
+    win.updateChips({ service_state: 'POWER_OFF', data_state: 'OUT_OF_SERVICE' });
+    assert($(doc, 'chip-data').classList.contains('bad'), 'OUT_OF_SERVICE is bad');
+    assert($(doc, 'chip-svc').classList.contains('bad'), 'POWER_OFF is bad');
+    win.updateChips({ data_state: 'IN_SERVICE' });
+    assert($(doc, 'chip-data').classList.contains('good'), 'IN_SERVICE is good');
+    win.updateChips({ data_state: '—' });
+    assert(!$(doc, 'chip-data').classList.contains('good'), 'unknown is not good');
+    assert(!$(doc, 'chip-data').classList.contains('bad'), 'unknown is not bad');
+  });
+
+  /* ================= A-146: token storage failures ================= */
+
+  await test('A-146 setStoredToken reports storage failure instead of swallowing it', async ({ win }) => {
+    assertEq(win.setStoredToken(''), false, 'empty token is false');
+    const restore = breakLocalStorage(win);
+    assertEq(win.setStoredToken('tok2'), false, 'storage failure reported');
+    assertEq(win.getStoredToken(), null, 'nothing stored while storage is broken');
+    restore();
+    assertEq(win.setStoredToken('tok'), true, 'baseline persists after restore');
+  });
+
+  await test('A-146 saveLanToken surfaces storage failure and keeps the input', async ({ win, doc }) => {
+    breakLocalStorage(win);
+    $(doc, 'lan-token-input').value = 'sekrit';
+    win.saveLanToken();
+    assert(toastText(doc).includes('Token could not be saved to this browser (storage unavailable)'), 'failure toast');
+    assert($(doc, 'toast').className.includes('err'), 'error-toned toast');
+    assertEq($(doc, 'lan-token-input').value, 'sekrit', 'input kept, nothing lost');
+  });
+
+  await test('A-146 saveLanToken success stores the token and clears the input', async ({ win, doc }) => {
+    $(doc, 'lan-token-input').value = 'mytoken';
+    win.saveLanToken();
+    assertEq(win.getStoredToken(), 'mytoken', 'token persisted');
+    assertEq($(doc, 'lan-token-input').value, '', 'input cleared');
+    assertEq(toastText(doc), 'Token saved');
+    assertMatch($(doc, 'lan-token').textContent, /^mytok/, 'masked token displayed');
+  });
+
+  await test('A-146 toggleLan new token with broken storage is shown for manual copying', async ({ win, doc, fetch }) => {
+    breakLocalStorage(win);
+    $(doc, 'lan-toggle').checked = true;
+    fetch.route((u, o) => u.includes('/api/settings') && isPost(o), () => jsonRes({ ok: true, lan_enabled: true, token: 'long-token-value' }));
+    await win.toggleLan();
+    assertEq($(doc, 'lan-token').textContent, 'long-token-value', 'token shown unmasked');
+    assertEq($(doc, 'lan-token-show').textContent, 'Hide', 'show button says Hide');
+    assertEq($(doc, 'lan-token-show').style.display, 'inline-block', 'show button visible');
+    assertEq($(doc, 'lan-token-entry').style.display, 'none', 'entry hidden');
+  });
+
+  await test('A-146 regenerateToken new token with broken storage is shown for manual copying', async ({ win, doc, fetch }) => {
+    breakLocalStorage(win);
+    fetch.route((u, o) => u.includes('/api/settings') && isPost(o), () => jsonRes({ ok: true, lan_enabled: true, token: 'fresh-token' }));
+    await win.regenerateToken();
+    assertEq($(doc, 'lan-token').textContent, 'fresh-token', 'token shown unmasked');
+    assertEq($(doc, 'lan-token-show').textContent, 'Hide', 'show button says Hide');
+  });
+
+  /* ================= A-160: toggleLan failure resync ================= */
+
+  await test('A-160 transport failure resyncs the toggle from server state (off -> on)', async ({ win, doc, fetch }) => {
+    $(doc, 'lan-toggle').checked = true;
+    fetch.route((u, o) => u.includes('/api/settings') && isGet(o), () => jsonRes({ ok: true, lan_enabled: false }));
+    fetch.route((u, o) => u.includes('/api/settings') && isPost(o), () => { throw new Error('network down'); });
+    await win.toggleLan();
+    assert(toastText(doc).includes('Failed to change network access: network down'), 'error toast');
+    assertEq($(doc, 'lan-toggle').checked, false, 'switch resynced back to server state');
+    const gets = fetch.calls().filter((c) => c.url.includes('/api/settings') && isGet(c.opts));
+    assert(gets.length >= 2, 'resync read performed');
+  });
+
+  await test('A-160 transport failure resyncs the toggle from server state (on -> on)', async ({ win, doc, fetch }) => {
+    $(doc, 'lan-toggle').checked = true;
+    fetch.route((u, o) => u.includes('/api/settings') && isGet(o), () => jsonRes({ ok: true, lan_enabled: true }));
+    fetch.route((u, o) => u.includes('/api/settings') && isPost(o), () => { throw new Error('connection refused'); });
+    await win.toggleLan();
+    assertEq($(doc, 'lan-toggle').checked, true, 'switch matches server truth');
+  });
+
+  await test('A-160 resync read failure leaves the toggle as the user set it', async ({ win, doc, fetch }) => {
+    $(doc, 'lan-toggle').checked = true;
+    fetch.route((u, o) => u.includes('/api/settings') && isPost(o), () => { throw new Error('network down'); });
+    fetch.route((u, o) => u.includes('/api/settings') && isGet(o), () => { throw new Error('still down'); });
+    await win.toggleLan();
+    assert(toastText(doc).includes('Failed to change network access: network down'), 'error toast');
+    assertEq($(doc, 'lan-toggle').checked, true, 'no resync info -> untouched');
+  });
+
+  /* ================= A-161: export verification / fallback ================= */
+
+  await test('A-161 export verifies d.ok and toasts the on-device path', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/export') && isPost(o), () => jsonRes({ ok: true, path: '/sdcard/band-config.json' }));
+    win.exportConfig();
+    await settleDeep();
+    assertEq(toastText(doc), 'Exported to /sdcard/band-config.json');
+    assertEq(doc.querySelectorAll('a[download="band-config.json"]').length, 0, 'no blob download on success');
+    assertEq(win.serverDownReported, false, 'no offline state');
+  });
+
+  await test('A-161 export ok:false is reported as a failure, no blob', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/export') && isPost(o), () => jsonRes({ ok: false, error: 'disk full' }));
+    win.exportConfig();
+    await settleDeep();
+    assertEq(toastText(doc), 'Export failed: disk full');
+    assert($(doc, 'toast').className.includes('err'), 'error-toned toast');
+    assertEq(doc.querySelectorAll('a[download="band-config.json"]').length, 0, 'no blob on failure');
+  });
+
+  await test('A-161 export transport failure falls back to a local blob with an honest warning', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/export') && isPost(o), () => { throw new Error('connection refused'); });
+    win.exportConfig();
+    await settleDeep();
+    assert(toastText(doc).includes('Server export unavailable — local download attempted; verify the file was saved'), 'fallback warning');
+    assertEq(doc.querySelectorAll('a[download="band-config.json"]').length, 1, 'blob download attempted');
+    assertEq(win.serverDownReported, true, 'server-down surfaced');
+    assertEq($(doc, 'server-banner').style.display, 'block', 'banner visible');
+  });
+
+  /* ================= A-118: restart pid proof ================= */
+
+  await test('A-118 restart proven by a different health pid', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/restart') && isPost(o), () => jsonRes({ ok: true, pid: 100 }));
+    fetch.route((u) => u.includes('/api/health'), () => jsonRes({ ok: true, status: 'ok', pid: 101 }));
+    await win.restartServer();
+    assertEq(toastText(doc), 'Server restarted');
+    assert(!$(doc, 'toast').className.includes('err'), 'success toast, not error');
+  });
+
+  await test('A-118 same health pid means the restart is not proven (health check timed out)', async ({ win, doc, fetch, timers, clock }) => {
+    fetch.route((u, o) => u.includes('/api/restart') && isPost(o), () => jsonRes({ ok: true, pid: 100 }));
+    fetch.route((u) => u.includes('/api/health'), () => jsonRes({ ok: true, status: 'ok', pid: 100 }));
+    const p = win.restartServer();
+    await settle();
+    assert(fetch.calls().filter((c) => c.url.includes('/api/health')).length >= 1, 'health polled once');
+    clock.now += 30001; // blow past the 30s deadline
+    flushTimers(timers); // release the sleep(2000) wait
+    await settle();
+    await p;
+    assertEq(toastText(doc), 'Server restarted — health check timed out');
+    assert($(doc, 'toast').className.includes('err'), 'timeout toast is error-toned');
+  });
+
+  await test('A-118 legacy health without pid falls back to status-only acceptance', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/restart') && isPost(o), () => jsonRes({ ok: true }));
+    fetch.route((u) => u.includes('/api/health'), () => jsonRes({ ok: true, status: 'ok' }));
+    await win.restartServer();
+    assertEq(toastText(doc), 'Server restarted');
+  });
+
+  await test('A-118 health status "error" keeps polling and eventually times out', async ({ win, doc, fetch, timers, clock }) => {
+    fetch.route((u, o) => u.includes('/api/restart') && isPost(o), () => jsonRes({ ok: true, pid: 100 }));
+    fetch.route((u) => u.includes('/api/health'), () => jsonRes({ ok: true, status: 'error', pid: 100 }));
+    const p = win.restartServer();
+    await settle();
+    clock.now += 30001;
+    flushTimers(timers);
+    await settle();
+    await p;
+    assertEq(toastText(doc), 'Server restarted — health check timed out');
+  });
+
+  await test('A-118 restart ok:false reports failure and never polls health', async ({ win, doc, fetch }) => {
+    fetch.route((u, o) => u.includes('/api/restart') && isPost(o), () => jsonRes({ ok: false, error: 'restart denied' }));
+    await win.restartServer();
+    assertEq(toastText(doc), 'Restart failed: restart denied');
+    assert($(doc, 'toast').className.includes('err'), 'error-toned toast');
+    assertEq(fetch.calls().filter((c) => c.url.includes('/api/health')).length, 0, 'no health poll');
+  });
+
+  /* ================= A-186: crash bands out of defaults ================= */
+
+  await test('A-186 DEFAULT_LTE and DEFAULT_NR exclude crash bands 7 and 66', async ({ win }) => {
+    assert(!win.DEFAULT_LTE.includes('7'), 'DEFAULT_LTE no 7');
+    assert(!win.DEFAULT_LTE.includes('66'), 'DEFAULT_LTE no 66');
+    assert(!win.DEFAULT_NR.includes('7'), 'DEFAULT_NR no 7');
+    assert(!win.DEFAULT_NR.includes('66'), 'DEFAULT_NR no 66');
+  });
+
+  await test('A-186 applyDefaults grids exclude 7/66 but the tiles stay toggleable', async ({ win, doc }) => {
+    win.applyDefaults();
+    assert(!win.lteEnabled.has('7'), 'lte no 7');
+    assert(!win.lteEnabled.has('66'), 'lte no 66');
+    assert(!win.nrEnabled.has('7'), 'nr no 7');
+    assert(!win.nrEnabled.has('66'), 'nr no 66');
+    assertEq(win.lteEnabled.size, 23, 'lte default count');
+    assertEq(win.nrEnabled.size, 15, 'nr default count');
+    const tile7 = doc.querySelector('#lte-bands .band[data-band="7"]');
+    assert(tile7, 'band 7 tile exists');
+    assert(!tile7.classList.contains('active'), 'band 7 not active by default');
+    win.toggleBand(7, 'lte'); // explicit user selection still allowed
+    assert(win.lteEnabled.has('7'), 'band 7 selectable explicitly');
+    assert(doc.querySelector('#lte-bands .band[data-band="7"]').classList.contains('active'), 'tile lights up');
+  });
+
+  /* ---- summary ---- */
+  const total = passed + failed;
+  out('');
+  out('# ' + total + ' tests, ' + passed + ' passed, ' + failed + ' failed');
+  if (failed > 0) {
+    out('');
+    for (const f of failures) {
+      out('FAIL: ' + f.name);
+      out('  ' + String((f.error && f.error.stack) || f.error).split('\n').join('\n  '));
+    }
+    process.exitCode = 1;
+  }
+
+  __suiteDone('followup');
+})().catch((e) => {
+  console.error('FOLLOWUP HARNESS ERROR', e && e.stack ? e.stack : e);
+  process.exitCode = 1;
+  __suiteDone('followup');
 });

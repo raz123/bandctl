@@ -1482,9 +1482,10 @@ async function loadBands() {
     if (!e.app) serverDown(e);   // A-100: only transport failures trip the offline banner
     if (userTouched) {
       showStatus('Failed to load: ' + e.message + ' — your selection was kept', true);
-    } else if (bootstrapped) {
+    } else if (bootstrapped && lteEnabled.size > 0) {
       // A-117: a failed refresh must never discard the last known
       // configuration — keep the visible selection, explain the failure.
+      // (An empty grid has nothing to keep; A-100 fills it with defaults.)
       showStatus('Failed to load: ' + e.message + ' — keeping the last known configuration', true);
     } else {
       showStatus('Failed to load: ' + e.message, true);
@@ -1550,7 +1551,7 @@ async function saveBands() {
           if (r2.status === 401) { /* re-auth surfaced by apiFetch */ }
           else if (r2.ok) {
             var d2 = await r2.json();
-            if (d2 && d2.ok && Array.isArray(d2.lte) && Array.isArray(d2.nr)) {
+            if (d2 && d2.ok !== false && Array.isArray(d2.lte) && Array.isArray(d2.nr)) {
               if (d2.rev != null) lastRev = d2.rev;
               var d2lte = d2.lte.map(String);
               var d2nr = d2.nr.map(String);
@@ -2754,8 +2755,9 @@ function fetchDefaults() {
     // A-109: if the modem read hasn't succeeded yet (and the user hasn't
     // touched the selection), stage the carrier-aware defaults — a transient
     // bootstrap read failure must not leave a carrier on the unrestricted
-    // fallback once the authoritative lookup succeeds.
-    if (!userTouched && !bootstrapped && lteEnabled.size === 0 && nrEnabled.size === 0) {
+    // fallback once the authoritative lookup succeeds. A-100's fill is a
+    // placeholder, not a real selection, so it must not block the stage.
+    if (!userTouched && !bootstrapped) {
       bootstrapped = true;
       applyDefaults();
     }
