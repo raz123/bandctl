@@ -40,23 +40,24 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 
 ## Features
 
-- **13 API endpoints**:
-  - `GET  /api/read` — current LTE/NR band configuration (from QMI, diag, config file, or default)
-  - `POST /api/write` — write LTE/NR band configuration to the modem (QMI first, diag fallback)
-  - `GET  /api/defaults` — carrier-aware defaults (Rogers 302720 curated, others unrestricted)
-  - `POST /api/boot-apply` — re-apply the persisted config at boot (config-file gated)
-  - `GET  /api/settings` — network-access settings (LAN mode, token required?)
-  - `POST /api/settings` — enable/disable LAN mode, (re)generate the access token
-  - `POST /api/restart` — restart the server (needed after changing network access)
-  - `GET  /api/signal` — current signal strength (RSRP/RSRQ/level) from `dumpsys telephony.registry`
-  - `GET  /api/registration` — service/data state, network type, operator, roaming
-  - `GET  /api/health` — transport status (QMI or diag, band counts, diag session owner)
-  - `POST /api/modem-reset` — soft modem reset (`cmd phone radio power` off/on, with fallback)
-  - `GET  /api/band-camping` — live band-camping log: last N serving-cell EARFCN/band samples
-  - `GET/POST /api/drop-log` — debug drop logging: enable/disable the watchdog, list recorded drop snapshots
+- **13 API endpoints** — every endpoint is addressed as `/api/<name>?action=<name>` (the `action=` query parameter selects the handler; the path itself is just the API root):
+  - `GET  /api/read?action=read` — current LTE/NR band configuration (from QMI, diag, config file, or default)
+  - `POST /api/write?action=write` — write LTE/NR band configuration to the modem (QMI first, diag fallback)
+  - `GET  /api/defaults?action=defaults` — carrier-aware defaults (Rogers 302720 curated, others unrestricted)
+  - `POST /api/boot-apply?action=boot-apply` — re-apply the persisted config at boot (config-file gated)
+  - `POST /api/export?action=export` — export the submitted band config to a timestamped JSON file in the module config dir (WebView-compatible: the UI toasts the on-device path instead of a blob download)
+  - `GET  /api/settings?action=settings` — network-access settings (LAN mode, token required?)
+  - `POST /api/settings?action=settings` — enable/disable LAN mode, (re)generate the access token
+  - `POST /api/restart?action=restart` — restart the server (needed after changing network access)
+  - `GET  /api/signal?action=signal` — current signal strength (RSRP/RSRQ/level) from `dumpsys telephony.registry`
+  - `GET  /api/registration?action=registration` — service/data state, network type, operator, roaming
+  - `GET  /api/health?action=health` — transport status (QMI or diag, band counts, diag session owner)
+  - `POST /api/modem-reset?action=modem-reset` — soft modem reset (`cmd phone radio power` off/on, with fallback)
+  - `GET  /api/band-camping?action=band-camping` — live band-camping log: last N serving-cell EARFCN/band samples
+  - `GET/POST /api/drop-log?action=drop-log` — debug drop logging: enable/disable the watchdog, list recorded drop snapshots
 - **Live band-camping readout** — the Diagnostics tab shows the current camped band (band + EARFCN) live, so you can see whether a forced band actually stuck.
 - **Debug drop logging** — Settings > Debug > Drop logging (default off): when enabled, a server-side watchdog stamps every radio drop (OUT_OF_SERVICE / POWER_OFF / EMERGENCY_ONLY) with correlation context — registration state, call state, Wi-Fi link/AP, data counters, radio-buffer tail — and records the recovery duration. Snapshots land in `config/drop_log/` and survive reboots; the toggle is live, no restart needed.
-- **Boot-time band re-apply** — the persisted config is re-applied automatically at every boot (pre-unlock, no app needed); config-file absent = no-op.
+- **Boot-time band re-apply** — the persisted config is re-applied automatically at every boot (pre-unlock, no app needed); config-file absent = no-op. There is no UI toggle to disable the boot re-apply. To stop it, delete `config/bands.json` — but note the server re-seeds the carrier default on Rogers (302720) devices, so there the re-apply resumes at the next server start or `POST /api/boot-apply` call.
 - **Carrier-aware defaults** — Rogers (302720) gets a curated whitelist; other carriers get unrestricted defaults until you lock bands.
 - **RSRP graph UI** — the web UI plots signal strength over time.
 - **Config persistence** — band settings are mirrored to `/data/adb/modules/bandctl/config/bands.json` and survive reboots.
@@ -95,8 +96,8 @@ LTE bands **7 and 66 are intentionally disabled** — a community-validated fix 
 ## Development / testing
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
-- Server tests: **64/64 passing**; diag protocol tests: **2/2 passing** (`python3 test_server.py` / `python3 test_diag_client.py`).
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot), and `tools/check_release_zip.py` (release gate: run `python3 tools/check_release_zip.py bandctl-*.zip` before publishing — it fails a zip missing the bundled interpreter, whose `diag/protocol.py` differs from the tested copy, or whose `_ssl`/`_hashlib` DT_NEEDED closure is unsatisfiable on bionic).
+- Tests: **264/264 passing** (`python3 -m pytest test_server.py test_diag_client.py test_diag_protocol.py -q`).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot), and `tools/check_release_zip.py` (release gate: run `python3 tools/check_release_zip.py bandctl-*.zip` before publishing — it fails a zip missing the bundled interpreter, whose `diag/protocol.py` differs from the tested copy, or whose `_ssl`/`_hashlib` DT_NEEDED closure is unsatisfiable on bionic).
 
 ## License
 
