@@ -5,3 +5,4 @@ __pycache__/
 qmi/test_qmi_band
 qmi/test_qmi_band.dSYM/
 node_modules/
+node_modules/
