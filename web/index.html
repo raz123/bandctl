@@ -463,6 +463,10 @@ em { font-style: normal; color: var(--muted); font-size: 0.8125rem; }
   background: rgba(242,85,90,0.14);
   color: var(--danger);
 }
+.tag.NET {
+  background: rgba(245,181,68,0.16);
+  color: var(--warn);
+}
 
 /* ============ SETTINGS ============ */
 .set-row {
@@ -853,6 +857,7 @@ button, input { font: inherit; }
 .hist-item { grid-template-columns: 46px 70px minmax(0, 1fr); }
 .tag { display: inline-flex; justify-content: center; min-height: 24px; padding: 4px 5px; border-radius: 6px; background: #e9f6e8; color: var(--success); font-size: 10px; font-weight: 750; letter-spacing: 0; text-transform: uppercase; }
 .tag.DROP { background: #fff0ee; color: var(--danger); }
+.tag.NET { background: #fdf3e0; color: var(--warn); }
 .hist-text { min-width: 0; color: var(--ink); font-size: 11px; line-height: 1.35; }
 .modem-reset { width: 100%; min-height: 52px; margin-top: 16px !important; border-color: var(--danger); border-radius: 8px; background: var(--bg); color: var(--danger); font-size: 16px; font-weight: 650; }
 .modem-reset:hover { background: #fff0ee; }
@@ -931,7 +936,7 @@ button, input { font: inherit; }
     </div>
     <div class="connection-line" id="connection-line">
       <span class="live-dot" aria-hidden="true"></span>
-      <strong id="connection-state">Connected</strong>
+      <strong id="connection-state">Connecting&hellip;</strong>
     </div>
   </div>
 </header>
@@ -947,9 +952,9 @@ button, input { font: inherit; }
 <!-- ============ BAND MANAGEMENT ============ -->
 <div id="panel-bands" class="tab-panel active" role="tabpanel" aria-labelledby="tab-bands">
   <div class="live-strip" aria-label="Current modem state">
-    <div><span>Modem</span><strong class="good" id="band-live-service">Connected</strong></div>
+    <div><span>Modem</span><strong id="band-live-service">&hellip;</strong></div>
     <div><span>Serving</span><strong id="band-live-camped">—</strong></div>
-    <div><span>Staged</span><strong id="staged-count">0 LTE / 0 NR</strong></div>
+    <div><span>Staged</span><strong id="staged-count">—</strong></div>
   </div>
   <section class="section">
     <div class="section-heading"><h2>LTE Bands</h2><span class="count" id="lte-count"></span></div>
@@ -960,7 +965,7 @@ button, input { font: inherit; }
     <div id="nr-bands" class="band-grid"></div>
   </section>
   <div class="button-stack">
-    <button type="button" class="btn primary" id="save-btn">Save &amp; Apply</button>
+    <button type="button" class="btn primary" id="save-btn" disabled>Save &amp; Apply</button>
     <div class="btn-row">
       <button type="button" class="btn ghost" id="reset-btn">Reset to defaults</button>
       <button type="button" class="btn ghost" id="refresh-btn">Refresh from modem</button>
@@ -1009,7 +1014,7 @@ button, input { font: inherit; }
 <!-- ============ SETTINGS ============ -->
 <div id="panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings">
   <section class="section">
-    <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="12" height="16" rx="2"></rect><path d="M9 5V3h6v2M9 11h6M9 15l1.5 1.5L13 14"></path></svg><span>Config Summary</span></h2><span class="meta">Applied</span></div>
+    <div class="section-heading"><h2 class="section-title"><svg class="section-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="12" height="16" rx="2"></rect><path d="M9 5V3h6v2M9 11h6M9 15l1.5 1.5L13 14"></path></svg><span>Config Summary</span></h2><span class="meta" id="config-summary-meta">&mdash;</span></div>
     <div class="setting-list">
       <div class="set-row"><span>LTE bands</span><b id="sum-lte">0</b></div>
       <div class="set-row"><span>NR bands</span><b id="sum-nr">0</b></div>
@@ -1104,25 +1109,65 @@ button, input { font: inherit; }
 <script>
 'use strict';
 
-/* ============ API contract (FIXED) ============ */
-// The module python server always listens on 127.0.0.1:8080, whether this
-// page is served by that server directly (desktop browser) or from the
-// Manager WebView (https://mui.kernelsu.org/... via WebViewAssetLoader).
-// The Manager allows cleartext to loopback, so the fetch below reaches the
-// python server in both cases — no protocol detection needed.
-var API_BASE = 'http://127.0.0.1:8080';
-var API_READ = API_BASE + '/api/read?action=read';
-var API_WRITE = API_BASE + '/api/write?action=write';
-var API_SIGNAL = API_BASE + '/api/signal?action=signal';
-var API_REG = API_BASE + '/api/registration?action=registration';
-var API_RESET = API_BASE + '/api/modem-reset?action=modem-reset';
-var API_EXPORT = API_BASE + '/api/export?action=export';
-var API_DEFAULTS = API_BASE + '/api/defaults?action=defaults';
-var API_CAMPING = API_BASE + '/api/band-camping?action=band-camping';
-var API_SETTINGS = API_BASE + '/api/settings?action=settings';
-var API_DROP_LOG = API_BASE + '/api/drop-log?action=drop-log';
-var API_RESTART = API_BASE + '/api/restart?action=restart';
-var API_HEALTH = API_BASE + '/api/health?action=health';
+/* ============ API contract ============ */
+// Endpoint paths; apiFetch() prepends the resolved base. The module python
+// server always listens on 127.0.0.1:8080, but when this page was served by
+// that server over the network (LAN mode, e.g. http://<phone-ip>:8080/) the
+// API must go back to the same origin — hardcoding loopback would send a
+// laptop's requests to the laptop's own loopback instead of the phone
+// (A-004). Container schemes (KSU Manager WebView, appassets://) keep the
+// phone-loopback base; resolveApiBase() probes the page origin's /api/health
+// to tell the two apart (the module server answers JSON, containers don't).
+var API_READ = '/api/read?action=read';
+var API_WRITE = '/api/write?action=write';
+var API_SIGNAL = '/api/signal?action=signal';
+var API_REG = '/api/registration?action=registration';
+var API_RESET = '/api/modem-reset?action=modem-reset';
+var API_EXPORT = '/api/export?action=export';
+var API_DEFAULTS = '/api/defaults?action=defaults';
+var API_CAMPING = '/api/band-camping?action=band-camping';
+var API_SETTINGS = '/api/settings?action=settings';
+var API_DROP_LOG = '/api/drop-log?action=drop-log';
+var API_RESTART = '/api/restart?action=restart';
+var API_HEALTH = '/api/health?action=health';
+
+var API_LOOPBACK_BASE = 'http://127.0.0.1:8080';
+var resolvedApiBase = null;
+var resolvingApiBase = null;
+function resolveApiBase() {
+  if (resolvedApiBase) return Promise.resolve(resolvedApiBase);
+  if (resolvingApiBase) return resolvingApiBase;
+  var loc = window.location;
+  if (loc.protocol === 'http:' || loc.protocol === 'https:') {
+    var h = loc.hostname;
+    if (h !== '127.0.0.1' && h !== 'localhost' && h !== '::1') {
+      // Non-loopback HTTP(S): the page may be served by the module server
+      // (LAN mode) or by a container (KSU Manager WebView). Probe the page
+      // origin — only the module server answers JSON on /api/health.
+      var originBase = loc.protocol + '//' + loc.host;
+      var probeCtrl = new AbortController();
+      var probeTimer = setTimeout(function () { probeCtrl.abort(); }, 5000);
+      resolvingApiBase = fetch(originBase + '/api/health?action=health', { signal: probeCtrl.signal })
+        .then(function (r) {
+          var ct = r.headers.get('content-type') || '';
+          return ct.indexOf('application/json') >= 0 ? originBase : API_LOOPBACK_BASE;
+        })
+        .catch(function () { return API_LOOPBACK_BASE; })
+        .then(function (base) {
+          clearTimeout(probeTimer);
+          resolvedApiBase = base;
+          resolvingApiBase = null;
+          return base;
+        });
+      return resolvingApiBase;
+    }
+  }
+  resolvedApiBase = API_LOOPBACK_BASE;
+  return Promise.resolve(resolvedApiBase);
+}
+
+var FETCH_TIMEOUT_MS = 15000; // A-084: no request may hang the UI forever
+var POLL_FAIL_LIMIT = 3;      // consecutive poll failures before serverDown
 
 var SIGNAL_MS = 2000;   // poll /api/signal every 2s
 var REG_MS = 2000;      // poll /api/registration every 2s
@@ -1163,13 +1208,21 @@ var defaultsLte = DEFAULT_LTE;
 var defaultsNr = DEFAULT_NR;
 var carrierInfo = null; // {carrier:'rogers'|'other', operator?, lte?, nr?} from /api/defaults
 var userTouched = false; // true once the user changes the selection; guards refreshes from clobbering it
+var bootstrapped = false; // true once an authoritative config (modem read or carrier defaults) is in hand
 var serverDownReported = false;
+var radioOutage = false;  // A-102: last registration reported an explicit service-loss state
+var consecutivePollFailures = 0; // A-025: single-endpoint hiccups must not stop every monitor
+var suppressOutageLog = false;    // A-190: user-initiated restart — don't log the expected outage
+var retrying = false;             // A-110: guard against concurrent retryConnect loops
+var signalSeq = 0;  // A-124: monotonic guard so stale signal polls can't overwrite newer data
+var regSeq = 0;     // registration counterpart of signalSeq
+var campSeq = 0;    // A-132: band-camping counterpart
+var settingsSeq = 0; // A-125: stale settings GET must not roll back a newer LAN change
 var signalTimer = null;
 var regTimer = null;
 var campTimer = null;
 var signalHistory = [];   // {t: epoch_ms, rsrp: number|null}
 var lastReg = null;       // {service, net, transports}
-var regPollSeq = 0;       // A-123: only the newest in-flight registration poll may apply
 var userInitiatedOp = false; // A-193: reset/restart in flight — suppress DROP tags
 var toastTimer = null;
 var HISTORY_KEY = 'bandController.history.v1'; // A-182: persisted event history
@@ -1181,14 +1234,24 @@ function fmtClock() {
   return [d.getHours(), d.getMinutes(), d.getSeconds()].map(function (x) { return String(x).padStart(2, '0'); }).join(':');
 }
 function fmtTime(ts) { return new Date(ts).toLocaleTimeString(); }
-function setConnectionState(connected) {
+// Connection indicator is DERIVED, not "HTTP request succeeded" (A-102):
+// green "Connected" only when the server is reachable, the radio is not in
+// an explicit service-loss state, and bootstrap has completed (A-089).
+function applyConnectionState() {
   var line = $('connection-line');
   var label = $('connection-state');
   var live = $('band-live-service');
+  var text, connected;
+  if (serverDownReported) { text = 'Offline'; connected = false; }
+  else if (radioOutage) { text = 'No service'; connected = false; }
+  else if (!bootstrapped) { text = 'Connecting\u2026'; connected = false; }
+  else { text = 'Connected'; connected = true; }
   if (line) line.classList.toggle('offline', !connected);
-  if (label) label.textContent = connected ? 'Connected' : 'Offline';
-  if (live) live.textContent = connected ? 'Connected' : 'Offline';
-  if (live) live.classList.toggle('good', connected);
+  if (label) label.textContent = text;
+  if (live) {
+    live.textContent = text;
+    live.classList.toggle('good', connected);
+  }
 }
 
 /* ============ Tabs ============ */
@@ -1251,8 +1314,17 @@ async function loadBands() {
   if (btn) { btn.textContent = 'Loading\u2026'; btn.classList.add('loading'); }
   try {
     var r = await apiFetch(API_READ);
+    if (r.status === 401) {
+      // A-203: auth failure is not a server outage — apiFetch already
+      // surfaced the re-auth prompt. Never show the unreachable banner or
+      // log a drop for a server that is up but rejecting the token.
+      showStatus('Authentication required — enter the access token in Settings', true);
+      return false;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    bootstrapped = true; // mark authoritative BEFORE rendering so the first
+    // paint after a successful read already reflects the loaded state
     if (userTouched) {
       // Never clobber an in-progress selection: keep the user's bands, but
       // still reflect the live source/summary.
@@ -1265,7 +1337,8 @@ async function loadBands() {
       serverDownReported = false;
       hideBanner();
     }
-    setConnectionState(true);
+    consecutivePollFailures = 0;
+    applyConnectionState();
     startPolling();
     showStatus('Loaded from modem (' + source + ') — ' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR bands');
     return true;
@@ -1273,9 +1346,12 @@ async function loadBands() {
     serverDown(e);
     if (userTouched) {
       showStatus('Failed to load: ' + e.message + ' — your selection was kept', true);
+    } else if (bootstrapped) {
+      // A-117: a failed refresh must never discard the last known
+      // configuration — keep the visible selection, explain the failure.
+      showStatus('Failed to load: ' + e.message + ' — keeping the last known configuration', true);
     } else {
       showStatus('Failed to load: ' + e.message, true);
-      applyDefaults();
     }
     return false;
   } finally {
@@ -1289,26 +1365,51 @@ async function saveBands() {
   var origText = btn.textContent;
   btn.textContent = 'Saving\u2026';
   btn.classList.add('loading');
-  var data = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
+  var snapshot = { lte: Array.from(lteEnabled), nr: Array.from(nrEnabled) };
+  function selectionChanged() {
+    return lteEnabled.size !== snapshot.lte.length ||
+      nrEnabled.size !== snapshot.nr.length ||
+      snapshot.lte.some(function (b) { return !lteEnabled.has(String(b)); }) ||
+      snapshot.nr.some(function (b) { return !nrEnabled.has(String(b)); });
+  }
   try {
     var r = await apiFetch(API_WRITE, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
+      body: JSON.stringify(snapshot)
     });
+    if (r.status === 401) {
+      // A-203: auth failure — server is up, credentials are stale.
+      showStatus('Authentication required — enter the access token in Settings', true);
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     if (d.ok) {
       source = d.source || source;
-      showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
-      // Confirm applied state by polling /api/read once
-      try {
-        var r2 = await apiFetch(API_READ);
-        if (r2.ok) {
-          var d2 = await r2.json();
-          applyConfig(d2.lte, d2.nr, d2.source);
-        }
-      } catch (e2) { /* confirmation read is best-effort */ }
+      if (selectionChanged()) {
+        // A-091/A-202: the user edited the grid while the apply was in
+        // flight — never let the confirmation read-back clobber the newer
+        // selection. Keep the newer edits staged for the next Save.
+        showStatus('Applied the earlier selection — your newer edits are still staged (press Save & Apply again).', false);
+        updateSummary();
+      } else {
+        // A-023: a successful save means the visible selection now matches
+        // the modem; clear the dirty guard so later refreshes show the
+        // modem's actual state instead of a stale in-memory copy.
+        userTouched = false;
+        // Confirm applied state by polling /api/read once — safe now that
+        // the in-memory selection still equals what was submitted.
+        try {
+          var r2 = await apiFetch(API_READ);
+          if (r2.status === 401) { /* re-auth surfaced by apiFetch */ }
+          else if (r2.ok) {
+            var d2 = await r2.json();
+            applyConfig(d2.lte, d2.nr, d2.source);
+          }
+        } catch (e2) { /* confirmation read is best-effort */ }
+        showStatus('Applied (source: ' + source + ') — re-camping may take up to a minute.', false);
+      }
     } else {
       showStatus('Error: ' + (d.error || 'unknown'), true);
     }
@@ -1322,17 +1423,37 @@ async function saveBands() {
 }
 
 async function resetDefaults() {
-  // Re-fetch first so we never apply the unrestricted fallback on a
-  // carrier-aware device; abort cleanly when carrier data is unavailable.
-  var ok = await fetchDefaults();
-  if (!ok || !defaultsLte.length) {
-    showStatus('Carrier defaults unavailable — reset aborted; nothing was changed', true);
-    toast('Carrier defaults unavailable — reset aborted', true);
-    return;
+  var btn = $('reset-btn');
+  var origHTML = btn ? btn.innerHTML : '';
+  var touchedAtStart = userTouched;
+  // A-113: lock the control while the carrier lookup is pending so a
+  // slow response cannot silently overwrite an edit made during the await.
+  if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+  try {
+    // Re-fetch first so we never apply the unrestricted fallback on a
+    // carrier-aware device; abort cleanly when carrier data is unavailable.
+    var ok = await fetchDefaults();
+    if (!ok || !defaultsLte.length) {
+      showStatus('Carrier defaults unavailable — reset aborted; nothing was changed', true);
+      toast('Carrier defaults unavailable — reset aborted', true);
+      return;
+    }
+    if (userTouched && !touchedAtStart) {
+      // A-113: the user edited the grid while the lookup was pending —
+      // keep the newer edits; they can press Reset again deliberately.
+      showStatus('Defaults loaded — your newer edits were kept; press Reset again to apply defaults', false);
+      return;
+    }
+    // A-008: reset is a user-initiated change — mark it touched so a
+    // later Refresh from the modem doesn't silently replace the reset,
+    // and so the summary renders as Staged, not Applied.
+    userTouched = true;
+    applyDefaults();
+    showStatus('Defaults loaded (' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR). Press Save & Apply to push to the modem.', false);
+    toast('Defaults loaded — press Save & Apply');
+  } finally {
+    if (btn) { btn.classList.remove('loading'); btn.disabled = false; btn.innerHTML = origHTML; }
   }
-  applyDefaults();
-  showStatus('Defaults loaded (' + lteEnabled.size + ' LTE, ' + nrEnabled.size + ' NR). Press Save & Apply to push to the modem.', false);
-  toast('Defaults loaded — press Save & Apply');
 }
 
 /* ============ Polling lifecycle ============ */
@@ -1360,7 +1481,7 @@ function serverDown(err) {
   if (serverDownReported) return;
   serverDownReported = true;
   stopPolling();
-  setConnectionState(false);
+  applyConnectionState();
   showBanner();
   // A-193: a restart the user triggered takes the server down on
   // purpose — the banner shows that, the history must not call it a DROP.
@@ -1368,19 +1489,42 @@ function serverDown(err) {
     logEntry('REG', 'Server restarting (user-initiated)');
     return;
   }
-  logDrop('Server unreachable — ' + (err && err.message ? err.message : String(err)));
+  // A-090/A-190: transport/auth outages are NET events, not radio DROPs —
+  // the event history records observed service losses only. A user-initiated
+  // server restart suppresses even that (the outage is expected there).
+  if (!suppressOutageLog) {
+    logEntry('NET', 'Server unreachable — ' + (err && err.message ? err.message : String(err)));
+  }
+  suppressOutageLog = false;
+}
+// A-025: a transient failure in ONE diagnostic endpoint must not freeze the
+// other monitors. Failures count up; only a sustained outage (all endpoints
+// failing) trips serverDown. Any success resets the counter.
+function pollFailure(e) {
+  if (serverDownReported) return;
+  consecutivePollFailures += 1;
+  if (consecutivePollFailures >= POLL_FAIL_LIMIT) serverDown(e);
 }
 function retryConnect() {
   var btn = $('retry-btn');
-  var origText = btn ? btn.textContent : '';
+  // A-110: guard against concurrent recovery loops — disable the control
+  // for the duration and ignore taps while a retry chain is in flight.
+  if (retrying || (btn && btn.disabled)) return;
+  retrying = true;
+  if (btn) { btn.disabled = true; btn.textContent = 'Retrying\u2026'; btn.classList.add('loading'); }
   var attempts = 0;
   var MAX_ATTEMPTS = 3; // initial try + 2 retries (~1.5s apart)
-  if (btn) { btn.textContent = 'Retrying\u2026'; btn.classList.add('loading'); }
   function attempt() {
     loadBands().then(function (ok) {
       if (ok) {
-        startPolling(); // timers were stopped by serverDown — resume them
-        if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+        // A-069: reconnect must also refresh the panels that were only read
+        // once at init — defaults/carrier, LAN settings, and drop-log state.
+        consecutivePollFailures = 0;
+        fetchDefaults();
+        fetchSettings();
+        fetchDropLog();
+        retrying = false;
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; btn.classList.remove('loading'); }
         return;
       }
       attempts += 1;
@@ -1388,7 +1532,8 @@ function retryConnect() {
         setTimeout(attempt, 1500);
       } else {
         // Still unreachable — the server-down banner stays up.
-        if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+        retrying = false;
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; btn.classList.remove('loading'); }
       }
     });
   }
@@ -1396,22 +1541,29 @@ function retryConnect() {
 }
 
 async function pollSignal() {
+  var seq = ++signalSeq;
   try {
     var r = await apiFetch(API_SIGNAL);
+    if (r.status === 401) return; // auth failure — re-auth surfaced; not an outage
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    // A-092/A-124: drop stale or out-of-order responses — a slow older poll
+    // must not overwrite newer diagnostics or resurrect a dead connection.
+    if (seq !== signalSeq || serverDownReported) return;
+    consecutivePollFailures = 0;
     var now = Date.now();
-    signalHistory.push({ t: now, rsrp: (d.rsrp_dbm == null ? null : d.rsrp_dbm) });
+    var ts = d.timestamp != null ? Number(d.timestamp) : now;
+    signalHistory.push({ t: ts, rsrp: (d.rsrp_dbm == null ? null : d.rsrp_dbm) });
     if (signalHistory.length > GRAPH_POINTS) signalHistory.shift();
     $('sig-rsrp').textContent = d.rsrp_dbm == null ? '—' : d.rsrp_dbm;
     $('sig-rsrq').textContent = d.rsrq_db == null ? '—' : d.rsrq_db;
     $('sig-tech').textContent = d.tech || '—';
     $('sig-level').textContent = d.level == null ? '—' : String(d.level);
     $('sig-time').textContent = fmtTime(d.timestamp || now);
-    setConnectionState(true);
+    applyConnectionState();
     drawGraph();
   } catch (e) {
-    serverDown(e);
+    if (seq === signalSeq) pollFailure(e);
   }
 }
 
@@ -1419,18 +1571,25 @@ async function pollRegistration() {
   // A-123: dumpsys reads take seconds and the threaded server can return
   // them out of order. Only the newest in-flight poll may apply its
   // response — and only it may declare the server down.
-  var seq = ++regPollSeq;
+  var seq = ++regSeq;
   try {
     var r = await apiFetch(API_REG);
+    if (r.status === 401) return; // auth failure — re-auth surfaced; not an outage
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
-    if (seq !== regPollSeq) return; // stale response — drop it
+    // A-092: never publish a stale/out-of-order poll after the server was
+    // declared down, and never let an older response overwrite newer chips.
+    if (seq !== regSeq || serverDownReported) return;
+    consecutivePollFailures = 0;
     updateChips(d);
     checkRegChange(d);
-    setConnectionState(true);
+    // A-102: connection state derives from the radio, not HTTP success — an
+    // explicit service-loss state (OUT_OF_SERVICE, EMERGENCY_ONLY, ...) must
+    // paint the app "No service", never green "Connected".
+    if (d.service_state) radioOutage = !!SVC_BAD[d.service_state];
+    applyConnectionState();
   } catch (e) {
-    if (seq !== regPollSeq) return; // stale failure — a newer poll decides
-    serverDown(e);
+    if (seq === regSeq) pollFailure(e);
   }
 }
 
@@ -1491,10 +1650,16 @@ function renderCamping(samples) {
     (latest.band == null ? 'EARFCN ' + latest.earfcn : 'B' + latest.band + ' · ' + latest.earfcn);
 }
 async function updateCamping() {
+  var seq = ++campSeq;
   try {
     var r = await apiFetch(API_CAMPING);
+    if (r.status === 401) return; // auth failure — re-auth surfaced; not an outage
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    // A-132: a slower older poll must not overwrite a newer camping result
+    // (or resurrect state after the server was declared down).
+    if (seq !== campSeq || serverDownReported) return;
+    consecutivePollFailures = 0;
     renderCamping(d && d.samples ? d.samples : []);
     var s = (d && d.samples && d.samples.length) ? d.samples[d.samples.length - 1] : null;
     if (!s || s.earfcn === null || s.earfcn === undefined) {
@@ -1712,14 +1877,20 @@ async function confirmModemReset() {
   closeModal('reset-modal');
   var btn = $('modem-reset-btn');
   if (!btn) return;
-  var origText = btn.textContent;
-  btn.textContent = 'Resetting\u2026';
+  // A-106: keep the inline SVG — restore via innerHTML, not textContent.
+  var origHTML = btn.innerHTML;
+  btn.innerHTML = 'Resetting\u2026';
   btn.classList.add('loading');
   // A-193: the reset powers the radio down on purpose — the transient
   // service loss must not be logged as a DROP. Cleared on next IN_SERVICE.
   userInitiatedOp = true;
   try {
     var r = await apiFetch(API_RESET, { method: 'POST' });
+    if (r.status === 401) {
+      // A-203: auth failure is not a server outage.
+      toast('Authentication required — enter the access token in Settings', true);
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     if (d.ok) {
@@ -1732,20 +1903,29 @@ async function confirmModemReset() {
     serverDown(e);
   } finally {
     btn.classList.remove('loading');
-    btn.textContent = origText;
+    btn.innerHTML = origHTML;
   }
 }
 
 /* ============ Settings: presets (localStorage) ============ */
 function getPresets() {
-  var raw = localStorage.getItem(PRESETS_KEY);
+  var raw;
+  // A-035: a WebView with blocked/disabled storage must not throw here —
+  // that would abort init before any modem state loads.
+  try { raw = localStorage.getItem(PRESETS_KEY); } catch (e) { return []; }
   if (!raw) return [];
   try {
     var p = JSON.parse(raw);
     return Array.isArray(p) ? p : [];
   } catch (e) { return []; }
 }
-function savePresets(p) { localStorage.setItem(PRESETS_KEY, JSON.stringify(p)); }
+function savePresets(p) {
+  // A-035: quota/blocked-storage errors must surface to the caller instead
+  // of closing the modal silently.
+  try { localStorage.setItem(PRESETS_KEY, JSON.stringify(p)); return true; }
+  catch (e) { return false; }
+}
+function presetBandCount(v) { return Array.isArray(v) ? v.length : 0; } // A-147
 function renderPresets() {
   var list = getPresets();
   var wrap = $('preset-list');
@@ -1760,9 +1940,9 @@ function renderPresets() {
   // fill text via textContent (safe against quotes in names)
   wrap.querySelectorAll('.preset-item').forEach(function (row, i) {
     var p = list[i];
-    if (!p) return;
-    row.querySelector('.preset-name').textContent = p.name;
-    row.querySelector('.preset-count').textContent = (p.lte || []).length + ' LTE / ' + (p.nr || []).length + ' NR';
+    if (!p || typeof p !== 'object') return;
+    row.querySelector('.preset-name').textContent = String(p.name == null ? 'Unnamed' : p.name);
+    row.querySelector('.preset-count').textContent = presetBandCount(p.lte) + ' LTE / ' + presetBandCount(p.nr) + ' NR';
   });
   $('preset-empty').style.display = list.length ? 'none' : 'block';
 }
@@ -1775,22 +1955,42 @@ function savePreset() {
 }
 function confirmSavePreset() {
   var name = ($('preset-name-input').value || '').trim();
-  if (!name) return;
+  if (!name) {
+    // A-222: an empty name was a silent no-op — give explicit feedback.
+    toast('Enter a name for the preset', true);
+    $('preset-name-input').focus();
+    return;
+  }
   closeModal('preset-modal');
   var list = getPresets();
   list.push({ name: name, lte: Array.from(lteEnabled), nr: Array.from(nrEnabled), savedAt: Date.now() });
-  savePresets(list);
+  if (!savePresets(list)) {
+    // A-035: storage failure — report it and leave the modal open so the
+    // user can retry or cancel instead of losing the typed name silently.
+    openModal('preset-modal');
+    toast('Could not save preset — browser storage is unavailable', true);
+    return;
+  }
   renderPresets();
   toast('Preset "' + name + '" saved');
 }
 function loadPreset(i) {
   var p = getPresets()[i];
   if (!p) return;
-  setBands(p.lte, p.nr);
+  // A-147: a malformed persisted record (e.g. lte: 1) must not crash the
+  // Load action with a TypeError — surface an actionable error instead.
+  if (!Array.isArray(p.lte) || !Array.isArray(p.nr)) {
+    toast('Preset "' + String(p.name == null ? '?' : p.name) + '" is corrupted — delete and recreate it', true);
+    return;
+  }
+  setBands(p.lte.map(String), p.nr.map(String));
   userTouched = true;
   renderBands();
   updateSummary();
   switchTab('bands');
+  // A-223: keep the tab bar in sync with location.hash so the previously
+  // active tab's button is not left a dead tap.
+  if (location.hash !== '#bands') location.hash = 'bands';
   toast('Preset "' + p.name + '" loaded — press Save & Apply to push');
 }
 function deletePreset(i) {
@@ -1798,7 +1998,10 @@ function deletePreset(i) {
   if (!list[i]) return;
   var name = list[i].name;
   list.splice(i, 1);
-  savePresets(list);
+  if (!savePresets(list)) {
+    toast('Could not delete preset — browser storage is unavailable', true);
+    return;
+  }
   renderPresets();
   toast('Preset "' + name + '" deleted');
 }
@@ -1846,8 +2049,9 @@ function exportConfig() {
 function onImportFile(file) {
   if (!file) return;
   var btn = $('import-btn');
-  var origText = btn ? btn.textContent : '';
-  if (btn) { btn.textContent = 'Importing\u2026'; btn.classList.add('loading'); }
+  // A-106: restore via innerHTML so the button's inline SVG icon survives.
+  var origHTML = btn ? btn.innerHTML : '';
+  if (btn) { btn.innerHTML = 'Importing\u2026'; btn.classList.add('loading'); }
   var reader = new FileReader();
   reader.onload = function () {
     try {
@@ -1856,18 +2060,23 @@ function onImportFile(file) {
       var lte = d.lte.map(String).filter(function (v) { return /^\d+$/.test(v); });
       var nr = d.nr.map(String).filter(function (v) { return /^\d+$/.test(v); });
       setBands(lte, nr);
+      // A-009: mark the selection touched so a concurrent/follow-up Refresh
+      // cannot clobber the imported config before it is applied.
+      userTouched = true;
       renderBands();
       updateSummary();
       switchTab('bands');
+      // A-223: keep the tab bar in sync with location.hash.
+      if (location.hash !== '#bands') location.hash = 'bands';
       toast('Config imported — ' + lte.length + ' LTE, ' + nr.length + ' NR bands. Press Save & Apply to push');
     } catch (e) {
       toast('Import failed: ' + e.message, true);
     }
-    if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+    if (btn) { btn.classList.remove('loading'); btn.innerHTML = origHTML; }
   };
   reader.onerror = function () {
     toast('Import failed: could not read file', true);
-    if (btn) { btn.classList.remove('loading'); btn.textContent = origText; }
+    if (btn) { btn.classList.remove('loading'); btn.innerHTML = origHTML; }
   };
   reader.readAsText(file);
   $('import-file').value = '';
@@ -1883,15 +2092,34 @@ function setStoredToken(t) {
   try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* ignore */ }
 }
 // Routes every API call through the bearer token when one is stored, and
-// surfaces 401s as a re-auth prompt instead of a generic failure.
+// surfaces 401s as a re-auth prompt instead of a generic failure. A-084:
+// every request gets a hard deadline so a stalled server can never leave a
+// control stuck in its loading state or a poll pending forever — the abort
+// rejects into the caller's existing catch/finally paths.
 function apiFetch(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
   var token = getStoredToken();
   if (token) opts.headers.Authorization = 'Bearer ' + token;
-  return fetch(path, opts).then(function (r) {
-    if (r.status === 401) showReAuth();
-    return r;
+  return resolveApiBase().then(function (base) {
+    var timer = null;
+    var ctrl = null;
+    if (typeof AbortController !== 'undefined' && !opts.signal) {
+      ctrl = new AbortController();
+      opts.signal = ctrl.signal;
+      timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT_MS);
+    }
+    return fetch(base + path, opts).then(
+      function (r) {
+        if (timer) clearTimeout(timer);
+        if (r.status === 401) showReAuth();
+        return r;
+      },
+      function (e) {
+        if (timer) clearTimeout(timer);
+        throw e;
+      }
+    );
   });
 }
 
@@ -1903,10 +2131,14 @@ function renderSettings(d) {
   $('lan-toggle').checked = lanEnabled;
   var sec = $('lan-token-section');
   sec.style.display = lanEnabled ? 'block' : 'none';
-  if (!lanEnabled) return;
+  if (!lanEnabled) {
+    // A-130: hiding the LAN panel must re-mask the token — a secret shown
+    // once must not reappear in full after a settings transition.
+    lanTokenShown = false;
+    return;
+  }
   var token = getStoredToken();
   if (token) {
-    $('lan-token-entry').style.display = 'none';
     renderTokenDisplay(token);
   } else {
     if ($('token-actions')) $('token-actions').style.display = 'none';
@@ -1916,6 +2148,10 @@ function renderSettings(d) {
   }
 }
 function renderTokenDisplay(token) {
+  // A-101: showing the masked token/actions and the paste form at the same
+  // time is a contradiction — the entry is hidden whenever a token exists.
+  var entry = $('lan-token-entry');
+  if (entry) entry.style.display = 'none';
   $('lan-token').textContent = lanTokenShown ? token : token.slice(0, 6) + '\u2026';
   $('lan-token-show').textContent = lanTokenShown ? 'Hide' : 'Show';
   $('lan-token-show').style.display = 'inline-block';
@@ -1987,21 +2223,33 @@ function saveLanToken() {
   setStoredToken(val);
   $('lan-token-input').value = '';
   lanTokenShown = false;
-  renderTokenDisplay(val);
+  renderTokenDisplay(val); // also hides the paste form (A-101)
   // The page may have stopped polling on the pre-token 401s — resume now.
   if (serverDownReported) {
     serverDownReported = false;
     hideBanner();
   }
+  consecutivePollFailures = 0;
+  applyConnectionState();
+  // A-067: entering the token must retry the bootstrap reads that 401'd
+  // earlier — otherwise the UI can claim it is connected while bands,
+  // carrier defaults, and drop-log state stay at their pre-auth fallback.
+  loadBands();
+  fetchDefaults();
+  fetchDropLog();
   startPolling();
   toast('Token saved');
 }
 // Best-effort: never blocks init; on failure leave the panel at its last state.
 function fetchSettings() {
+  var seq = ++settingsSeq;
   apiFetch(API_SETTINGS).then(function (r) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).then(function (d) {
+    // A-125: a delayed bootstrap GET must not roll back a newer LAN change
+    // (e.g. the user enabling LAN while this read was still in flight).
+    if (seq !== settingsSeq) return;
     renderSettings(d);
   }).catch(function () {
     // 401s are already surfaced by apiFetch (showReAuth); network errors
@@ -2052,6 +2300,7 @@ function toggleDropLog() {
   });
 }
 async function toggleLan() {
+  var seq = ++settingsSeq; // A-125: invalidate any in-flight settings GET
   var checked = $('lan-toggle').checked;
   try {
     var r = await apiFetch(API_SETTINGS, {
@@ -2059,8 +2308,14 @@ async function toggleLan() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ lan_enabled: checked, regenerate: false })
     });
+    if (r.status === 401) {
+      toast('Authentication required — enter the access token first', true);
+      $('lan-toggle').checked = !checked; // revert the switch
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    if (seq !== settingsSeq) return; // superseded by a newer action
     if (d.token) setStoredToken(d.token);
     renderSettings(d);
     toast('Network access changed — restart the server to apply');
@@ -2069,15 +2324,24 @@ async function toggleLan() {
   }
 }
 async function regenerateToken() {
+  var seq = ++settingsSeq; // A-125
   try {
     var r = await apiFetch(API_SETTINGS, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ lan_enabled: true, regenerate: true })
     });
+    if (r.status === 401) {
+      toast('Authentication required — enter the access token first', true);
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    if (seq !== settingsSeq) return;
     if (d.token) setStoredToken(d.token);
+    // A-130: a regenerated token must start masked — a reveal from the old
+    // token must not carry over to the new secret.
+    lanTokenShown = false;
     renderSettings(d);
     toast('New token generated');
   } catch (e) {
@@ -2101,6 +2365,9 @@ async function restartServer() {
   // log a DROP — this restart is deliberate, so suppress DROP tags until
   // the next IN_SERVICE poll clears the flag.
   userInitiatedOp = true;
+  // A-190: this outage is user-initiated and expected — don't record it as
+  // a false "DROP"/NET event in Event History.
+  suppressOutageLog = true;
   try {
     var r = await apiFetch(API_RESTART, { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2108,17 +2375,51 @@ async function restartServer() {
     // The server may already be tearing down — the health poll below decides.
   }
   var ok = await waitForHealth();
+  suppressOutageLog = false;
+  if (ok && serverDownReported) {
+    // The polls may have tripped the server-down state during the bounce —
+    // resume monitoring and re-sync the panels instead of leaving the user
+    // staring at a banner next to a "Server restarted" toast.
+    serverDownReported = false;
+    hideBanner();
+    consecutivePollFailures = 0;
+    applyConnectionState();
+    loadBands();
+    fetchDefaults();
+    fetchSettings();
+    fetchDropLog();
+  }
   toast(ok ? 'Server restarted' : 'Server restarted — health check timed out', !ok);
 }
 
 /* ============ Summary ============ */
 function updateSummary() {
-  $('sum-lte').textContent = lteEnabled.size;
-  $('sum-nr').textContent = nrEnabled.size;
-  $('sum-source').textContent = source;
-  $('lte-count').textContent = lteEnabled.size + ' active';
-  $('nr-count').textContent = nrEnabled.size + ' active';
-  if ($('staged-count')) $('staged-count').textContent = lteEnabled.size + ' LTE / ' + nrEnabled.size + ' NR';
+  var known = bootstrapped || userTouched;
+  $('sum-lte').textContent = known ? lteEnabled.size : '—';
+  $('sum-nr').textContent = known ? nrEnabled.size : '—';
+  $('sum-source').textContent = known ? source : '—';
+  $('lte-count').textContent = known ? lteEnabled.size + ' active' : '';
+  $('nr-count').textContent = known ? nrEnabled.size + ' active' : '';
+  // A-089: never present an empty "0 LTE / 0 NR" as real state before the
+  // first authoritative config arrives.
+  if ($('staged-count')) $('staged-count').textContent = known ? lteEnabled.size + ' LTE / ' + nrEnabled.size + ' NR' : '—';
+  updateApplyMeta();
+  updateSaveState();
+}
+// A-007: the Config Summary status label must reflect staging state — a
+// changed-but-not-applied selection is "Staged", not "Applied".
+function updateApplyMeta() {
+  var meta = $('config-summary-meta');
+  if (!meta) return;
+  if (userTouched) meta.textContent = 'Staged — not applied';
+  else if (bootstrapped) meta.textContent = 'Applied';
+  else meta.textContent = '—';
+}
+// A-089: Save & Apply stays disabled until there is something real to save
+// (bootstrap completed or the user made an explicit selection).
+function updateSaveState() {
+  var btn = $('save-btn');
+  if (btn) btn.disabled = !(bootstrapped || userTouched);
 }
 function updateCarrierRow() {
   var el = $('sum-carrier');
@@ -2137,13 +2438,28 @@ function updateCarrierRow() {
 // Resolves true when carrier-aware defaults are in hand, false on failure.
 function fetchDefaults() {
   return apiFetch(API_DEFAULTS).then(function (r) {
+    if (r.status === 401) throw new Error('auth required'); // surfaced by apiFetch
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).then(function (d) {
-    if (d.lte && d.lte.length) defaultsLte = d.lte.map(String);
-    if (d.nr && d.nr.length) defaultsNr = d.nr.map(String);
+    // A-070: an HTTP-200 body can still be an application error — only a
+    // well-formed defaults payload may update the lists. Otherwise reset
+    // Defaults must abort instead of applying the unrestricted fallback.
+    if (!d || d.error || !Array.isArray(d.lte) || !Array.isArray(d.nr)) {
+      throw new Error('invalid defaults payload');
+    }
+    defaultsLte = d.lte.map(String);
+    defaultsNr = d.nr.map(String);
     carrierInfo = d;
     updateCarrierRow();
+    // A-109: if the modem read hasn't succeeded yet (and the user hasn't
+    // touched the selection), stage the carrier-aware defaults — a transient
+    // bootstrap read failure must not leave a carrier on the unrestricted
+    // fallback once the authoritative lookup succeeds.
+    if (!userTouched && !bootstrapped && lteEnabled.size === 0 && nrEnabled.size === 0) {
+      bootstrapped = true;
+      applyDefaults();
+    }
     return true;
   }).catch(function () {
     // server unreachable — keep DEFAULT_* fallback, carrier row stays "—"
@@ -2224,6 +2540,20 @@ function init() {
   $('drop-log-toggle').addEventListener('change', toggleDropLog);
   window.addEventListener('hashchange', onHash);
   window.addEventListener('resize', drawGraph);
+  // A-114: telemetry polling must pause when the page is hidden (Settings
+  // tab in a WebView, app backgrounded) and resume on return — no point
+  // hammering dumpsys while nothing the user can see needs the data.
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      stopPolling();
+    } else if (!serverDownReported) {
+      startPolling();
+    }
+  });
+  window.addEventListener('pagehide', stopPolling);
+  window.addEventListener('pageshow', function () {
+    if (!serverDownReported) startPolling();
+  });
 
   onHash();
   renderPresets();
