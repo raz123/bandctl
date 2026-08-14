@@ -2,7 +2,7 @@
   "name": "bandctl-webui-tests",
   "version": "1.0.0",
   "private": true,
-  "description": "DEV-ONLY jsdom regression harness for web/index.html client-side behavior. Not part of the shipped module (the module ships bundled Python; no Node runtime).",
+  "description": "DEV-ONLY jsdom regression harness for web/index.html (behavior + a11y suites). Not part of the shipped module (the module ships bundled Python; no Node runtime).",
   "type": "commonjs",
   "scripts": {
     "test": "node tests/js/run.js"
