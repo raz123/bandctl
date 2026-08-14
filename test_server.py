@@ -751,7 +751,9 @@ class TestExport(SettingsFileCase):
 
 
 class TestWriteConfigMirror(unittest.TestCase):
-    """A-189: a valid-but-failed apply still mirrors the config file."""
+    """A-189 superseded by A-68: a failed apply is never promoted to
+    boot-time source of truth, so the config file is not mirrored on
+    failure."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -762,15 +764,14 @@ class TestWriteConfigMirror(unittest.TestCase):
         server.CONFIG_FILE = self._orig
         self._tmp.cleanup()
 
-    def test_failed_apply_mirrors_config_file(self):
+    def test_failed_apply_not_mirrored(self):
         h = server.BandHandler.__new__(server.BandHandler)
         with mock.patch.object(h, "_apply_bands",
                                return_value=(False, "diag",
                                              "diag write failed")):
             res = h.write_config({"lte": [1, 2], "nr": [77]})
         self.assertFalse(res["ok"])
-        self.assertEqual(json.loads(server.CONFIG_FILE.read_text()),
-                         {"lte": [1, 2], "nr": [77]})
+        self.assertFalse(server.CONFIG_FILE.exists())
 
 
 class TestCors(unittest.TestCase):
@@ -903,6 +904,16 @@ class TestBandValidation(unittest.TestCase):
         res = self.h.write_config({"lte": [0], "nr": []})
         self.assertFalse(res["ok"])
         self.assertIn("error", res)
+
+    def test_wrong_rat_namespace_rejected(self):
+        """A-131: an NR-only band must not be accepted in lte, and an
+        LTE-only band must not be accepted in nr."""
+        bands, err = self.h._validate_bands({"lte": [77], "nr": []})
+        self.assertIsNone(bands)
+        self.assertIn("LTE band catalog", err)
+        bands, err = self.h._validate_bands({"lte": [1], "nr": [4]})
+        self.assertIsNone(bands)
+        self.assertIn("NR band catalog", err)
 
 
 class TestBootApply(unittest.TestCase):
@@ -1079,6 +1090,8 @@ class TestModemReset(unittest.TestCase):
              mock.patch.object(server, '_wait_for_radio_state',
                                return_value=True), \
              mock.patch.object(server, '_wait_for_radio_recovery',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_radio_on',
                                return_value=True):
             status, payload = self._reset()
         self.assertEqual(status, 200)
@@ -1113,7 +1126,9 @@ class TestModemReset(unittest.TestCase):
              mock.patch.object(server, '_wait_for_radio_recovery',
                                return_value=True), \
              mock.patch.object(server, '_disable_airplane',
-                               return_value=True) as disable:
+                               return_value=True) as disable, \
+             mock.patch.object(server, '_wait_radio_on',
+                               return_value=True):
             status, payload = self._reset()
         self.assertTrue(payload['ok'])
         disable.assert_called_once()
@@ -1125,6 +1140,8 @@ class TestModemReset(unittest.TestCase):
                                side_effect=lambda s, sub: s == 'connectivity'), \
              mock.patch.object(server, '_run_cmd'), \
              mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_radio_on',
                                return_value=True), \
              mock.patch.object(server, '_wait_for_radio_recovery',
                                return_value=False), \
@@ -1162,6 +1179,87 @@ class TestModemReset(unittest.TestCase):
             status, payload = self._reset()
         self.assertFalse(payload['ok'])
         self.assertIn('airplane mode left on', payload['error'])
+
+    def test_radio_path_on_not_verified_fails(self):
+        """A-20: the preferred path must not certify success until the
+        radio verifiably leaves POWER_OFF again after power-on."""
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'phone'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_radio_on',
+                               return_value=False):
+            status, payload = self._reset()
+        self.assertEqual(status, 200)
+        self.assertFalse(payload['ok'])
+        self.assertIn('did not power back on', payload['error'])
+
+    def test_preferred_ineffective_falls_back_to_airplane(self):
+        """A-137: a listed-but-ineffective radio power command must not
+        block the airplane-mode fallback."""
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: True), \
+             mock.patch.object(server, '_run_cmd') as run, \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               side_effect=[False, True]), \
+             mock.patch.object(server, '_airplane_on',
+                               return_value=None), \
+             mock.patch.object(server, '_disable_airplane',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_radio_on',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_for_radio_recovery',
+                               return_value=True):
+            status, payload = self._reset()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['ok'])
+        cmds = [c.args[0] for c in run.call_args_list]
+        self.assertTrue(any('airplane-mode' in c for c in cmds),
+                        "airplane-mode fallback was not attempted: {}".format(cmds))
+
+    def test_airplane_already_on_is_restored_not_cleared(self):
+        """A-62: a pre-existing airplane-mode choice survives the reset —
+        the fallback restores it instead of turning connectivity back on."""
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'connectivity'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_airplane_on',
+                               return_value=True), \
+             mock.patch.object(server, '_disable_airplane') as disable:
+            status, payload = self._reset()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['ok'])
+        disable.assert_not_called()
+
+    def test_airplane_path_radio_stays_off_fails(self):
+        """A-148: the fallback must not report success while the radio is
+        still POWER_OFF after cleanup."""
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'connectivity'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_airplane_on',
+                               return_value=False), \
+             mock.patch.object(server, '_disable_airplane',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_radio_on',
+                               return_value=False):
+            status, payload = self._reset()
+        self.assertEqual(status, 200)
+        self.assertFalse(payload['ok'])
+        self.assertIn('did not power back on', payload['error'])
+
+    def test_disable_airplane_unverifiable_prop_fails(self):
+        """A-46: cleanup whose verification is unavailable (getprop
+        failure -> None) must never be certified as success."""
+        with mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_airplane_on', return_value=None), \
+             mock.patch.object(server.time, 'sleep'):
+            self.assertFalse(server._disable_airplane())
 
 
 class TestDropLog(unittest.TestCase):
@@ -1420,7 +1518,7 @@ class TestDumpsysParsers(unittest.TestCase):
                 "CellInfoLte:{mRegistered=YES mTimeStampType=2 "
                 "mCellIdentity=CellIdentityLte:{ mCi=210655 mPci=262 "
                 "mTac=6348 mEarfcn=2050 mBands=[4] mBandwidth=20000 }}\n}")
-        self.assertEqual(server._parse_band_camping(text), (2050, 4))
+        self.assertEqual(server._parse_band_camping(text), (2050, 4, "LTE"))
 
     def test_read_registration_unparseable_reports_error(self):
         """A-144 end-to-end: an all-null snapshot becomes an explicit
@@ -1815,10 +1913,12 @@ class TestTransportErrorStatus(unittest.TestCase):
 
     def test_health_degraded_stays_200(self):
         # A transport that answers but has no bands is degraded, not an
-        # error — the frontend must still render it.
+        # error — the frontend must still render it. QMI output must
+        # carry the success result TLV to be trusted (A-14).
         with mock.patch.object(server, '_run_qmi',
-                               return_value=(0, 'LTE bands: (none)\n'
-                                              'NR5G SA bands: (none)\n')):
+                               return_value=(0, '  result: status=0 SUCCESS\n'
+                                              '    LTE bands: (none)\n'
+                                              '    NR5G SA bands: (none)\n')):
             status, res = run_api('/api/health?action=health')
         self.assertEqual(status, 200)
         self.assertEqual(res['status'], 'degraded')
@@ -2119,29 +2219,29 @@ class TestBandCampingRead(unittest.TestCase):
         self.assertEqual(
             server._parse_band_camping(
                 "mCellIdentity=CellIdentityLte:{ mEarfcn=2147483647, mBands=[4] }"),
-            (None, None))
+            (None, None, None))
 
     def test_earfcn_out_of_domain_not_a_cell(self):
         self.assertEqual(
             server._parse_band_camping(
                 "mCellIdentity=CellIdentityLte:{ mEarfcn=70000, mBands=[4] }"),
-            (None, None))
+            (None, None, None))
 
     def test_invalid_band_identities_rejected(self):
         self.assertEqual(
             server._parse_band_camping(
                 "mCellIdentity=CellIdentityLte:{ mEarfcn=2050, mBands=[0] }"),
-            (2050, None))
+            (2050, None, "LTE"))
         self.assertEqual(
             server._parse_band_camping(
                 "mCellIdentity=CellIdentityLte:{ mEarfcn=2050, mBands=[999] }"),
-            (2050, None))
+            (2050, None, "LTE"))
 
     def test_valid_cell_parsed(self):
         self.assertEqual(
             server._parse_band_camping(
                 "mCellIdentity=CellIdentityLte:{ mEarfcn=2050, mBands=[4] }"),
-            (2050, 4))
+            (2050, 4, "LTE"))
 
 
 class TestCampingLogBounded(unittest.TestCase):
@@ -2186,7 +2286,7 @@ class TestCampingLogBounded(unittest.TestCase):
             self.assertTrue(server._band_camping_sample())
         line = server.BAND_CAMPING_LOG.read_text().strip()
         parts = line.split(',')
-        self.assertEqual(parts[1:], ['2050', '4'])
+        self.assertEqual(parts[1:], ['2050', '4', 'LTE'])
         self.assertTrue(parts[0].isdigit())
 
 
@@ -2405,11 +2505,376 @@ class TestQmiNrSort(unittest.TestCase):
 
     def test_nr_sorted_numerically(self):
         out = ("    LTE bands: 1 2\n"
-               "    NR5G SA bands: 1 10\n"
+               "    NR5G SA bands: 1 20\n"
                "    NR5G NSA bands: 2 3\n")
         parsed = server._parse_qmi_get(out)
-        self.assertEqual(parsed['nr'], ['1', '2', '3', '10'])
+        self.assertEqual(parsed['nr'], ['1', '2', '3', '20'])
         self.assertEqual(parsed['lte'], ['1', '2'])
+
+
+class ConfigFileCase(unittest.TestCase):
+    """Point CONFIG_FILE (and the write revision) at a temp dir so read/
+    write/boot-apply tests are deterministic and never touch the checkout."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.CONFIG_FILE
+        self._orig_rev = server._CONFIG_REV
+        server.CONFIG_FILE = Path(self._tmp.name) / "bands.json"
+        server._CONFIG_REV = 0
+
+    def tearDown(self):
+        server.CONFIG_FILE = self._orig
+        server._CONFIG_REV = self._orig_rev
+        self._tmp.cleanup()
+
+
+class TestQmiParse(unittest.TestCase):
+    """A-122/A-145: QMI output parsing — base+extension union and the
+    LTE/NR catalog filter."""
+
+    def test_unions_base_and_extension_masks(self):
+        out = ("  result: status=0 error=0x0000 SUCCESS\n"
+               "    LTE bands: 1 3 12 \n"
+               "    NR5G SA bands: 1 77 \n"
+               "    LTE bands: 66 \n"
+               "    NR5G SA bands: 78 \n"
+               "    NR5G NSA bands: 79 \n")
+        parsed = server._parse_qmi_get(out)
+        self.assertEqual(parsed["lte"], ["1", "3", "12", "66"])
+        self.assertEqual(parsed["nr"], ["1", "77", "78", "79"])
+
+    def test_filters_out_of_catalog_nr_bands(self):
+        """A-145: an NR band above the catalog (e.g. 257) is dropped so
+        the reported set can always be displayed and re-applied."""
+        out = "    LTE bands: 1 3 12 \n    NR5G SA bands: 257 77 \n"
+        parsed = server._parse_qmi_get(out)
+        self.assertEqual(parsed["lte"], ["1", "3", "12"])
+        self.assertEqual(parsed["nr"], ["77"])
+
+    def test_filters_out_of_catalog_lte_bands(self):
+        out = "    LTE bands: 1 77 \n"  # 77 is an NR-only band
+        parsed = server._parse_qmi_get(out)
+        self.assertEqual(parsed["lte"], ["1"])
+
+    def test_no_lte_line_returns_none(self):
+        self.assertIsNone(server._parse_qmi_get("    NR5G SA bands: 77 \n"))
+
+
+class TestQmiRead(ConfigFileCase):
+    """A-14/A-44: failed or partial QMI reads must never be authoritative."""
+
+    def setUp(self):
+        super().setUp()
+        self.h = server.BandHandler.__new__(server.BandHandler)
+
+    def test_successful_qmi_read(self):
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, "  result: status=0 SUCCESS\n"
+                                               "    LTE bands: 1 3 \n"
+                                               "    NR5G SA bands: 77 \n")):
+            res = self.h._read_qmi_config()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "qmi")
+        self.assertEqual(res["lte"], ["1", "3"])
+        self.assertEqual(res["nr"], ["77"])
+        self.assertIn("rev", res)
+
+    def test_nonzero_exit_not_authoritative(self):
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(1, "    LTE bands: 1 3 \n")):
+            self.assertIsNone(self.h._read_qmi_config())
+
+    def test_failure_status_not_authoritative(self):
+        """A-14: a status=1 response that still contains mask TLVs must
+        not be parsed as a valid read."""
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, "  result: status=1 error=0x0002 FAILURE\n"
+                                               "    LTE bands: 1 3 \n")):
+            self.assertIsNone(self.h._read_qmi_config())
+
+    def test_read_config_falls_through_on_qmi_failure(self):
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, "    LTE bands: 1 3 \n")), \
+             mock.patch.object(server, 'read_bands',
+                               side_effect=OSError("no diag")):
+            res = self.h.read_config()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "default")
+
+    def test_health_ignores_qmi_failure_status(self):
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, "  result: status=1 FAILURE\n"
+                                               "    LTE bands: 1 3 \n")), \
+             mock.patch.object(server, 'read_bands',
+                               side_effect=OSError("no diag")):
+            res = self.h.modem_health()
+        self.assertEqual(res["status"], "error")
+        self.assertNotEqual(res["transport"], "qmi")
+        self.assertIn("pid", res)
+
+
+class TestQmiWrite(unittest.TestCase):
+    """A-138/A-13: QMI apply certification — exit code, result TLV, and
+    read-back verification."""
+
+    def setUp(self):
+        self.h = server.BandHandler.__new__(server.BandHandler)
+
+    def test_nonzero_exit_with_success_output_rejected(self):
+        """A-138: printing `result: status=0` then exiting nonzero must
+        not certify a successful apply."""
+        with mock.patch.object(server, '_run_qmi',
+                               side_effect=[(7, "  result: status=0 SUCCESS\n"),
+                                            (0, "  result: status=0 SUCCESS\n    LTE bands: 1 3 \n")]):
+            ok = self.h._write_qmi_config([1, 3], [])
+        self.assertFalse(ok)
+
+    def test_failure_status_rejected(self):
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, "  result: status=1 FAILURE\n")):
+            self.assertFalse(self.h._write_qmi_config([1], []))
+
+    def test_readback_missing_requested_band_rejected(self):
+        """A-13: a SET that silently drops a requested band (the helper's
+        LTE mask cannot represent bands >64) must not be certified."""
+        with mock.patch.object(server, '_run_qmi',
+                               side_effect=[(0, "  result: status=0 SUCCESS\n"),
+                                            (0, "  result: status=0 SUCCESS\n    LTE bands: 1 3 \n"),
+                                            (0, "  result: status=0 SUCCESS\n    LTE bands: 1 3 \n")]), \
+             mock.patch.object(server.time, 'sleep'):
+            ok = self.h._write_qmi_config([1, 3, 66], [])
+        self.assertFalse(ok)
+
+    def test_readback_confirms_success(self):
+        with mock.patch.object(server, '_run_qmi',
+                               side_effect=[(0, "  result: status=0 SUCCESS\n"),
+                                            (0, "  result: status=0 SUCCESS\n    LTE bands: 1 3 66 \n    NR5G SA bands: 77 \n")]):
+            ok = self.h._write_qmi_config([1, 3, 66], [77])
+        self.assertTrue(ok)
+
+
+class TestWriteConfig(ConfigFileCase):
+    """write_config: mirror-only-on-success (A-68), save failure reported
+    (A-16), serialization + rev conflict (A-45/A-97)."""
+
+    def setUp(self):
+        super().setUp()
+        self.h = server.BandHandler.__new__(server.BandHandler)
+
+    def test_failed_apply_not_persisted(self):
+        """A-68: a failed apply must not be promoted to boot-time source
+        of truth."""
+        with mock.patch.object(self.h, '_apply_bands',
+                               return_value=(False, "diag", "diag write failed")):
+            res = self.h.write_config({"lte": [1], "nr": []})
+        self.assertFalse(res["ok"])
+        self.assertFalse(server.CONFIG_FILE.exists())
+
+    def test_save_failure_reported(self):
+        """A-16: a persistence failure must not return ok:true."""
+        with mock.patch.object(self.h, '_apply_bands',
+                               return_value=(True, "qmi", None)), \
+             mock.patch.object(self.h, '_save_config_file',
+                               side_effect=OSError("disk full")):
+            res = self.h.write_config({"lte": [1], "nr": []})
+        self.assertFalse(res["ok"])
+        self.assertIn("config save failed", res["error"])
+
+    def test_success_persists_and_increments_rev(self):
+        with mock.patch.object(self.h, '_apply_bands',
+                               return_value=(True, "qmi", None)):
+            res = self.h.write_config({"lte": [1, 3], "nr": [77]})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["rev"], 1)
+        saved = json.loads(server.CONFIG_FILE.read_text())
+        self.assertEqual(saved["lte"], [1, 3])
+        self.assertEqual(saved["nr"], [77])
+
+    def test_stale_rev_rejected_without_apply(self):
+        """A-97: a write based on an older read is rejected when another
+        client changed the config meanwhile."""
+        server._CONFIG_REV = 5
+        with mock.patch.object(self.h, '_apply_bands') as apply:
+            res = self.h.write_config({"lte": [1], "nr": [], "rev": 4})
+        self.assertFalse(res["ok"])
+        self.assertIn("changed by another client", res["error"])
+        apply.assert_not_called()
+
+
+class TestReadConfigFile(ConfigFileCase):
+    """_read_config_file validation (A-42), corruption reporting (A-149),
+    and the diag empty-read fallthrough (A-15)."""
+
+    def setUp(self):
+        super().setUp()
+        self.h = server.BandHandler.__new__(server.BandHandler)
+
+    def test_valid_file_normalized(self):
+        server.CONFIG_FILE.write_text(
+            json.dumps({"lte": ["1", "1", "3"], "nr": ["77"]}))
+        res = self.h._read_config_file()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "config_file")
+        self.assertEqual(res["lte"], ["1", "3"])
+
+    def test_out_of_catalog_band_reported(self):
+        """A-42: an invalid persisted file is reported, not trusted as the
+        live modem configuration."""
+        server.CONFIG_FILE.write_text(json.dumps({"lte": ["77"], "nr": []}))
+        res = self.h._read_config_file()
+        self.assertFalse(res["ok"])
+        self.assertIn("invalid config file", res["error"])
+
+    def test_corrupt_file_reported_not_defaults(self):
+        """A-149: malformed JSON must not silently become carrier
+        defaults."""
+        server.CONFIG_FILE.write_text("{truncated")
+        res = self.h._read_config_file()
+        self.assertFalse(res["ok"])
+        self.assertIn("config file corrupt", res["error"])
+
+    def test_missing_file_carrier_defaults(self):
+        res = self.h._read_config_file()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "default")
+
+    def test_diag_empty_read_falls_through(self):
+        """A-15: a failed/empty diag read must not be labelled as an
+        authoritative diag config."""
+        server.CONFIG_FILE.write_text(json.dumps({"lte": [1], "nr": []}))
+        with mock.patch.object(server, '_run_qmi', return_value=(None, "")), \
+             mock.patch.object(server, 'read_bands',
+                               return_value={'lte_bands': [], 'nr_bands': []}):
+            res = self.h.read_config()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "config_file")
+        self.assertEqual(res["lte"], ["1"])
+
+    def test_diag_read_success(self):
+        with mock.patch.object(server, '_run_qmi', return_value=(None, "")), \
+             mock.patch.object(server, 'read_bands',
+                               return_value={'lte_bands': [1, 3],
+                                             'nr_bands': [77]}):
+            res = self.h.read_config()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "diag")
+        self.assertEqual(res["lte"], ["1", "3"])
+
+
+class TestBandCamping(unittest.TestCase):
+    """A-30: NR serving-cell parsing, plus the existing LTE path."""
+
+    def test_lte_camping(self):
+        text = ("mCellInfo=CellInfoLte:{mRegistered=YES mTimeStamp=123 "
+                "mCellIdentity=CellIdentityLte:{mEarfcn=2050 mBands=[4]} }\n")
+        self.assertEqual(server._parse_band_camping(text), (2050, 4, "LTE"))
+
+    def test_nr_camping_with_mbands(self):
+        text = ("mCellInfo=CellInfoNr:{mRegistered=YES mTimeStamp=123 "
+                "mCellIdentity=CellIdentityNr:{mNrarfcn=633334 mBands=[78]} }\n")
+        self.assertEqual(server._parse_band_camping(text), (633334, 78, "NR"))
+
+    def test_nr_camping_arfcn_fallback(self):
+        text = "mCellIdentity=CellIdentityNr:{mNrarfcn=620000}\n"
+        self.assertEqual(server._parse_band_camping(text), (620000, 77, "NR"))
+
+    def test_no_cell_returns_none(self):
+        self.assertEqual(server._parse_band_camping("mWhatever=1\n"),
+                         (None, None, None))
+
+
+class TestBootApplyNoSeed(ConfigFileCase):
+    """A-119: a missing bands.json is a permanent skip — never re-seeded,
+    even when the operator property identifies Rogers."""
+
+    def test_missing_file_skips_even_on_rogers(self):
+        with mock.patch.object(server, '_get_prop', return_value="302720"):
+            res = server.BandHandler.boot_apply(None)
+        self.assertEqual(res, {"ok": True, "skipped": True})
+        self.assertFalse(server.CONFIG_FILE.exists())
+
+
+class TestRestartPid(unittest.TestCase):
+    """A-24/A-118: restart and health expose the server pid so a client
+    can prove a restart by observing a pid change."""
+
+    def test_restart_response_carries_pid(self):
+        with mock.patch.object(server.subprocess, 'Popen'):
+            res = server.BandHandler.restart_service(None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["pid"], os.getpid())
+
+    def test_health_carries_pid(self):
+        h = server.BandHandler.__new__(server.BandHandler)
+        with mock.patch.object(server, '_run_qmi',
+                               return_value=(0, "  result: status=0 SUCCESS\n"
+                                               "    LTE bands: 1 3 \n")):
+            res = h.modem_health()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["transport"], "qmi")
+        self.assertEqual(res["pid"], os.getpid())
+
+
+class TestDropLogRollback(unittest.TestCase):
+    """A-63: a failed drop-log persistence restores the in-memory value."""
+
+    def setUp(self):
+        self._orig = server.SETTINGS.get("drop_log")
+        server.SETTINGS["drop_log"] = True
+
+    def tearDown(self):
+        server.SETTINGS["drop_log"] = self._orig
+
+    def test_failed_save_restores_old_value(self):
+        with mock.patch.object(server, '_save_settings',
+                               side_effect=OSError("disk full")):
+            res = server.BandHandler.update_drop_log(None, {"enabled": False})
+        self.assertFalse(res["ok"])
+        self.assertTrue(server.SETTINGS["drop_log"])
+
+
+class TestDefaults(unittest.TestCase):
+    """A-58/A-186: crash-pair-free defaults and the carrier-detection
+    flag."""
+
+    def test_all_bands_default_excludes_crash_pair(self):
+        d = server.defaults_for_carrier("other")
+        self.assertNotIn("7", d["lte"])
+        self.assertNotIn("66", d["lte"])
+        self.assertNotIn("7", d["nr"])
+        self.assertNotIn("66", d["nr"])
+
+    def test_rogers_default_still_excludes_crash_pair(self):
+        d = server.defaults_for_carrier("rogers")
+        self.assertNotIn("66", d["lte"])
+
+    def test_read_defaults_flags_undetected_carrier(self):
+        """A-58: an unreadable operator property must not silently select
+        unrestricted defaults."""
+        with mock.patch.object(server, '_get_prop', return_value=""):
+            res = server.BandHandler.read_defaults(None)
+        self.assertFalse(res["carrier_detected"])
+        self.assertEqual(res["carrier"], "other")
+
+    def test_read_defaults_detected_rogers(self):
+        with mock.patch.object(server, '_get_prop',
+                               side_effect=lambda name: "302720"
+                               if "numeric" in name else "ROGERS"):
+            res = server.BandHandler.read_defaults(None)
+        self.assertTrue(res["carrier_detected"])
+        self.assertEqual(res["carrier"], "rogers")
+
+
+class TestAtomicDirFsync(SettingsFileCase):
+    """A-141: the atomic writer fsyncs the parent directory after the
+    rename so the replacement survives a crash (file fsync + dir fsync)."""
+
+    def test_save_fsyncs_file_and_directory(self):
+        with mock.patch("os.fsync") as fsync:
+            server.SETTINGS["bind"] = "0.0.0.0"
+            server._save_settings()
+        self.assertGreaterEqual(fsync.call_count, 2)
 
 
 if __name__ == '__main__':
