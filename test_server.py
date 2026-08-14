@@ -17,7 +17,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import ExitStack
 from io import BytesIO
 from pathlib import Path
 from unittest import mock
@@ -1031,6 +1033,8 @@ class TestModemReset(unittest.TestCase):
                                side_effect=lambda s, sub: s == 'phone'), \
              mock.patch.object(server, '_run_cmd') as run, \
              mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_for_radio_recovery',
                                return_value=True):
             status, payload = self._reset()
         self.assertEqual(status, 200)
@@ -1038,17 +1042,55 @@ class TestModemReset(unittest.TestCase):
         cmds = [c.args[0][-1] for c in run.call_args_list]
         self.assertEqual(cmds, ['off', 'on'])
 
+    def test_radio_power_path_reports_unrecovered_state(self):
+        """A-197: a reset whose radio never returns to IN_SERVICE must
+        report ok:false with the observed post-reset state, not a fake
+        success."""
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'phone'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_for_radio_recovery',
+                               return_value=False), \
+             mock.patch.object(server, '_radio_reg_state',
+                               return_value='OUT_OF_SERVICE'):
+            status, payload = self._reset()
+        self.assertEqual(status, 200)
+        self.assertFalse(payload['ok'])
+        self.assertIn('OUT_OF_SERVICE', payload['error'])
+
     def test_airplane_path_success_disables_and_verifies(self):
         with mock.patch.object(server, '_cmd_available',
                                side_effect=lambda s, sub: s == 'connectivity'), \
              mock.patch.object(server, '_run_cmd'), \
              mock.patch.object(server, '_wait_for_radio_state',
                                return_value=True), \
+             mock.patch.object(server, '_wait_for_radio_recovery',
+                               return_value=True), \
              mock.patch.object(server, '_disable_airplane',
                                return_value=True) as disable:
             status, payload = self._reset()
         self.assertTrue(payload['ok'])
         disable.assert_called_once()
+
+    def test_airplane_path_reports_unrecovered_state(self):
+        """A-197: airplane fallback also waits for IN_SERVICE before
+        claiming success."""
+        with mock.patch.object(server, '_cmd_available',
+                               side_effect=lambda s, sub: s == 'connectivity'), \
+             mock.patch.object(server, '_run_cmd'), \
+             mock.patch.object(server, '_wait_for_radio_state',
+                               return_value=True), \
+             mock.patch.object(server, '_wait_for_radio_recovery',
+                               return_value=False), \
+             mock.patch.object(server, '_radio_reg_state',
+                               return_value='POWER_OFF'), \
+             mock.patch.object(server, '_disable_airplane',
+                               return_value=True):
+            status, payload = self._reset()
+        self.assertFalse(payload['ok'])
+        self.assertIn('POWER_OFF', payload['error'])
 
     def test_airplane_mid_toggle_failure_still_cleans_up(self):
         def boom(cmd, timeout=None):
@@ -1149,10 +1191,10 @@ class TestDropLog(unittest.TestCase):
         self.assertIn('call_state: 0', text)
         self.assertIn('wifi: Wifi is enabled', text)
         self.assertIn('counters:', text)
-        # A-185: the snapshot must NOT persist raw radio-buffer lines
-        # (IMSI/phone numbers) — an explicit privacy marker replaces them.
-        self.assertIn('radio tail: omitted', text)
-        self.assertNotIn('PHONE0', text)
+        # A-185/A-219: the snapshot must NOT persist raw radio-buffer
+        # lines (IMSI/phone numbers) — a redacted count marker replaces
+        # them, never the PHONE0 payload itself.
+        self.assertIn('omitted (privacy redacted)', text)
         self.assertNotIn('REG_HOME', text)
 
 
@@ -1178,6 +1220,520 @@ class TestShippedIndexHtml(unittest.TestCase):
         parser = HTMLParser()
         parser.feed(html.decode('utf-8', 'replace'))
         parser.close()
+
+
+# --- Real-format dumpsys fixtures (A-184/A-208/A-209) -------------------
+# Drawn from the modem_logs/ captures: nested braces in the mServiceState
+# object, dual-RAT blocks, IWLAN transport entries, and the collapse block.
+
+REAL_REG_HEALTHY = (
+    "    mCallState=0\n"
+    "    mServiceState={mVoiceRegState=0(IN_SERVICE), mDataRegState=0(IN_SERVICE), "
+    "mChannelNumber=3150, duplexMode()=1, mCellBandwidths=[20000], "
+    "mOperatorAlphaLong=ROGERS, mOperatorAlphaShort=ROGERS, "
+    "isManualNetworkSelection=false(automatic), getRilVoiceRadioTechnology=14(LTE), "
+    "getRilDataRadioTechnology=14(LTE), mCssIndicator=unsupported, mNetworkId=-1, "
+    "mSystemId=-1, mCdmaRoamingIndicator=-1, mCdmaDefaultRoamingIndicator=-1, "
+    "mIsEmergencyOnly=false, isUsingCarrierAggregation=false, mArfcnRsrpBoost=0, "
+    "mNetworkRegistrationInfos=[NetworkRegistrationInfo{ domain=PS "
+    "transportType=WLAN registrationState=NOT_REG_OR_SEARCHING "
+    "mInitialRegistrationState=NOT_REG_OR_SEARCHING roamingType=NOT_ROAMING "
+    "accessNetworkTechnology=IWLAN rejectCause=0 emergencyEnabled=false "
+    "availableServices=[] cellIdentity=null voiceSpecificInfo=null "
+    "dataSpecificInfo=null nrState=**** rRplmn= isUsingCarrierAggregation=false}], "
+    "mNrFrequencyRange=0, mOperatorAlphaLongRaw=ROGERS, mOperatorAlphaShortRaw=ROGERS, "
+    "mIsDataRoamingFromRegistration=false, mIsIwlanPreferred=false}\n"
+    "    mSignalStrength=SignalStrength:{mCdma=CellSignalStrengthCdma: cdmaDbm=2147483647 "
+    "cdmaEcio=2147483647 evdoDbm=2147483647 evdoEcio=2147483647 evdoSnr=2147483647 level=0,"
+    "mGsm=CellSignalStrengthGsm: rssi=2147483647 ber=2147483647 mTa=2147483647 mLevel=0,"
+    "mWcdma=CellSignalStrengthWcdma: ss=2147483647 ber=2147483647 rscp=2147483647 ecno=2147483647 level=0,"
+    "mTdscdma=CellSignalStrengthTdscdma: rssi=2147483647 ber=2147483647 rscp=2147483647 level=0,"
+    "mLte=CellSignalStrengthLte: rssi=-71 rsrp=-105 rsrq=-13 rssnr=15 "
+    "cqiTableIndex=2147483647 cqi=2147483647 ta=2147483647 level=3 parametersUseForLevel=0,"
+    "mNr=CellSignalStrengthNr:{ csiRsrp = 2147483647 csiRsrq = 2147483647 "
+    "csiCqiTableIndex = 2147483647 csiCqiReport = [] ssRsrp = 2147483647 ssRsrq = 2147483647 "
+    "ssSinr = 2147483647 ssCqiTableIndex = 2147483647 ssCqiReport = [] level = 0 }}\n"
+)
+
+REAL_REG_COLLAPSED = (
+    "    mCallState=0\n"
+    "    mServiceState={mVoiceRegState=1(OUT_OF_SERVICE), mDataRegState=1(OUT_OF_SERVICE), "
+    "mChannelNumber=0, duplexMode()=0, mCellBandwidths=[], mOperatorAlphaLong=null, "
+    "mOperatorAlphaShort=null, isManualNetworkSelection=false(automatic), "
+    "getRilVoiceRadioTechnology=0(Unknown), getRilDataRadioTechnology=0(Unknown), "
+    "mCssIndicator=unsupported, mNetworkId=0, mSystemId=0, mCdmaRoamingIndicator=0, "
+    "mCdmaDefaultRoamingIndicator=0, mIsEmergencyOnly=false, "
+    "isUsingCarrierAggregation=false, mArfcnRsrpBoost=0, mNetworkRegistrationInfos=[], "
+    "mNrFrequencyRange=0, mOperatorAlphaLongRaw=null, mOperatorAlphaShortRaw=null, "
+    "mIsDataRoamingFromRegistration=false, mIsIwlanPreferred=false}\n"
+    "    mSignalStrength=SignalStrength:{mCdma=CellSignalStrengthCdma: cdmaDbm=2147483647 "
+    "cdmaEcio=2147483647 evdoDbm=2147483647 evdoEcio=2147483647 evdoSnr=2147483647 level=0,"
+    "mLte=CellSignalStrengthLte: rssi=2147483647 rsrp=2147483647 rsrq=2147483647 "
+    "rssnr=2147483647 cqiTableIndex=2147483647 cqi=2147483647 ta=2147483647 level=0 "
+    "parametersUseForLevel=0,mNr=CellSignalStrengthNr:{ csiRsrp = 2147483647 "
+    "csiRsrq = 2147483647 csiCqiTableIndex = 2147483647 csiCqiReport = [] "
+    "ssRsrp = 2147483647 ssRsrq = 2147483647 ssSinr = 2147483647 "
+    "ssCqiTableIndex = 2147483647 ssCqiReport = [] level = 0 }}\n"
+)
+
+# Compact drop/non-drop registration dicts for watchdog tests.
+_DROP_REG = {"service_state": "OUT_OF_SERVICE", "data_state": "OUT_OF_SERVICE",
+             "network_type": "Unknown", "operator": None, "roaming": None}
+_GOOD_REG = {"service_state": "IN_SERVICE", "data_state": "IN_SERVICE",
+             "network_type": "LTE", "operator": "ROGERS", "roaming": False}
+
+
+class _SeqTime(object):
+    """Fake time module for watchdog tests: monotonic returns a scripted
+    sequence, strftime a fixed stamp, so durations and refreshes are
+    deterministic (A-154)."""
+
+    def __init__(self, monos):
+        self._monos = list(monos)
+
+    def monotonic(self):
+        if not self._monos:
+            raise StopIteration("monotonic sequence exhausted")
+        return self._monos.pop(0)
+
+    def strftime(self, fmt, t=None):
+        return "2026-08-13 00:00:00"
+
+    def time(self):
+        return 1750000000.0
+
+    def sleep(self, s):
+        pass
+
+
+class TestDumpsysParsers(unittest.TestCase):
+    """A-184: the UI-facing dumpsys parsers (signal object/legacy,
+    registration object/legacy, band camping) — both format branches
+    guarded against the format drift an Android update can cause."""
+
+    def test_parse_signal_object_modern(self):
+        parsed = server._parse_signal_strength(REAL_REG_HEALTHY)
+        self.assertEqual(parsed["tech"], "LTE")
+        self.assertEqual(parsed["rsrp_dbm"], -105)
+        self.assertEqual(parsed["rsrq_db"], -13)
+        self.assertEqual(parsed["level"], 3)
+
+    def test_parse_signal_object_rejects_all_invalid(self):
+        parsed = server._parse_signal_strength(REAL_REG_COLLAPSED)
+        self.assertIsNone(parsed)
+
+    def test_parse_signal_legacy_flat_list(self):
+        text = "SignalStrength: 99 0 99 99 99 99 99 -71 -111 -13 15 2 1\n"
+        parsed = server._parse_signal_strength(text)
+        self.assertEqual(parsed["tech"], "LTE")
+        self.assertEqual(parsed["rsrp_dbm"], -111)
+        self.assertEqual(parsed["rsrq_db"], -13)
+        self.assertEqual(parsed["level"], 3)  # -111 -> threshold band 3
+
+    def test_parse_registration_modern_object(self):
+        reg = server._parse_registration(REAL_REG_HEALTHY)
+        self.assertEqual(reg["service_state"], "IN_SERVICE")
+        self.assertEqual(reg["data_state"], "IN_SERVICE")
+        self.assertEqual(reg["network_type"], "LTE")
+        self.assertEqual(reg["operator"], "ROGERS")
+        self.assertFalse(reg["roaming"])
+
+    def test_parse_registration_modern_collapsed(self):
+        reg = server._parse_registration(REAL_REG_COLLAPSED)
+        self.assertEqual(reg["service_state"], "OUT_OF_SERVICE")
+        self.assertEqual(reg["data_state"], "OUT_OF_SERVICE")
+        self.assertEqual(reg["network_type"], "Unknown")
+        self.assertIsNone(reg["operator"])
+
+    def test_parse_registration_legacy_flat(self):
+        text = ("mServiceState=ServiceState: 0 0 true home ROGERS 302720 LTE\n"
+                "mRoaming=1\nmNetworkType=13\nmOperatorAlphaLong=ROGERS\n")
+        reg = server._parse_registration(text)
+        self.assertEqual(reg["service_state"], "IN_SERVICE")
+        self.assertEqual(reg["data_state"], "IN_SERVICE")
+        self.assertEqual(reg["network_type"], "LTE")
+        self.assertEqual(reg["operator"], "ROGERS")
+        self.assertTrue(reg["roaming"])
+
+    def test_parse_registration_unparseable_returns_none(self):
+        """A-144: an mServiceState block that parses nothing is a
+        telemetry failure, not an all-null success."""
+        for text in ("mServiceState={}\n",
+                     "mServiceState={mChannelNumber=3150}\n",
+                     "mServiceState=ServiceState: ???\n"):
+            self.assertIsNone(server._parse_registration(text), text)
+
+    def test_parse_registration_captures_iwlan_transport(self):
+        """A-208: the WLAN/IWLAN transport entry inside
+        mNetworkRegistrationInfos must survive into the parsed dict even
+        though the collapsed block reads getRil*Technology=0(Unknown)."""
+        reg = server._parse_registration(REAL_REG_HEALTHY)
+        self.assertEqual(reg["transports"],
+                         [{"transport": "WLAN", "tech": "IWLAN"}])
+
+    def test_parse_band_camping_object(self):
+        text = ("mCellInfo={mRegistered=YES\n"
+                "CellInfoLte:{mRegistered=YES mTimeStampType=2 "
+                "mCellIdentity=CellIdentityLte:{ mCi=210655 mPci=262 "
+                "mTac=6348 mEarfcn=2050 mBands=[4] mBandwidth=20000 }}\n}")
+        self.assertEqual(server._parse_band_camping(text), (2050, 4))
+
+    def test_read_registration_unparseable_reports_error(self):
+        """A-144 end-to-end: an all-null snapshot becomes an explicit
+        error response instead of a deceptively successful payload."""
+        with mock.patch.object(server, '_run_dumpsys',
+                               return_value="mServiceState={}\n"):
+            res = server.BandHandler.read_registration(None)
+        self.assertIn("error", res)
+
+
+class _SyncThread(object):
+    """Runs the target synchronously — for auto-recovery tests (A-196)
+    the spawned worker must complete before the poll returns."""
+
+    def __init__(self, target, daemon=None):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+class TestDropWatchdog(unittest.TestCase):
+    """A-209 family: the watchdog chain (detection -> snapshot ->
+    rotation -> recovery) driven through _drop_log_poll with real-format
+    registration dicts and fast intervals."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_dir = server.DROP_LOG_DIR
+        self._orig_gap = server.DROP_SNAP_GAP
+        self._orig_confirm = server.DROP_RECOVERY_CONFIRM
+        self._orig_max = server.DROP_LOG_MAX_FILES
+        self._orig_setting = server.SETTINGS.get("drop_log")
+        server.DROP_LOG_DIR = Path(self._tmp.name)
+        server.DROP_SNAP_GAP = 60
+        server.DROP_RECOVERY_CONFIRM = 2
+        server.DROP_LOG_MAX_FILES = 40
+        server.SETTINGS["drop_log"] = True
+        self._episode_counter = server._EPISODE_COUNTER
+
+    def tearDown(self):
+        server.DROP_LOG_DIR = self._orig_dir
+        server.DROP_SNAP_GAP = self._orig_gap
+        server.DROP_RECOVERY_CONFIRM = self._orig_confirm
+        server.DROP_LOG_MAX_FILES = self._orig_max
+        server.SETTINGS["drop_log"] = self._orig_setting
+        self._tmp.cleanup()
+
+    def _watch(self):
+        return server._DropWatch()
+
+    def _snapshot_stub(self, reg):
+        return "registration: {}\ncontext-stub\n".format(json.dumps(reg))
+
+    def _poll(self, w, reg, snap=None, fake_time=None):
+        """Run one watchdog poll with `reg` as the registration.
+        `snap` overrides the snapshot writer (None -> stub); `fake_time`
+        swaps in a scripted clock."""
+        patchers = [mock.patch.object(server, '_drop_state', return_value=reg)]
+        if snap is None:
+            patchers.append(mock.patch.object(
+                server, '_drop_snapshot_text', side_effect=self._snapshot_stub))
+        else:
+            patchers.append(mock.patch.object(
+                server, '_drop_snapshot_text', side_effect=snap))
+        if fake_time is not None:
+            patchers.append(mock.patch.object(server, 'time', fake_time))
+        with ExitStack() as stack:
+            for p in patchers:
+                stack.enter_context(p)
+            return server._drop_log_poll(w)
+
+    def _episode_files(self):
+        return sorted(p.name for p in Path(server.DROP_LOG_DIR).iterdir()
+                      if p.name.startswith("drop_"))
+
+    def test_real_format_chain_detection_to_recovery(self):
+        """A-209: the real-format registry (nested braces, dual-RAT
+        blocks, IWLAN entries) drives the full watchdog chain: detect on
+        the collapse, snapshot, recover with duration."""
+        w = self._watch()
+        self._poll(w, server._parse_registration(REAL_REG_COLLAPSED))
+        self.assertTrue(w.in_drop)
+        path = w.episode_file
+        self._poll(w, _GOOD_REG)
+        self._poll(w, _GOOD_REG)
+        self.assertFalse(w.in_drop)
+        text = path.read_text()
+        self.assertIn("=== DROP DETECTED", text)
+        self.assertIn("OUT_OF_SERVICE", text)
+        self.assertIn("=== RECOVERED", text)
+        self.assertIn("(duration", text)
+
+    def test_real_format_snapshot_includes_iwlan_transport(self):
+        """A-208/A-209: the snapshot written for the IWLAN phase carries
+        the WLAN transport context in the structured registration."""
+        w = self._watch()
+        self._poll(w, server._parse_registration(REAL_REG_HEALTHY),
+                   snap=server._drop_snapshot_text)  # real snapshot writer
+        self.assertTrue(w.in_drop)  # IWLAN transport = drop signature
+        text = w.episode_file.read_text()
+        self.assertIn("WLAN", text)
+        self.assertIn("IWLAN", text)
+
+    def test_telemetry_failure_is_not_recovery(self):
+        """A-053/A-181: a dumpsys failure (None) mid-episode must NOT
+        stamp RECOVERED or reset the episode — the state is unknown."""
+        w = self._watch()
+        self._poll(w, _DROP_REG)
+        self.assertTrue(w.in_drop)
+        path = w.episode_file
+        self._poll(w, None)  # telemetry failure
+        self.assertTrue(w.in_drop)
+        self.assertNotIn("RECOVERED", path.read_text())
+        # Recovery only on an explicit non-drop state.
+        self._poll(w, _GOOD_REG)
+        self._poll(w, _GOOD_REG)
+        self.assertFalse(w.in_drop)
+        self.assertIn("=== RECOVERED", path.read_text())
+
+    def test_data_only_outage_detected(self):
+        """A-085: data_state OUT_OF_SERVICE with voice IN_SERVICE is a
+        drop episode."""
+        w = self._watch()
+        reg = {"service_state": "IN_SERVICE", "data_state": "OUT_OF_SERVICE",
+               "network_type": "LTE", "operator": "ROGERS", "roaming": False}
+        self._poll(w, reg)
+        self.assertTrue(w.in_drop)
+
+    def test_service_emergency_detected(self):
+        """A-108: SERVICE_EMERGENCY opens a drop episode."""
+        w = self._watch()
+        reg = {"service_state": "SERVICE_EMERGENCY",
+               "data_state": "SERVICE_EMERGENCY",
+               "network_type": "Unknown", "operator": None, "roaming": None}
+        self._poll(w, reg)
+        self.assertTrue(w.in_drop)
+
+    def test_iwlan_transport_detected(self):
+        """A-176: an IWLAN/VoWiFi transport with both states IN_SERVICE
+        triggers the episode (the field drop signature)."""
+        w = self._watch()
+        reg = {"service_state": "IN_SERVICE", "data_state": "IN_SERVICE",
+               "network_type": "IWLAN", "operator": "ROGERS", "roaming": False}
+        self._poll(w, reg)
+        self.assertTrue(w.in_drop)
+
+    def test_long_episode_stays_one_file(self):
+        """A-059/A-187: refresh snapshots append to the SAME episode
+        file — no orphaned per-gap files, one recovery marker."""
+        server.DROP_SNAP_GAP = 1
+        w = self._watch()
+        # Three consecutive drop polls spanning the snap gap (monotonic
+        # 1000 -> 1001.5 -> 1003: two refreshes, one file).
+        fake = _SeqTime([1000.0, 1001.5, 1003.0, 1004.0, 1005.0])
+        for _ in range(3):
+            self._poll(w, _DROP_REG, fake_time=fake)
+        path = w.episode_file
+        self._poll(w, _GOOD_REG, fake_time=fake)
+        self._poll(w, _GOOD_REG, fake_time=fake)
+        files = self._episode_files()
+        self.assertEqual(len(files), 1)
+        text = path.read_text()
+        self.assertIn("snapshot refresh", text)
+        self.assertEqual(text.count("=== RECOVERED"), 1)
+
+    def test_same_second_episodes_get_unique_files(self):
+        """A-128: two episodes in the same wall second must not share a
+        file (unique per-process episode id in the name)."""
+        w = self._watch()
+        self._poll(w, _DROP_REG)
+        path1 = w.episode_file
+        self._poll(w, _GOOD_REG)
+        self._poll(w, _GOOD_REG)
+        self._poll(w, _DROP_REG)
+        path2 = w.episode_file
+        self._poll(w, _GOOD_REG)
+        self._poll(w, _GOOD_REG)
+        self.assertEqual(len(self._episode_files()), 2)
+        self.assertNotEqual(path1.name, path2.name)
+
+    def test_disable_mid_episode_closes_with_duration(self):
+        """A-093: turning drop logging off during an episode writes a
+        duration-bearing closure marker instead of discarding it."""
+        w = self._watch()
+        self._poll(w, _DROP_REG)
+        path = w.episode_file
+        server.SETTINGS["drop_log"] = False
+        with mock.patch.object(server, '_drop_state', return_value=_DROP_REG):
+            server._drop_log_poll(w)
+        self.assertFalse(w.in_drop)
+        text = path.read_text()
+        self.assertIn("=== EPISODE CLOSED", text)
+        self.assertIn("(duration", text)
+
+    def test_recovery_append_failure_keeps_episode(self):
+        """A-115: the RECOVERED marker is written BEFORE episode state
+        is cleared — a failed append leaves the episode open for retry
+        instead of losing the recovery boundary."""
+        w = self._watch()
+        self._poll(w, _DROP_REG)
+        path = w.episode_file
+
+        def failing_open(*a, **k):
+            raise OSError("disk full")
+
+        with mock.patch.object(server, '_drop_state', return_value=_GOOD_REG), \
+             mock.patch('server.open', side_effect=failing_open), \
+             mock.patch.object(server, '_drop_snapshot_text',
+                               side_effect=self._snapshot_stub):
+            with self.assertRaises(OSError):
+                server._drop_log_poll(w)  # recovery poll 1 (no write yet)
+                server._drop_log_poll(w)  # recovery poll 2 (append fails)
+        # Episode state survives the failed append.
+        self.assertTrue(w.in_drop)
+        self.assertEqual(w.episode_file, path)
+        self.assertNotIn("RECOVERED", path.read_text())
+        # Next poll retries and succeeds.
+        self._poll(w, _GOOD_REG)
+        self.assertFalse(w.in_drop)
+        self.assertIn("=== RECOVERED", path.read_text())
+
+    def test_blip_requires_two_confirmed_polls(self):
+        """A-199: a single IN_SERVICE blip between drops must not close
+        the episode; recovery needs DROP_RECOVERY_CONFIRM consecutive
+        non-drop polls."""
+        w = self._watch()
+        self._poll(w, _DROP_REG)   # episode opens
+        path = w.episode_file
+        self._poll(w, _GOOD_REG)   # blip — recovery_polls=1
+        self.assertTrue(w.in_drop)
+        self.assertNotIn("RECOVERED", path.read_text())
+        self._poll(w, _DROP_REG)   # still dropping — blip discarded
+        self.assertTrue(w.in_drop)
+        self._poll(w, _GOOD_REG)   # 1
+        self._poll(w, _GOOD_REG)   # 2 -> recovered
+        self.assertFalse(w.in_drop)
+        self.assertIn("=== RECOVERED", path.read_text())
+
+    def test_duration_uses_monotonic_not_wall_clock(self):
+        """A-154: duration derives from time.monotonic, so a backward
+        wall-clock step between detection and recovery cannot persist a
+        negative duration."""
+        w = self._watch()
+        # Detection at mono 1000, recovery at mono 1120 -> 120s even
+        # though wall-clock strftime stays fixed (a frozen/backward clock).
+        fake = _SeqTime([1000.0, 1060.0, 1120.0])
+        self._poll(w, _DROP_REG, fake_time=fake)   # detection
+        path = w.episode_file
+        self._poll(w, _GOOD_REG, fake_time=fake)   # poll 1
+        self._poll(w, _GOOD_REG, fake_time=fake)   # poll 2 -> recovered
+        self.assertFalse(w.in_drop)
+        text = path.read_text()
+        self.assertIn("(duration 120s)", text)
+        self.assertNotIn("duration -", text)
+
+    def test_reconcile_orphaned_episode_on_startup(self):
+        """A-188: a restart mid-episode leaves an active marker; startup
+        reconcile closes the orphan with an INTERRUPTED line."""
+        os.makedirs(server.DROP_LOG_DIR, exist_ok=True)
+        name = "drop_20260813_000000_1_0.txt"
+        (server.DROP_LOG_DIR / name).write_text("=== DROP DETECTED ===\n")
+        marker = server.DROP_LOG_DIR / server._ACTIVE_EPISODE_FILE
+        marker.write_text(json.dumps({"file": name, "pid": 1}))
+        server._reconcile_open_episode()
+        text = (server.DROP_LOG_DIR / name).read_text()
+        self.assertIn("=== EPISODE INTERRUPTED", text)
+        self.assertFalse(marker.exists())
+
+    def test_rotation_caps_episode_files(self):
+        """A-043/A-207: the drop_log dir keeps only the newest
+        DROP_LOG_MAX_FILES episode files, never growing unbounded."""
+        os.makedirs(server.DROP_LOG_DIR, exist_ok=True)
+        for i in range(server.DROP_LOG_MAX_FILES + 5):
+            (server.DROP_LOG_DIR / "drop_20260813_{:04d}_1_{}.txt".format(
+                i, i)).write_text("x")
+        server._rotate_drop_log()
+        self.assertEqual(len(self._episode_files()), server.DROP_LOG_MAX_FILES)
+
+    def test_auto_recover_invoked_once_per_episode(self):
+        """A-196: after the grace period a sustained drop invokes the
+        modem reset once per episode (not once per poll)."""
+        calls = []
+        w = self._watch()
+        fake = _SeqTime([1000.0, 1001.0])
+        with mock.patch.object(server, '_modem_reset',
+                               side_effect=lambda: (calls.append(1),
+                                                    {"ok": True})), \
+             mock.patch.object(server, 'AUTO_RECOVER_GRACE', 0), \
+             mock.patch.object(server, '_AUTO_RECOVER_TIMES', []), \
+             mock.patch.object(server.threading, 'Thread', _SyncThread):
+            self._poll(w, _DROP_REG, fake_time=fake)   # opens episode, grace 0
+            self._poll(w, _DROP_REG, fake_time=fake)   # still dropping
+        self.assertEqual(len(calls), 1)  # once per episode, not per poll
+        self.assertTrue(w.auto_recover_attempted)
+
+    def test_auto_recover_rate_limited(self):
+        """A-196: no more than AUTO_RECOVER_MAX_PER_HOUR auto-recoveries
+        within the window."""
+        calls = []
+        w = self._watch()
+        fake = _SeqTime([1000.0])
+        with mock.patch.object(server, '_modem_reset',
+                               side_effect=lambda: (calls.append(1),
+                                                    {"ok": True})), \
+             mock.patch.object(server, 'AUTO_RECOVER_GRACE', 0), \
+             mock.patch.object(server, 'AUTO_RECOVER_MAX_PER_HOUR', 1), \
+             mock.patch.object(server, '_AUTO_RECOVER_TIMES', [990.0]), \
+             mock.patch.object(server.threading, 'Thread', _SyncThread):
+            self._poll(w, _DROP_REG, fake_time=fake)
+        self.assertEqual(len(calls), 0)  # window already exhausted
+
+
+class TestDropLogConcurrency(unittest.TestCase):
+    """A-116: the drop-log toggle mutation + save is one critical
+    section — concurrent toggles can never report a state that was not
+    the one persisted."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_file = server.SETTINGS_FILE
+        self._orig_settings = server.SETTINGS
+        server.SETTINGS_FILE = Path(self._tmp.name) / "settings.json"
+        server.SETTINGS = {"bind": "127.0.0.1", "token": None,
+                           "drop_log": False}
+
+    def tearDown(self):
+        server.SETTINGS_FILE = self._orig_file
+        server.SETTINGS = self._orig_settings
+        self._tmp.cleanup()
+
+    def test_concurrent_toggles_serialize_mutation_and_save(self):
+        results = []
+        errors = []
+
+        def toggle(enabled):
+            try:
+                res = server.BandHandler.update_drop_log(
+                    None, {"enabled": enabled})
+                results.append((enabled, res["enabled"]))
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=toggle, args=(v,))
+                   for v in (True, False) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        # Every response reported exactly the value its own request set.
+        for requested, reported in results:
+            self.assertEqual(requested, reported)
+        # Memory and disk agree on the final state.
+        self.assertEqual(
+            server.SETTINGS["drop_log"],
+            json.loads(server.SETTINGS_FILE.read_text())["drop_log"])
 
 
 if __name__ == '__main__':

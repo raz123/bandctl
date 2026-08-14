@@ -1168,8 +1168,11 @@ var signalTimer = null;
 var regTimer = null;
 var campTimer = null;
 var signalHistory = [];   // {t: epoch_ms, rsrp: number|null}
-var lastReg = null;       // {service, net}
+var lastReg = null;       // {service, net, transports}
+var regPollSeq = 0;       // A-123: only the newest in-flight registration poll may apply
+var userInitiatedOp = false; // A-193: reset/restart in flight — suppress DROP tags
 var toastTimer = null;
+var HISTORY_KEY = 'bandController.history.v1'; // A-182: persisted event history
 
 /* ============ DOM helpers ============ */
 function $(id) { return document.getElementById(id); }
@@ -1359,6 +1362,12 @@ function serverDown(err) {
   stopPolling();
   setConnectionState(false);
   showBanner();
+  // A-193: a restart the user triggered takes the server down on
+  // purpose — the banner shows that, the history must not call it a DROP.
+  if (userInitiatedOp) {
+    logEntry('REG', 'Server restarting (user-initiated)');
+    return;
+  }
   logDrop('Server unreachable — ' + (err && err.message ? err.message : String(err)));
 }
 function retryConnect() {
@@ -1407,14 +1416,20 @@ async function pollSignal() {
 }
 
 async function pollRegistration() {
+  // A-123: dumpsys reads take seconds and the threaded server can return
+  // them out of order. Only the newest in-flight poll may apply its
+  // response — and only it may declare the server down.
+  var seq = ++regPollSeq;
   try {
     var r = await apiFetch(API_REG);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
+    if (seq !== regPollSeq) return; // stale response — drop it
     updateChips(d);
     checkRegChange(d);
     setConnectionState(true);
   } catch (e) {
+    if (seq !== regPollSeq) return; // stale failure — a newer poll decides
     serverDown(e);
   }
 }
@@ -1491,19 +1506,40 @@ async function updateCamping() {
     // Camping is best-effort; the registration poll owns server-down handling.
   }
 }
+function isIwlan(d) {
+  // A-182: the field-observed drop precursor — network_type IWLAN or a
+  // WLAN/IWLAN transport entry inside mNetworkRegistrationInfos (A-208).
+  // lastReg stores the same fields under {net, transports}.
+  if (!d) return false;
+  if (d.network_type === 'IWLAN' || d.net === 'IWLAN') return true;
+  var transports = d.transports || [];
+  return transports.some(function (t) { return t && t.tech === 'IWLAN'; });
+}
 function checkRegChange(d) {
-  var cur = { service: d.service_state, net: d.network_type };
+  var cur = { service: d.service_state, net: d.network_type, transports: d.transports || [] };
   if (!lastReg) {
     logEntry('REG', 'Initial state: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
-  } else if (cur.service !== lastReg.service || cur.net !== lastReg.net) {
+  } else if (cur.service !== lastReg.service || cur.net !== lastReg.net || isIwlan(d) !== isIwlan(lastReg)) {
     var wasIn = lastReg.service === 'IN_SERVICE';
     var isIn = cur.service === 'IN_SERVICE';
     if (!isIn && wasIn) {
-      logDrop('Service lost: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+      // A-193: a reset/restart the user triggered powers the radio down
+      // on purpose — that is not an outage.
+      if (userInitiatedOp) {
+        logEntry('REG', 'Service state → ' + (d.service_state || 'unknown') + ' (reset in progress)');
+      } else {
+        logDrop('Service lost: ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
+      }
+    } else if (isIn && wasIn && (cur.net === 'IWLAN' || isIwlan(d) || isIwlan(lastReg))) {
+      // IWLAN/VoWiFi handover with both states IN_SERVICE — the drop
+      // precursor the service-only gate missed (A-182).
+      logDrop('Wi-Fi calling handover: ' + (cur.net || 'unknown'));
     } else {
       logEntry('REG', 'Service state → ' + (d.service_state || 'unknown') + (d.network_type ? ' · ' + d.network_type : ''));
     }
   }
+  // A-193: any IN_SERVICE poll ends the reset window — the radio is back.
+  if (cur.service === 'IN_SERVICE') userInitiatedOp = false;
   lastReg = cur;
 }
 function logEntry(tag, text) {
@@ -1524,8 +1560,51 @@ function logEntry(tag, text) {
   item.appendChild(txt);
   list.insertBefore(item, list.firstChild);
   while (list.children.length > HISTORY_MAX) list.removeChild(list.lastChild);
+  persistHistory(); // A-182: survive reloads
 }
 function logDrop(text) { logEntry('DROP', text); }
+function persistHistory() {
+  // A-182: mirror the DOM history (newest first) into localStorage so a
+  // page reload does not erase the visible drop record.
+  try {
+    var list = $('history-list');
+    var entries = [];
+    for (var i = 0; i < list.children.length && i < HISTORY_MAX; i++) {
+      var item = list.children[i];
+      var tagEl = item.querySelector('.tag');
+      var timeEl = item.querySelector('.hist-time');
+      var txtEl = item.querySelector('.hist-text');
+      entries.push({ tag: tagEl ? tagEl.textContent : '', time: timeEl ? timeEl.textContent : '', text: txtEl ? txtEl.textContent : '' });
+    }
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(entries));
+  } catch (e) { /* storage full/blocked — history stays DOM-only */ }
+}
+function restoreHistory() {
+  try {
+    var raw = localStorage.getItem(HISTORY_KEY);
+    if (!raw) return;
+    var entries = JSON.parse(raw);
+    if (!Array.isArray(entries)) return;
+    var list = $('history-list');
+    entries.forEach(function (entry) {
+      var item = document.createElement('div');
+      item.className = 'hist-item';
+      var time = document.createElement('span');
+      time.className = 'hist-time';
+      time.textContent = entry.time || '';
+      var tagEl = document.createElement('span');
+      tagEl.className = 'tag ' + (entry.tag || 'REG');
+      tagEl.textContent = entry.tag || 'REG';
+      var txt = document.createElement('span');
+      txt.className = 'hist-text';
+      txt.textContent = entry.text || '';
+      item.appendChild(tagEl);
+      item.appendChild(time);
+      item.appendChild(txt);
+      list.appendChild(item);
+    });
+  } catch (e) { /* corrupted storage — start fresh */ }
+}
 
 /* ============ Signal graph (plain canvas, auto-scale) ============ */
 function drawGraph() {
@@ -1636,6 +1715,9 @@ async function confirmModemReset() {
   var origText = btn.textContent;
   btn.textContent = 'Resetting\u2026';
   btn.classList.add('loading');
+  // A-193: the reset powers the radio down on purpose — the transient
+  // service loss must not be logged as a DROP. Cleared on next IN_SERVICE.
+  userInitiatedOp = true;
   try {
     var r = await apiFetch(API_RESET, { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2015,6 +2097,10 @@ async function waitForHealth() {
   return false;
 }
 async function restartServer() {
+  // A-193: while the server is down the registration poll fails and would
+  // log a DROP — this restart is deliberate, so suppress DROP tags until
+  // the next IN_SERVICE poll clears the flag.
+  userInitiatedOp = true;
   try {
     var r = await apiFetch(API_RESTART, { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2141,6 +2227,7 @@ function init() {
 
   onHash();
   renderPresets();
+  restoreHistory(); // A-182: reload the persisted event history
   renderCamping([]);
   updateSummary();
   loadBands();
