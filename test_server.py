@@ -5,8 +5,8 @@ gate (token required iff LAN enabled and client not loopback; GET
 /api/settings exempt), band validation (M8), guarded parsing (M6),
 atomic config writes (M7), and the static-serving contract (SRV-07).
 
-Follows the module/diag/tests/test_protocol.py convention
-(unittest.TestCase classes, runnable under pytest).
+Follows the diag test conventions (unittest.TestCase classes, runnable
+under pytest).
 
 The tests never touch the modem: band validation and boot-apply paths
 are exercised with stubbed _apply_bands, and requests run against a
@@ -701,6 +701,30 @@ class TestDropLog(unittest.TestCase):
         self.assertIn('wifi: Wifi is enabled', text)
         self.assertIn('counters:', text)
         self.assertIn('radio tail', text)
+
+
+class TestShippedIndexHtml(unittest.TestCase):
+    """A-163: the SHIPPED web/index.html must parse as HTML.
+
+    The static-serving contract tests above stub their own index.html; this
+    smoke test loads the page the server actually serves, so a broken
+    shipped page (e.g. an unclosed tag) cannot ship undetected.
+    """
+
+    def test_shipped_index_html_parses(self):
+        from html.parser import HTMLParser
+
+        path = Path(__file__).parent / "web" / "index.html"
+        self.assertTrue(path.exists(), "shipped UI missing at web/index.html")
+        html = path.read_bytes()
+        self.assertTrue(html.strip(), "shipped UI is empty")
+        lowered = html.lower()
+        self.assertIn(b"<html", lowered)
+        self.assertIn(b"</html>", lowered)
+        # A lenient HTML parser must be able to consume the whole page.
+        parser = HTMLParser()
+        parser.feed(html.decode('utf-8', 'replace'))
+        parser.close()
 
 
 if __name__ == '__main__':

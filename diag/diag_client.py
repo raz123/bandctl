@@ -1,7 +1,8 @@
 """Qualcomm Diag Client - Direct /dev/diag interface.
 
 Talks to the modem through /dev/diag without NSG, following the
-kernel-verified protocol contract (docs/protocol_kernel.md):
+kernel-verified protocol contract (drivers/char/diag on the
+4.19.325-aptusitu kernel):
 
 - Write: ``[0x20 int32 LE][HDLC frame]`` -- no separate token byte.
 - Read: drain the 5 mask notifications queued at open(), then parse the
@@ -17,6 +18,7 @@ import fcntl
 import os
 import struct
 import threading
+import time
 from typing import Optional
 
 try:
@@ -47,6 +49,14 @@ DCI_LOG_MASKS_TYPE = 0x100
 DCI_EVENT_MASKS_TYPE = 0x200
 USER_SPACE_DATA_TYPE = 0x20
 
+# Stream-size ceilings for the HDLC scanner. A malformed item_len field
+# (or a corrupted stream) must not be able to grow the retained buffer
+# without limit: an item larger than _MAX_FRAME_LEN is treated as
+# garbage and the buffer is discarded (resync), and read_response drops
+# the accumulated buffer once it exceeds _MAX_STREAM_LEN.
+_MAX_FRAME_LEN = 65536      # generous ceiling for one diag item
+_MAX_STREAM_LEN = 262144    # ceiling for the accumulate-then-rescan buffer
+
 # The 5 mask notifications a fresh client must drain before NV data
 # (diagchar_core.c:364-375).
 MASK_NOTIFICATION_TYPES = frozenset((
@@ -72,6 +82,16 @@ _LOGGING_PARAM = struct.pack(
     -1,      # peripheral: unspecified
     1,       # device_mask: bit 0 = local proc
 )
+
+
+def _mask_to_bytes(mask: int) -> bytes:
+    """Pack a band bitmask for the NV wire (little-endian).
+
+    Uses at least 8 bytes (the classic LTE/NR item width); masks that set
+    a band above 64 grow to however many bytes are needed (A-12).
+    """
+    nbytes = max(8, (mask.bit_length() + 7) // 8)
+    return mask.to_bytes(nbytes, 'little')
 
 
 class DiagClient:
@@ -147,8 +167,17 @@ class DiagClient:
             ) from e
 
     def close(self):
-        """Close the device; the kernel restores USB mode and frees the session."""
+        """Close the device; the kernel restores USB mode and frees the session.
+
+        A reader abandoned by a timed-out read is still blocked in
+        os.read() on the (now closed) fd it captured at thread start.
+        Joining it here reaps the thread whenever the driver unblocks
+        reads on close; a driver that never unblocks leaves a harmless
+        daemon thread pinned to a dead fd (it can no longer touch any
+        live descriptor).
+        """
         self._fd_dirty = False
+        prior = self._reader_thread
         self._reader_thread = None
         if self.fd is not None:
             try:
@@ -156,6 +185,8 @@ class DiagClient:
             except OSError:
                 pass
             self.fd = None
+        if prior is not None:
+            prior.join(timeout=0.1)
 
     def __enter__(self):
         return self
@@ -172,18 +203,24 @@ class DiagClient:
         remote-proc indicator (diagchar_core.c:4102, 3542-3543). For NV
         commands those bytes are positive, so the command stays local.
 
-        Returns True if the write was accepted.
+        Retries short writes (os.write may accept fewer bytes than
+        requested) and returns True only when the FULL buffer was accepted;
+        a truncated command would otherwise make the following read wait
+        for a response that never comes.
         """
         if self.fd is None:
             raise RuntimeError("Diag device not open")
+        data = struct.pack('<I', USER_SPACE_DATA_TYPE) + hdlc_encode(cmd_bytes)
+        written = 0
         try:
-            os.write(
-                self.fd,
-                struct.pack('<I', USER_SPACE_DATA_TYPE) + hdlc_encode(cmd_bytes),
-            )
-            return True
+            while written < len(data):
+                n = os.write(self.fd, data[written:])
+                if n <= 0:
+                    return False  # kernel accepted no further bytes
+                written += n
         except OSError:
             return False
+        return True
 
     def _timed_read(self, timeout: Optional[float]) -> Optional[bytes]:
         """Blocking ``os.read`` with a timeout, via a daemon-thread join.
@@ -202,10 +239,15 @@ class DiagClient:
         with self._reader_lock:
             self._ensure_clean_reader()
             result = {}
+            # Capture the fd NOW: the closure must never re-evaluate
+            # self.fd at execution time, or a reader abandoned by a
+            # timeout could grab a replacement descriptor opened by a
+            # later _ensure_clean_reader and steal its bytes (A-129).
+            fd = self.fd
 
             def _reader():
                 try:
-                    result['data'] = os.read(self.fd, 16384)
+                    result['data'] = os.read(fd, 16384)
                 except BaseException as exc:  # OSError, KeyboardInterrupt, ...
                     result['error'] = exc
 
@@ -239,8 +281,10 @@ class DiagClient:
         dirty and the prior reader is still alive, the fd is closed and
         reopened (fresh MD session): the new reader runs on a different
         file description, so no read can block behind a hung modem for
-        more than one timeout. A prior reader that finished on its own
-        leaves the fd reusable.
+        more than one timeout. ``close()`` joins the abandoned reader, so
+        a driver that unblocks reads on close also reaps the thread
+        instead of leaking one per timeout. A prior reader that finished
+        on its own leaves the fd reusable.
 
         Raises RuntimeError if the session cannot be re-created (e.g. the
         modem diag session is now owned by another client).
@@ -248,13 +292,13 @@ class DiagClient:
         if not self._fd_dirty:
             return
         self._fd_dirty = False
-        prior = self._reader_thread
-        self._reader_thread = None
-        if prior is None or not prior.is_alive():
-            return  # reader exited on its own; fd is clean, reuse it
+        if self._reader_thread is None or not self._reader_thread.is_alive():
+            self._reader_thread = None
+            return
         # The abandoned reader is still blocked on the old file
-        # description. Retire it: close the fd, open a fresh one, and
-        # re-create the memory-device session on it.
+        # description. Retire it: close the fd (which also joins the
+        # abandoned reader), open a fresh one, and re-create the
+        # memory-device session on it.
         self.close()
         self._open()
         try:
@@ -263,17 +307,34 @@ class DiagClient:
             self.close()
             raise
 
-    def _drain_mask_notifications(self, timeout: Optional[float]) -> bytes:
+    def _retire_stale_reader(self):
+        """Retire any abandoned reader BEFORE a command is written.
+
+        A timed-out read leaves the fd dirty. If the next NV command is
+        written first and the cleanup happens inside read_response's first
+        read, the command is retired along with the old session before its
+        response can be observed (A-126). Cleaning up here -- before
+        send_command -- keeps the command on the fresh session.
+        """
+        with self._reader_lock:
+            self._ensure_clean_reader()
+
+    def _drain_mask_notifications(self, deadline: float) -> bytes:
         """Drain the 5 mask notifications queued by the kernel at open().
 
         Each read returns ``[data_type int32 LE][blob]``; the mask blobs
         (data_type 0x1/0x2/0x4/0x100/0x200) are discarded. Returns any chunk
         that was NOT a mask notification (e.g. an early MD stream) so the
-        caller can process it.
+        caller can process it. Each read is bounded by the time remaining
+        until ``deadline`` (monotonic), so the whole drain cannot exceed
+        the caller's timeout.
         """
         leftover = bytearray()
         for _ in range(5):
-            chunk = self._timed_read(timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            chunk = self._timed_read(remaining)
             if chunk is None:
                 break
             if len(chunk) < 4:
@@ -290,9 +351,17 @@ class DiagClient:
         """Scan an MD stream buffer for an NV response frame.
 
         Stream layout: ``[0x20][num_data][ (len uint32, HDLC frame) * num_data ]``.
-        HDLC-decodes each item and returns the payload whose first byte is
-        0x3D/0x3E (an NV response), falling back to the first successfully
-        decoded frame.
+        HDLC-decodes each item and returns the payload of the first NV
+        response (first byte 0x3D/0x3E). Non-NV frames (notifications,
+        other command replies) are skipped: returning one as a fallback
+        would let a stray notification be attributed to the caller's NV
+        request and leave the real NV frame stranded in the stream
+        (A-61).
+
+        A data_type other than 0x20, or an item_len that exceeds
+        ``_MAX_FRAME_LEN`` (malformed/impossible), discards the buffer so
+        the caller resynchronizes on the next read instead of retaining
+        garbage forever (A-75).
 
         Returns ``(payload, remaining_buffer)``. When no complete NV frame
         is available yet it returns ``(None, buf)`` with the buffer intact
@@ -307,24 +376,20 @@ class DiagClient:
                 return None, bytearray()
             num_data = struct.unpack_from('<I', buf, 4)[0]
             pos = 8
-            first_decoded = None
             for _ in range(num_data):
                 if len(buf) < pos + 4:
                     return None, buf  # partial item header
                 item_len = struct.unpack_from('<I', buf, pos)[0]
                 pos += 4
+                if item_len > _MAX_FRAME_LEN:
+                    # Impossible length: discard the buffer and resync.
+                    return None, bytearray()
                 if len(buf) < pos + item_len:
                     return None, buf  # partial frame
                 payload = hdlc_decode(bytes(buf[pos:pos + item_len]))
                 pos += item_len
-                if payload is None:
-                    continue
-                if first_decoded is None:
-                    first_decoded = payload
                 if payload and payload[0] in (0x3D, 0x3E):
                     return payload, bytearray(buf[pos:])
-            if first_decoded is not None:
-                return first_decoded, bytearray(buf[pos:])
             buf = bytearray(buf[pos:])  # whole block consumed, no NV frame
         return None, buf
 
@@ -334,22 +399,36 @@ class DiagClient:
         Drains the 5 initial mask notifications, then parses the
         USER_SPACE_DATA_TYPE stream, HDLC-decoding each item. Returns None
         on timeout or I/O error.
+
+        The caller's timeout is an OVERALL deadline: every individual read
+        gets only the time remaining, so a stream that keeps dribbling
+        partial bytes cannot extend the wait indefinitely (A-32). The
+        accumulated buffer is also capped: if it grows past
+        ``_MAX_STREAM_LEN`` without yielding a frame, it is discarded and
+        the scan resynchronizes on the next read instead of accumulating
+        memory forever (A-75).
         """
         if self.fd is None:
             raise RuntimeError("Diag device not open")
         if timeout is None:
             timeout = self.timeout
 
+        deadline = time.monotonic() + timeout
         try:
-            buf = bytearray(self._drain_mask_notifications(timeout))
+            buf = bytearray(self._drain_mask_notifications(deadline))
             while True:
                 payload, buf = self._scan_stream(buf)
                 if payload is not None:
                     return payload
-                chunk = self._timed_read(timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                chunk = self._timed_read(remaining)
                 if chunk is None or chunk == b'':
                     return None  # timeout, or device closed
                 buf.extend(chunk)
+                if len(buf) > _MAX_STREAM_LEN:
+                    buf = bytearray()  # resync: drop the malformed accumulation
         except OSError:
             return None
 
@@ -359,18 +438,26 @@ class DiagClient:
         Returns the ``parse_nv_read_response`` dict
         (``{nv_id, sub_id, status, data, success}``) or None on failure.
         """
+        # Clean up a reader abandoned by a previous timeout BEFORE the
+        # command is written: writing first and cleaning up inside
+        # read_response would retire the command along with the old
+        # session (A-126).
+        self._retire_stale_reader()
         if not self.send_command(build_nv_read_cmd(nv_id, slot)):
             return None
         response = self.read_response()
         if response is None:
             return None
         # Echo-validate: a response carrying a DIFFERENT nv_id (e.g. the
-        # other band's reply surfacing via _scan_stream's fallback) must
-        # not be attributed to this request.
+        # other band's reply surfacing via _scan_stream) must not be
+        # attributed to this request.
         return parse_nv_read_response(response, nv_id, slot)
 
     def write_nv(self, nv_id: int, data: bytes, slot: int = 0) -> bool:
         """Write an NV item; True when the 0x3E echo reports status 0."""
+        # Same ordering guarantee as read_nv: retire any abandoned reader
+        # before the command is written (A-126).
+        self._retire_stale_reader()
         if not self.send_command(build_nv_write_cmd(nv_id, data, slot)):
             return False
         response = self.read_response()
@@ -383,7 +470,9 @@ class DiagClient:
         """Read current LTE/NR band configuration.
 
         Reads NV 0x06828 (LTE band pref) and NV 0x06946 (NR band pref on
-        SM8250); each is parsed as an 8-byte little-endian bitmask.
+        SM8250); each is parsed as a little-endian bitmask. The mask is an
+        arbitrary-precision integer, so bands above 64 (LTE B66/B71, NR
+        B77/B78) round-trip instead of being dropped (A-12).
         """
         lte_result = self.read_nv(NV_LTE_BAND_PREF, slot)
         nr_result = self.read_nv(NV_NR5G_BAND_PREF, slot)
@@ -392,11 +481,11 @@ class DiagClient:
         nr_bands = []
 
         if lte_result and lte_result['success'] and len(lte_result['data']) >= 8:
-            mask = struct.unpack('<Q', lte_result['data'][:8])[0]
+            mask = int.from_bytes(lte_result['data'][:16], 'little')
             lte_bands = band_bitmask_to_list(mask)
 
         if nr_result and nr_result['success'] and len(nr_result['data']) >= 8:
-            mask = struct.unpack('<Q', nr_result['data'][:8])[0]
+            mask = int.from_bytes(nr_result['data'][:16], 'little')
             nr_bands = band_bitmask_to_list(mask)
 
         return {
@@ -407,17 +496,35 @@ class DiagClient:
     def set_band_config(self, lte_bands: list, nr_bands: list, slot: int = 0) -> bool:
         """Write LTE/NR band configuration.
 
-        Packs each band list into an 8-byte little-endian bitmask and writes
-        NV 0x06828 (LTE) and NV 0x06946 (NR). Returns True only if both
-        writes succeeded.
+        Packs each band list into a little-endian bitmask (8 bytes when
+        the mask fits, more for bands above 64) and writes NV 0x06828
+        (LTE) and NV 0x06946 (NR). Returns True only if both writes
+        succeeded.
+
+        The two NV items are independent writes, so a second-write failure
+        would otherwise leave the modem half-applied (new LTE mask, old NR
+        mask). The previous values are read first and the first write is
+        rolled back when the second fails, so a reported failure leaves
+        the modem on its original configuration (A-88).
         """
+        lte_prev = self.read_nv(NV_LTE_BAND_PREF, slot)
+        nr_prev = self.read_nv(NV_NR5G_BAND_PREF, slot)
+
         lte_mask = band_list_to_bitmask(lte_bands)
         nr_mask = band_list_to_bitmask(nr_bands)
 
-        lte_ok = self.write_nv(NV_LTE_BAND_PREF, struct.pack('<Q', lte_mask), slot)
-        nr_ok = self.write_nv(NV_NR5G_BAND_PREF, struct.pack('<Q', nr_mask), slot)
+        lte_ok = self.write_nv(NV_LTE_BAND_PREF, _mask_to_bytes(lte_mask), slot)
+        if not lte_ok:
+            return False
 
-        return lte_ok and nr_ok
+        nr_ok = self.write_nv(NV_NR5G_BAND_PREF, _mask_to_bytes(nr_mask), slot)
+        if not nr_ok:
+            # Roll the first write back so the modem is not left with a
+            # half-applied configuration.
+            if lte_prev and lte_prev['success'] and len(lte_prev['data']) >= 8:
+                self.write_nv(NV_LTE_BAND_PREF, lte_prev['data'][:16], slot)
+            return False
+        return True
 
 
 # Convenience functions
