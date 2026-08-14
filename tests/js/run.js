@@ -421,6 +421,36 @@ const okRoutes = (over = {}) => Object.assign({
     assert(w.signalTimer !== null, 'S15 timers resumed when visible');
   }
 
+  // ============ S16: stale settings GET cannot roll back a newer LAN change (A-125) ============
+  console.log('S16 stale settings rollback guard');
+  {
+    const server = okRoutes();
+    const dom = makeDom(server);
+    const w = dom.window;
+    await wait(80);
+    assert(w.lanEnabled === false, 'S16 baseline LAN off');
+    // Hold the next settings GET in flight; the POST returns LAN on.
+    let staleResolve;
+    server['/api/settings'] = (ctx) => {
+      if ((ctx.opts.method || 'GET').toUpperCase() === 'GET') {
+        return new Promise((res) => { staleResolve = res; });
+      }
+      return Promise.resolve(jsonRes({ ok: true, lan_enabled: true, token_required: false }));
+    };
+    w.fetchSettings(); // bootstrap-style GET, will resolve last
+    await wait(10);
+    w.$('lan-toggle').checked = true;
+    w.$('lan-toggle').dispatchEvent(new w.Event('change')); // user flips LAN on
+    await wait(30);
+    assert(w.lanEnabled === true, 'S16 LAN enabled by the user action');
+    assert(w.$('lan-toggle').checked === true, 'S16 toggle stays on after POST');
+    // Now the stale GET (captured before the toggle) finally returns LAN off.
+    staleResolve(jsonRes({ ok: true, lan_enabled: false, token_required: false }));
+    await wait(30);
+    assert(w.lanEnabled === true, 'S16 stale GET did not roll back LAN (A-125)');
+    assert(w.$('lan-toggle').checked === true, 'S16 UI still shows LAN on');
+  }
+
   console.log('\nTOTAL: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('HARNESS ERROR', e); process.exit(2); });
