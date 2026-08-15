@@ -182,7 +182,7 @@ SETTINGS_FILE = MODDIR / "config" / "settings.json"
 # way drop_log gates the drop watchdog. Default True preserves the shipped
 # Diagnostics behavior (the UI polls and renders camping data); the toggle
 # makes the always-on daemon user-controllable.
-DEFAULT_SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": None,
+DEFAULT_SETTINGS = {"bind": "127.0.0.1", "port": 8090, "token": None,
                     "drop_log": False, "band_camping": True}
 
 # Serialize config/settings writes so concurrent saves cannot interleave
@@ -225,8 +225,8 @@ def _load_settings():
         if data.get("bind") in ("127.0.0.1", "0.0.0.0"):
             settings["bind"] = data["bind"]
         # Configurable listen port (release follow-up): a user-set int in
-        # [1, 65535] overrides the 8080 default, e.g. to dodge a LAN app
-        # squatting 8080. Invalid/absent values fall back to 8080.
+        # [1, 65535] overrides the 8090 default (chosen to dodge the common
+        # 8080 LAN squatter). Invalid/absent values fall back to 8090.
         p = data.get("port")
         if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535:
             settings["port"] = p
@@ -3004,11 +3004,11 @@ if __name__ == '__main__':
     # threaded server stalls /api/defaults, /api/read, and button actions
     # behind an endless polling queue.
     # Bind comes from settings.json (default 127.0.0.1; 0.0.0.0 = LAN); the
-    # port likewise (default 8080 — set "port" in settings.json to dodge a
+    # port likewise (default 8090 — set "port" in settings.json to dodge a
     # LAN app squatting 8080). Only the listen PORT is re-read here; a bind
     # change still needs a restart to rebind the socket.
     bind = SETTINGS.get("bind", "127.0.0.1")
-    port = SETTINGS.get("port", 8080)
+    port = SETTINGS.get("port", 8090)
     server = http.server.ThreadingHTTPServer((bind, port), BandHandler)
     # A-049: the auth gate keys on the ACTUAL listening address, not the
     # settings value — a pending settings change must not drop auth before

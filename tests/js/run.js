@@ -72,7 +72,7 @@ function makeFetch(server) {
 function makeDom(server) {
   return new JSDOM(html, {
     runScripts: 'dangerously',
-    url: 'http://localhost:8080/',
+    url: 'http://localhost:8090/',
     pretendToBeVisual: true,
     beforeParse(window) {
       window.fetch = makeFetch(server);
@@ -414,13 +414,13 @@ const okRoutes = (over = {}) => Object.assign({
     lanDom.window.fetch = (url) => { seen.push(String(url)); return Promise.resolve(jsonRes({ ok: true })); };
     await lanDom.window.apiFetch('/api/read?action=read');
     assert(seen.some((u) => u.indexOf('http://192.168.1.50:8080/api/read') === 0), 'S14 LAN apiFetch targets page origin');
-    // phone browser on a NON-8080 loopback port (configurable "port" in
+    // phone browser on a NON-default loopback port (configurable "port" in
     // settings.json): the page origin answers JSON -> use SAME origin, NOT
-    // the hardcoded 8080 base (regression: loopback used to skip the probe
+    // the hardcoded base (regression: loopback used to skip the probe
     // and hardcode 8080, so a localhost:8090 page's API calls died).
     const loDom = new JSDOM(html, {
       runScripts: 'dangerously',
-      url: 'http://127.0.0.1:8090/',
+      url: 'http://127.0.0.1:9090/',
       pretendToBeVisual: true,
       beforeParse(window) {
         window.fetch = makeFetch(okRoutes());
@@ -430,11 +430,11 @@ const okRoutes = (over = {}) => Object.assign({
       },
     });
     const lbase = await loDom.window.resolveApiBase();
-    assert(lbase === 'http://127.0.0.1:8090', 'S14 loopback non-8080 page resolves to page origin');
+    assert(lbase === 'http://127.0.0.1:9090', 'S14 loopback non-default port resolves to page origin');
     const lseen = [];
     loDom.window.fetch = (url) => { lseen.push(String(url)); return Promise.resolve(jsonRes({ ok: true })); };
     await loDom.window.apiFetch('/api/read?action=read');
-    assert(lseen.some((u) => u.indexOf('http://127.0.0.1:8090/api/read') === 0), 'S14 loopback non-8080 apiFetch targets page origin');
+    assert(lseen.some((u) => u.indexOf('http://127.0.0.1:9090/api/read') === 0), 'S14 loopback non-default apiFetch targets page origin');
     // container origin (KSU WebView): non-JSON health -> phone loopback
     const containerDom = new JSDOM(html, {
       runScripts: 'dangerously',
@@ -452,7 +452,7 @@ const okRoutes = (over = {}) => Object.assign({
       },
     });
     const cbase = await containerDom.window.resolveApiBase();
-    assert(cbase === 'http://127.0.0.1:8080', 'S14 container page stays on phone loopback');
+    assert(cbase === 'http://127.0.0.1:8090', 'S14 container page stays on phone loopback');
   }
 
   // ============ S15: polling pauses when hidden (A-114) ============
@@ -1055,7 +1055,7 @@ const { JSDOM, VirtualConsole } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..', '..');
 const HTML = fs.readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
-const PAGE_URL = 'http://127.0.0.1:8080/';
+const PAGE_URL = 'http://127.0.0.1:8090/';
 
 /* ---------------- tiny framework ---------------- */
 

@@ -15,10 +15,10 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
    - Alternatively, from a root shell: `ksud module install bandctl-*.zip`
 3. Reboot (or let the module start the service).
 4. Open the web UI:
-   - **Browser** — open **http://localhost:8080** from the device browser.
-   - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
+   - **Browser** — open **http://localhost:8090** from the device browser.
+   - From a computer: `adb forward tcp:8090 tcp:8090`, then open http://localhost:8090.
 
-   The listen port defaults to **8080** and can be changed via `"port"` in `config/settings.json` (e.g. to dodge a LAN app squatting 8080); the Web UI resolves the API base automatically, so no other configuration is needed after a restart.
+   The listen port defaults to **8090** (chosen to dodge the common 8080 LAN squatter) and can be changed via `"port"` in `config/settings.json`; the Web UI resolves the API base automatically, so no other configuration is needed after a restart.
 
 ## Screenshots
 

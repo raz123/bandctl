@@ -1158,7 +1158,7 @@ button, input { font: inherit; }
 
 /* ============ API contract ============ */
 // Endpoint paths; apiFetch() prepends the resolved base. The module python
-// server listens on the port from settings.json (default 127.0.0.1:8080),
+// server listens on the port from settings.json (default 127.0.0.1:8090),
 // but when this page was served by that server over the network (LAN mode,
 // e.g. http://<phone-ip>:<port>/) the API must go back to the same origin —
 // hardcoding loopback would send a laptop's requests to the laptop's own
@@ -1166,7 +1166,7 @@ button, input { font: inherit; }
 // WebView, appassets://) keep the phone-loopback base. resolveApiBase()
 // probes the page origin's /api/health for ANY http(s) origin to tell the
 // two apart (the module server answers JSON, containers don't) — including
-// a phone browser on a NON-8080 loopback port (configurable "port").
+// a phone browser on a non-default loopback port (configurable "port").
 var API_READ = '/api/read?action=read';
 var API_WRITE = '/api/write?action=write';
 var API_SIGNAL = '/api/signal?action=signal';
@@ -1180,7 +1180,7 @@ var API_DROP_LOG = '/api/drop-log?action=drop-log';
 var API_RESTART = '/api/restart?action=restart';
 var API_HEALTH = '/api/health?action=health';
 
-var API_LOOPBACK_BASE = 'http://127.0.0.1:8080';
+var API_LOOPBACK_BASE = 'http://127.0.0.1:8090';
 var resolvedApiBase = null;
 var resolvingApiBase = null;
 function resolveApiBase() {
@@ -1190,9 +1190,9 @@ function resolveApiBase() {
   if (loc.protocol === 'http:' || loc.protocol === 'https:') {
     // Probe the page origin's /api/health for ANY http(s) origin — the
     // module server answers JSON, containers and unrelated origins don't.
-    // This keeps LAN mode AND a phone browser on a NON-8080 loopback port
+    // This keeps LAN mode AND a phone browser on a non-default loopback port
     // (configurable "port" in settings.json) pointing at the real server;
-    // only a non-JSON/non-responding origin falls back to the 8080 base.
+    // only a non-JSON/non-responding origin falls back to the 8090 base.
     var originBase = loc.protocol + '//' + loc.host;
     var probeCtrl = new AbortController();
     var probeTimer = setTimeout(function () { probeCtrl.abort(); }, 5000);
@@ -1211,7 +1211,7 @@ function resolveApiBase() {
     return resolvingApiBase;
   }
   // Container schemes (KSU Manager WebView, appassets://): no page-origin
-  // HTTP server, so the module-loopback 8080 base is the only answer.
+  // HTTP server, so the module-loopback 8090 base is the only answer.
   resolvedApiBase = API_LOOPBACK_BASE;
   return Promise.resolve(resolvedApiBase);
 }

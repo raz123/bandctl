@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # Band Controller — web UI for LTE/NR band locking
-# Starts Python HTTP server on localhost:8080 after boot
+# Starts Python HTTP server on localhost:8090 after boot
 # Re-applies the persisted band preference at boot: waits for the server +
 # radio, then POSTs /api/boot-apply (best-effort — the UI can apply later)
 
@@ -25,16 +25,16 @@ if [ ! -f "$MODDIR/module.prop" ]; then
 fi
 
 WEB_DIR="$MODDIR/web"
-PORT=8080
+PORT=8090
 # Configurable listen port (release follow-up): read "port" from
 # config/settings.json so the boot/restart health-checks hit the SAME port
-# the server binds (default 8080 — set "port" in settings.json to dodge a
-# LAN app squatting 8080). Invalid/absent value falls back to 8080.
+# the server binds (default 8090 — set "port" in settings.json to dodge a
+# LAN app squatting 8080). Invalid/absent value falls back to 8090.
 if [ -r "$MODDIR/config/settings.json" ]; then
   _PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
     "$MODDIR/config/settings.json" | head -n1)
   case "$_PORT" in
-    ''|*[!0-9]*) : ;;   # absent / non-numeric -> keep default 8080
+    ''|*[!0-9]*) : ;;   # absent / non-numeric -> keep default 8090
     *) PORT=$_PORT ;;
   esac
 fi

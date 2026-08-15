@@ -87,7 +87,7 @@ chmod 755 "$MODDIR/python" "$MODDIR/python/bin" "$MODDIR/python/bin/python3.14" 
 chmod 755 "$MODDIR/python/usr/lib" 2>/dev/null
 
 echo "[bandctl] Install complete."
-echo "[bandctl] After boot: open http://localhost:8080"
+echo "[bandctl] After boot: open http://localhost:8090"
 echo "=========================================="
 
 exit 0

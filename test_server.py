@@ -97,20 +97,20 @@ class TestSettingsLoad(SettingsFileCase):
 
     def test_missing_file_defaults(self):
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "port": 8080, "token": None,
+                         {"bind": "127.0.0.1", "port": 8090, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_malformed_json_defaults(self):
         server.SETTINGS_FILE.write_text("{not json")
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "port": 8080, "token": None,
+                         {"bind": "127.0.0.1", "port": 8090, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_invalid_bind_falls_back_to_localhost(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "9.9.9.9", "token": "tok"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "port": 8080, "token": "tok",
+                         {"bind": "127.0.0.1", "port": 8090, "token": "tok",
                           "drop_log": False, "band_camping": True})
 
     def test_invalid_token_downgrades_lan_bind(self):
@@ -128,7 +128,7 @@ class TestSettingsLoad(SettingsFileCase):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "port": 8080, "token": None,
+                         {"bind": "127.0.0.1", "port": 8090, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_lan_bind_with_valid_token_kept(self):
@@ -153,33 +153,33 @@ class TestSettingsLoad(SettingsFileCase):
         self.assertEqual(loaded["bind"], "127.0.0.1")
 
     def test_custom_port_honored(self):
-        """release follow-up: "port" in settings.json overrides the 8080
-        default (dodge a LAN app squatting 8080)."""
+        """release follow-up: a non-default "port" in settings.json
+        overrides the 8090 default (dodge a LAN app squatting 8080)."""
         server.SETTINGS_FILE.write_text(
-            json.dumps({"bind": "127.0.0.1", "port": 8090, "token": None}))
-        self.assertEqual(server._load_settings()["port"], 8090)
+            json.dumps({"bind": "127.0.0.1", "port": 9090, "token": None}))
+        self.assertEqual(server._load_settings()["port"], 9090)
 
     def test_invalid_port_falls_back_to_default(self):
         """release follow-up: bool/zero/out-of-range/non-int port is
-        rejected and the 8080 default is kept."""
+        rejected and the 8090 default is kept."""
         for bad in (0, 70000, True, "8080", -1, 3.5):
             server.SETTINGS_FILE.write_text(
                 json.dumps({"bind": "127.0.0.1", "port": bad}))
-            self.assertEqual(server._load_settings()["port"], 8080,
+            self.assertEqual(server._load_settings()["port"], 8090,
                              "port {} should not be accepted".format(bad))
 
     def test_update_settings_preserves_custom_port(self):
         """release follow-up: a UI LAN-toggle save must not drop a
         user-set port (update_settings starts from the live SETTINGS)."""
         server.SETTINGS_FILE.write_text(
-            json.dumps({"bind": "127.0.0.1", "port": 8090, "token": None}))
+            json.dumps({"bind": "127.0.0.1", "port": 9090, "token": None}))
         loaded = server._load_settings()
         server.SETTINGS.update(loaded)
         h = server.BandHandler.__new__(server.BandHandler)
         res = h.update_settings({"lan_enabled": False, "regenerate": False})
         self.assertTrue(res["ok"])
         self.assertEqual(json.loads(server.SETTINGS_FILE.read_text())["port"],
-                         8090)
+                         9090)
 
 
 class TestSettingsSave(SettingsFileCase):
