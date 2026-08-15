@@ -7,10 +7,16 @@ qmi_band client), with /dev/diag and the config file as fallbacks.
 HTTP API (all responses are JSON, served from the phone's web root):
 
   GET  /api/read?action=read
-       -> {"lte": ["1", ...], "nr": ["77", ...],
-           "source": "qmi" | "diag" | "config_file" | "default"}
+       -> {"ok": true, "lte": ["1", ...], "nr": ["77", ...],
+           "source": "qmi" | "diag" | "config_file" | "default",
+           "rev": int}
        LTE/NR band configuration. Tries QMI (QRTR) first, then diag, then
-       the fallback config file, then a carrier-aware default list.
+       the fallback config file, then a carrier-aware default list. A
+       failed exchange (QMI nonzero exit / non-success result TLV, empty
+       diag read, corrupt or invalid persisted file) is {"ok": false,
+       "error": ...} — never a fake authoritative read. "rev" is the
+       persisted-intent revision; POST /api/write may echo it to reject
+       stale writes (see below).
 
   GET  /api/defaults?action=defaults
        -> {"carrier": "rogers" | "other", "mccmnc": "302720" | null,
@@ -20,10 +26,17 @@ HTTP API (all responses are JSON, served from the phone's web root):
        "rogers" returns the community-validated curated whitelist, any
        other carrier the unrestricted all-bands list. Never 500s.
 
-  POST /api/write?action=write   body {"lte": [...], "nr": [...]}
-       -> {"ok": bool, "source": ..., "error": ...?}
+  POST /api/write?action=write   body {"lte": [...], "nr": [...],
+                                        "rev": int?}
+       -> {"ok": bool, "source": ..., "rev": int, "error": ...?}
        Writes the band configuration to the modem via QMI (QRTR) first,
        falling back to diag, and mirrors it to the fallback config file.
+       Both transports are verified by read-back, so ok:true means the
+       requested set was actually applied and persisted; a failed apply
+       is not mirrored (boot re-apply never retries a rejected set) and a
+       persistence failure is reported. Writes are serialized; an
+       optional "rev" from a prior /api/read causes a conflict error when
+       another client changed the config in the meantime.
 
   POST /api/boot-apply?action=boot-apply  (no body)
        -> {"ok": true, "skipped": true} | {"ok": true,
@@ -70,12 +83,18 @@ HTTP API (all responses are JSON, served from the phone's web root):
        radio does not power off, returns ok:false - never fakes success.
 
   GET  /api/band-camping?action=band-camping[&limit=N]
-       -> {"ok": true, "samples": [{"timestamp": epoch_ms,
-           "earfcn": int, "band": int|null}, ...], "log": path}
+       -> {"ok": true, "enabled": bool, "samples": [{"timestamp": epoch_ms,
+           "earfcn": int, "band": int|null}, ...], "log": str}
        Last N (default 50) serving-cell EARFCN/band samples recorded by
-       the background band-camping sampler (findings 5c). When the log
-       has no samples yet, "samples" is an empty list - the sampler
-       only writes a line when an LTE cell identity is present.
+       the background band-camping sampler (findings 5c); "enabled" is
+       the live sampler toggle (A-120/A-201). When the log has no
+       samples yet, "samples" is an empty list - the sampler only writes
+       a line when an LTE cell identity is present.
+
+  POST /api/band-camping?action=band-camping  body {"enabled": bool}
+       -> {"ok": true, "enabled": bool}
+       Enables/disables the background serving-cell sampler (persisted to
+       settings.json, picked up live — no restart needed).
 
   POST /api/export?action=export  body {"lte": [...], "nr": [...]}
        -> {"ok": bool, "path": str, "error": ...?}
@@ -110,7 +129,9 @@ HTTP API (all responses are JSON, served from the phone's web root):
 """
 import http.server
 import fcntl
+import glob
 import hmac
+import ipaddress
 import itertools
 import json
 import os
@@ -144,13 +165,34 @@ DIAG_DEVICE = "/dev/diag"
 # (127.0.0.1 = local-only, 0.0.0.0 = LAN); the token gates /api/* from
 # non-loopback clients while LAN is enabled.
 SETTINGS_FILE = MODDIR / "config" / "settings.json"
-DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None, "drop_log": False}
+# band_camping gates the 5s serving-cell sampler (A-120/A-201), the same
+# way drop_log gates the drop watchdog. Default True preserves the shipped
+# Diagnostics behavior (the UI polls and renders camping data); the toggle
+# makes the always-on daemon user-controllable.
+DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None, "drop_log": False,
+                    "band_camping": True}
 
 # Serialize config/settings writes so concurrent saves cannot interleave
 # (each save is temp-file + os.replace, atomic per write). RLock so a
 # mutation+save critical section can hold the lock while _save_settings
 # re-acquires it inside _atomic_write_json (A-116).
 _CONFIG_WRITE_LOCK = threading.RLock()
+
+# Serialize /api/modem-reset (A-51): the power off/on transitions must not
+# interleave across concurrent requests.
+_MODEM_RESET_LOCK = threading.Lock()
+
+# Serialize the whole band-apply transaction (QMI SET + read-back verify,
+# diag fallback, config-file mirror) so concurrent clients cannot
+# interleave band writes on the modem (A-45). _CONFIG_WRITE_LOCK only
+# guards the JSON replace; this guards the transaction end to end.
+_BAND_WRITE_LOCK = threading.Lock()
+
+# Revision of the persisted band intent (config/bands.json). Incremented
+# under _BAND_WRITE_LOCK on every successful write; /api/read responses
+# carry it and /api/write may echo it to fail when another client changed
+# the config meanwhile (A-97).
+_CONFIG_REV = 0
 
 # Request bodies are clamped to 1 MiB before parsing (M6 guard).
 MAX_BODY_BYTES = 1 * 1024 * 1024
@@ -173,6 +215,16 @@ def _load_settings():
         settings["token"] = token if isinstance(token, str) and token else None
         if isinstance(data.get("drop_log"), bool):
             settings["drop_log"] = data["drop_log"]
+        if isinstance(data.get("band_camping"), bool):
+            settings["band_camping"] = data["band_camping"]
+        # A-105/A-218: never accept a LAN bind without a usable token. That
+        # state remote-locks every non-loopback client (every request 401s
+        # while the server is reachable on the LAN, and the recovery POST is
+        # itself behind the gate). Downgrade to loopback-only so the server
+        # stays locally administrable; update_settings never produces this
+        # combination because the token is minted before the bind is flipped.
+        if settings["bind"] == "0.0.0.0" and not settings["token"]:
+            settings["bind"] = "127.0.0.1"
     except (OSError, ValueError):
         pass
     return settings
@@ -182,33 +234,95 @@ def _load_settings():
 # re-runs service.sh so a bind/token change takes effect on the fresh process.
 SETTINGS = _load_settings()
 
+# The address the HTTP socket actually listens on, set in __main__ after the
+# server binds. Auth decisions use THIS rather than SETTINGS["bind"] (A-049):
+# update_settings flips SETTINGS["bind"] immediately while the socket stays
+# put until the restart, so gating on the settings value would let a remote
+# client pass unauthenticated for the whole window after "disable LAN".
+# None outside __main__ (tests/imports) -> fall back to SETTINGS["bind"].
+_EFFECTIVE_BIND = None
+
+# Serialize POST /api/settings (and the drop-log toggle, which mutates the
+# same SETTINGS dict) so two racing requests cannot interleave their
+# read-modify-write of the shared snapshot (A-041).
+_SETTINGS_UPDATE_LOCK = threading.Lock()
+
+# One scheduled restart at a time (A-041): repeated taps must not stack
+# detached service.sh runs that each kill and replace the server.
+_RESTART_LOCK = threading.Lock()
+_RESTART_PENDING = False
+
+
+def _ensure_private_dir(path):
+    """Create `path` root-private (0o700), re-asserting the mode on an
+    existing directory.
+
+    Hardens the module config tree (A-180): service.sh's bare `mkdir -p`
+    inherits the boot umask (000 -> world-writable 777) and nothing else
+    chmods it, which lets any unprivileged app unlink/replace files in it.
+    The server runs as root and is the only legit reader of config/ and
+    config/drop_log/, so 0o700 is safe and strictly tighter than the
+    audit's 0755 recommendation."""
+    path = Path(path)
+    os.makedirs(str(path), mode=0o700, exist_ok=True)
+    try:
+        os.chmod(str(path), 0o700)
+    except OSError:
+        pass
+
 
 def _atomic_write_json(path, data):
     """Persist `data` as JSON to `path` atomically (M7).
 
     Writes to a temp file in the same directory, fsyncs, then
     os.replace()s it over the target so readers never observe a
-    partially-written file. The temp file is opened with O_NOFOLLOW so a
-    symlink planted at the temp name cannot redirect the write; the
-    replace itself swaps the target name outright (a pre-existing symlink
-    at the target is replaced, not followed). Writes are serialized by
-    _CONFIG_WRITE_LOCK. Raises on failure; callers turn exceptions into
-    JSON error responses."""
+    partially-written file. The temp file is opened with O_NOFOLLOW|O_EXCL
+    (A-180/A-211) so a symlink or pre-created hard link planted at the temp
+    name cannot redirect or truncate the write; a leftover temp from a
+    crashed save is cleared once and retried. The replace itself swaps the
+    target name outright (a pre-existing symlink at the target is replaced,
+    not followed). The directory is created root-private (A-180). Writes
+    are serialized by _CONFIG_WRITE_LOCK. Raises on failure; callers turn
+    exceptions into JSON error responses."""
     path = Path(path)
-    os.makedirs(str(path.parent), exist_ok=True)
+    _ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    flags |= os.O_EXCL
     tmp = os.path.join(str(path.parent),
                        ".{}.{}.tmp".format(path.name, os.getpid()))
     with _CONFIG_WRITE_LOCK:
-        fd = os.open(tmp, flags, 0o600)
+        fd = None
+        for attempt in (0, 1):
+            try:
+                fd = os.open(tmp, flags, 0o600)
+                break
+            except FileExistsError:
+                if attempt:
+                    raise
+                # Stale temp left by a crashed save: clear and retry.
+                os.unlink(tmp)
+        if fd is None:
+            raise OSError("cannot create temp file {}".format(tmp))
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, str(path))
+            # Crash durability (A-141): fsync the parent directory so the
+            # rename itself survives a power loss — without it the file can
+            # revert or vanish despite the API reporting a save. Filesystems
+            # that do not support directory fsync raise; ignore that.
+            try:
+                dfd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -217,19 +331,30 @@ def _atomic_write_json(path, data):
             raise
 
 
-def _save_settings():
-    """Atomically persist the in-memory SETTINGS snapshot."""
-    _atomic_write_json(SETTINGS_FILE, SETTINGS)
+def _save_settings(settings=None):
+    """Atomically persist the in-memory SETTINGS snapshot (or a supplied
+    copy of it — persist-first callers pass the proposed new state)."""
+    _atomic_write_json(SETTINGS_FILE,
+                       settings if settings is not None else SETTINGS)
 
 
-# QMI band-apply client (QRTR transport). Resolved relative to the module
-# dir like DIAG_DIR; falls back to /data/local/tmp/qmi_band for dev use.
-# The module zip ships the static binary at qmi/qmi_band.
+# QMI band-apply client (QRTR transport), resolved relative to the module
+# dir like DIAG_DIR; the module zip ships the static binary at qmi/qmi_band.
+# A-198: the old fallback silently exec'd /data/local/tmp/qmi_band (an
+# adb-push scratch dir) as root. Never substitute non-module binaries —
+# when the bundled artifact is missing, QMI is simply unavailable and
+# _run_qmi reports it; __main__ logs the condition loudly.
 QMI_BIN = Path(__file__).parent.parent / "qmi" / "qmi_band"
 if not QMI_BIN.exists():
-    QMI_BIN = Path("/data/local/tmp/qmi_band")
-QMI_GET_TIMEOUT = 5
-QMI_SET_TIMEOUT = 8
+    QMI_BIN = None
+# QMI subprocess timeouts. The helper re-discovers the NAS endpoint on
+# every invocation: a fixed ~3s QRTR enumeration plus per-probe waits
+# before the first response (A-194). These timeouts must sit above that
+# fixed discovery+probe budget so a slow-but-working modem is not killed
+# by the caller (A-64); the C-side worst-case sweep can still exceed even
+# these, which is a discovery-cost fix inside qmi_band.c, not here.
+QMI_GET_TIMEOUT = 15
+QMI_SET_TIMEOUT = 20
 
 # Fallback config file for persistence
 CONFIG_FILE = MODDIR / "config" / "bands.json"
@@ -252,13 +377,20 @@ PERSIST_DIR = _persistent_data_dir()
 
 # Export dir for WebView-compatible config export (the Manager WebView
 # drops blob downloads, so export writes a timestamped file on-device).
-EXPORT_DIR = PERSIST_DIR
+# Only the newest EXPORT_KEEP export files are retained (A-082: repeated
+# exports used to accumulate in the module config dir without bound).
+EXPORT_DIR = MODDIR / "config"
+EXPORT_KEEP = 10
 
 # Band-camping sampler (findings 5c): append `timestamp,earfcn,band` CSV
 # lines every BAND_CAMPING_INTERVAL seconds so a band force can be
-# validated offline (does the modem ever camp on a banned band?).
-BAND_CAMPING_LOG = PERSIST_DIR / "band_camping.log"
+# validated offline (does the modem ever camp on a banned band?). The log
+# is trimmed to BAND_CAMPING_MAX_LINES on append (A-028: the old sampler
+# grew the file forever and every /api/band-camping read re-read it in
+# full) and gated on the SETTINGS["band_camping"] toggle (A-120/A-201).
+BAND_CAMPING_LOG = MODDIR / "config" / "band_camping.log"
 BAND_CAMPING_INTERVAL = 5
+BAND_CAMPING_MAX_LINES = 2000
 # Wall-clock ms can step backwards (NTP/carrier time sync), which would
 # make the CSV / last-N chart show time going backwards (A-154). Keep the
 # written timestamp strictly monotonic by clamping to last+1.
@@ -711,9 +843,22 @@ _ROGERS_BANDS = {
     "nr": ["1", "3", "5", "8", "20", "28", "38", "41", "77", "78"],
 }
 
+# Band catalogs the UI renders (web/index.html LTE_BANDS / NR_BANDS) — the
+# read/write contract: a band may only be applied in its own RAT namespace
+# (A-131) and out-of-catalog bands are filtered from QMI reads (A-145), so
+# the displayed set can always be re-applied.
+_LTE_CATALOG = frozenset([1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 20, 25, 26,
+                          28, 29, 30, 38, 40, 41, 42, 43, 48, 66, 71])
+_NR_CATALOG = frozenset([1, 2, 3, 5, 7, 8, 20, 25, 28, 38, 40, 41, 66, 71,
+                         77, 78, 79])
+
+# Non-Rogers default: unrestricted, EXCEPT bands 7 and 66 — the README's
+# community-validated SM8250 crash pair (66<->7 handover crash) must not be
+# selected by any default path (A-186); they stay selectable only via
+# explicit user action.
 _ALL_BANDS = {
-    "lte": ["1","2","3","4","5","7","8","12","13","14","17","20","25","26","28","29","30","38","40","41","42","43","48","66","71"],
-    "nr": ["1","2","3","5","7","8","20","25","28","38","40","41","66","71","77","78","79"],
+    "lte": ["1","2","3","4","5","8","12","13","14","17","20","25","26","28","29","30","38","40","41","42","43","48","71"],
+    "nr": ["1","2","3","5","8","20","25","28","38","40","41","71","77","78","79"],
 }
 
 
@@ -742,15 +887,22 @@ def _get_prop(name):
 
 
 def carrier_for_mccmnc(mccmnc):
-    """"rogers" when any SIM slot's operator numeric is Rogers/Fido
+    """"rogers" when the active SIM slot's operator numeric is Rogers/Fido
     (302720), else "other" (including empty/missing values).
 
     `gsm.operator.numeric` is comma-joined per SIM slot (e.g. "302720,"
-    or "302720,302220"), so normalize by splitting on ","."""
+    or "302720,302220"), so normalize by splitting on ",". With more than
+    one distinct slot present we cannot tell which subscription is active,
+    so Rogers-specific band exclusions are NOT applied — "other" yields
+    the unrestricted all-bands defaults, which cannot remove bands the
+    active carrier needs (A-072: mixed-SIM detection used to apply the
+    Rogers whitelist to whichever carrier was actually active)."""
     if not mccmnc:
         return "other"
-    slots = [s.strip() for s in str(mccmnc).split(",")]
-    return "rogers" if ROGERS_MCCMNC in slots else "other"
+    slots = [s.strip() for s in str(mccmnc).split(",") if s.strip()]
+    if len(set(slots)) > 1:
+        return "other"
+    return "rogers" if slots and slots[0] == ROGERS_MCCMNC else "other"
 
 
 def defaults_for_carrier(carrier):
@@ -773,9 +925,21 @@ def seed_config_if_absent():
     server's carrier-aware all-bands fallback applies until the first
     Save & Apply mirrors one). If the operator prop is empty (mid-radio-
     drop), nothing is seeded — never raises."""
-    if os.path.exists(CONFIG_FILE):
-        return
     try:
+        if os.path.exists(CONFIG_FILE):
+            # A-134: an interrupted install-time seed leaves a truncated
+            # bands.json. Mere existence must not block recovery — a file
+            # that is unreadable or not valid config is re-seeded.
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+                if (isinstance(data, dict)
+                        and isinstance(data.get("lte"), list)
+                        and isinstance(data.get("nr"), list)):
+                    return  # existing file is valid; keep user config
+            except (OSError, ValueError):
+                pass
+            print(f"Config file missing/invalid, re-seeding: {CONFIG_FILE}")
         mccmnc = (_get_prop("gsm.operator.numeric") or "").strip(" ,")
         if carrier_for_mccmnc(mccmnc) != "rogers":
             return
@@ -784,15 +948,18 @@ def seed_config_if_absent():
     except Exception as e:
         print(f"Config seed skipped: {e}")
 
-
 def _run_qmi(args, timeout):
     """Run the QMI band client; return (returncode, combined output).
 
-    Returns (None, "") when the binary is missing, not executable (e.g.
-    the exec bit was lost during install), or the call times out - callers
-    treat that as "QMI unavailable" and fall back. Catching OSError keeps
-    a PermissionError from killing the single-threaded HTTP server.
+    Returns (None, "") when the binary is missing (including the A-198
+    None sentinel for a module without the bundled artifact), not
+    executable (e.g. the exec bit was lost during install), or the call
+    times out - callers treat that as "QMI unavailable" and fall back.
+    Catching OSError keeps a PermissionError from killing the
+    single-threaded HTTP server.
     """
+    if QMI_BIN is None:
+        return None, ""
     try:
         proc = subprocess.run([str(QMI_BIN)] + args, capture_output=True,
                               text=True, timeout=timeout)
@@ -810,10 +977,18 @@ def _parse_qmi_get(output):
 
     The client prints one `LTE bands:` / `NR5G SA bands:` / `NR5G NSA
     bands:` line per mask (band numbers space-separated, "(none)" when
-    empty). NR bands are the union of the SA and NSA lists. Returns None
-    when no band lists could be parsed (transport unavailable).
+    empty). Base and extension TLVs print under the SAME labels, so each
+    category accumulates the UNION of its lines (A-122) — the total
+    preference is the union of the base and extension masks. Bands
+    outside the app's LTE/NR catalogs are filtered out (A-145) so the
+    reported set can always be displayed and re-applied. Returns None
+    when no LTE band line could be parsed (transport unavailable or
+    malformed output).
     """
-    lte = sa = nsa = None
+    lte = set()
+    sa = set()
+    nsa = set()
+    lte_seen = False
     for line in output.splitlines():
         m = re.match(r"\s*(LTE|NR5G SA|NR5G NSA) bands:\s*(.*)$", line)
         if not m:
@@ -821,15 +996,29 @@ def _parse_qmi_get(output):
         tag, rest = m.group(1), m.group(2).strip()
         bands = [] if rest in ("", "(none)") else rest.split()
         if tag == "LTE":
-            lte = bands
-        elif tag == "NR5G SA":
-            sa = bands
-        else:
-            nsa = bands
-    if lte is None:
+            lte_seen = True
+        for b in bands:
+            if not b.isdigit():
+                continue
+            band = int(b)
+            if tag == "LTE":
+                if band in _LTE_CATALOG:
+                    lte.add(band)
+            elif tag == "NR5G SA":
+                if band in _NR_CATALOG:
+                    sa.add(band)
+            else:
+                if band in _NR_CATALOG:
+                    nsa.add(band)
+    if not lte_seen:
         return None
-    nr = sorted(set(sa or []) | set(nsa or []))
-    return {"lte": [str(b) for b in lte], "nr": [str(b) for b in nr]}
+    # A-221: sort the NR union numerically, not lexicographically, so
+    # '1','10','2' orders the same as the numeric LTE list.
+    try:
+        nr = sorted(set(sa or []) | set(nsa or []), key=int)
+    except (TypeError, ValueError):
+        nr = sorted(set(sa or []) | set(nsa or []))
+    return {"lte": [str(b) for b in sorted(lte)], "nr": [str(b) for b in nr]}
 
 
 def _cmd_available(service, subcommand):
@@ -842,27 +1031,37 @@ def _cmd_available(service, subcommand):
 
 
 def _airplane_on():
-    """True when the persistent airplane-mode prop says the radio is off.
+    """Tri-state airplane-mode property: True/False when getprop answers
+    authoritatively, None when it cannot be verified (getprop failure,
+    empty or unexpected value).
 
-    ponytail: getprop failing is treated as "off" (cleanup reports
-    success); the disable command failing is caught separately in
-    _disable_airplane, which is the path that matters for leaving
-    airplane mode stuck on."""
+    Callers must never treat None as "off" — certifying cleanup on an
+    unverifiable property is the A-46 bug (a failed disable command plus
+    an unavailable property used to report success)."""
     try:
-        return str(_get_prop("persist.radio.airplane_mode_on")).strip() == "1"
+        val = str(_get_prop("persist.radio.airplane_mode_on")).strip()
     except Exception:
+        return None
+    if val == "1":
+        return True
+    if val == "0":
         return False
+    return None
 
 
 def _disable_airplane(attempts=3):
-    """Disable airplane mode and verify it took; retries. True when off."""
+    """Disable airplane mode and verify it took; retries.
+
+    Returns True only when the property is verifiably off (A-46): if the
+    property cannot be read, cleanup cannot be certified and this returns
+    False so callers report an honest failure."""
     for _ in range(attempts):
         try:
             _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "disable"], timeout=10)
         except Exception:
             pass
         time.sleep(1)
-        if not _airplane_on():
+        if _airplane_on() is False:
             return True
     return False
 
@@ -875,10 +1074,26 @@ def _parse_int(value):
         return None
 
 
-def _valid_signal(value):
-    """True if a parsed signal metric is a real measurement (not a
-    sentinel like 2147483647 or the legacy 99 unknown marker)."""
-    return value is not None and value < _INVALID_SIGNAL and value != 99
+def _valid_signal(value, lo=-160, hi=-1):
+    """True if a parsed signal metric is a real measurement.
+
+    Rejects None, the Integer.MAX_VALUE sentinel, the legacy 99 unknown
+    marker, and values outside the physical dBm domain — RSRP/RSRQ are
+    always negative, so 0, 50, etc. are corrupt/vendor junk (A-140:
+    non-sentinel values used to pass straight through to the UI)."""
+    if value is None or value >= _INVALID_SIGNAL or value == 99:
+        return False
+    return lo <= value <= hi
+
+
+def _signal_level(level):
+    """Normalize an Android signal level (domain 0-4) to int or None.
+
+    A-133: sentinels (2147483647, 99) and out-of-domain junk were passed
+    through as a live level whenever the accompanying metrics were valid."""
+    if isinstance(level, int) and 0 <= level <= 4:
+        return level
+    return None
 
 
 def _field_int(section, name):
@@ -926,7 +1141,7 @@ def _parse_signal_object(sig_obj):
         fields = lm.group(1)
         lte_rsrp = _field_int(fields, r'rsrp')
         lte_rsrq = _field_int(fields, r'rsrq')
-        lte_level = _field_int(fields, r'level')
+        lte_level = _signal_level(_field_int(fields, r'level'))
 
     # NR section: mNr=CellSignalStrengthNr:{ csiRsrp = .. ssRsrp = .. level = 0 }
     nr_rsrp = nr_rsrq = nr_level = None
@@ -935,7 +1150,14 @@ def _parse_signal_object(sig_obj):
         fields = nm.group(1)
         nr_rsrp = _field_int(fields, r'ssRsrp')
         nr_rsrq = _field_int(fields, r'ssRsrq')
-        nr_level = _field_int(fields, r'level')
+        # A-99: when the SS measurements are sentinels/unavailable but the
+        # also-exposed CSI measurements are valid, use those — a real 5G
+        # session must not be reported as no-signal.
+        if not _valid_signal(nr_rsrp):
+            nr_rsrp = _field_int(fields, r'csiRsrp')
+        if not _valid_signal(nr_rsrq):
+            nr_rsrq = _field_int(fields, r'csiRsrq')
+        nr_level = _signal_level(_field_int(fields, r'level'))
 
     candidates = []
     if _valid_signal(lte_rsrp) or _valid_signal(lte_rsrq):
@@ -980,21 +1202,65 @@ def _parse_signal_legacy(values):
             "level": _lte_level_from_rsrp(rsrp), "tech": "LTE"}
 
 
+def _signal_rsrp(parsed):
+    """Sort key for candidate selection: RSRP, or -1000 when absent."""
+    rsrp = parsed.get("rsrp_dbm")
+    return rsrp if rsrp is not None else -1000
+
+
 def _parse_signal_strength(text):
     """Parse signal strength from `dumpsys telephony.registry` output.
 
     Tries the modern mSignalStrength=SignalStrength:{...} object format
-    first (each line is one subscription; the first line carrying a valid
-    measurement wins), then the legacy flat `SignalStrength: <ints>` list.
-    Returns None when nothing parseable exists.
+    first, then the legacy flat `SignalStrength: <ints>` list. On
+    multi-phone dumps (dual-SIM) the signal of the IN_SERVICE subscription
+    is preferred over the first record — SIM 0 out of service must not
+    shadow SIM 1's healthy measurement (A-50). Falls back to the strongest
+    valid measurement when no in-service phone is identifiable. Returns
+    None when nothing parseable exists.
     """
+    if 'Phone Id=' in text:
+        phones = {}
+        svc_by_phone = {}
+        current = None
+        for line in text.splitlines():
+            m = re.match(r'\s*Phone Id=(\d+)', line)
+            if m:
+                current = int(m.group(1))
+                phones.setdefault(current, [])
+                continue
+            if current is None:
+                continue
+            if line.lstrip().startswith('mServiceState='):
+                svc_by_phone[current] = line.split('mServiceState=', 1)[1].strip()
+            if 'mSignalStrength=' in line:
+                phones[current].append(line.split('mSignalStrength=', 1)[1])
+        # 1) The in-service phone's signal.
+        for pid, svc in svc_by_phone.items():
+            reg = _parse_service_state(svc, text)
+            if reg and reg["service_state"] == "IN_SERVICE":
+                for raw in phones.get(pid, []):
+                    parsed = _parse_signal_object(raw)
+                    if parsed:
+                        return parsed
+        # 2) Strongest valid measurement across phones.
+        best = None
+        for raw_list in phones.values():
+            for raw in raw_list:
+                parsed = _parse_signal_object(raw)
+                if parsed and (best is None
+                               or _signal_rsrp(parsed) > _signal_rsrp(best)):
+                    best = parsed
+        if best is not None:
+            return best
+    # Single-phone / ungrouped dump: first valid object, then legacy flat
+    # list (the object format is `SignalStrength:{`, which the flat-list
+    # pattern cannot match).
     for line in text.splitlines():
         if 'mSignalStrength=' in line:
             parsed = _parse_signal_object(line.split('mSignalStrength=', 1)[1])
             if parsed:
                 return parsed
-    # Legacy flat list: `SignalStrength:` followed by ints (the object
-    # format is `SignalStrength:{`, which this pattern cannot match).
     m = re.search(r'SignalStrength:\s+(-?\d+(?: -?\d+)*)', text)
     if m:
         parsed = _parse_signal_legacy([int(x) for x in m.group(1).split()])
@@ -1018,20 +1284,42 @@ def _reg_label(svc, field):
 def _parse_registration(text):
     """Parse registration state from `dumpsys telephony.registry` output.
 
-    Uses the first top-level `mServiceState=` line (the current state;
-    everything after is notify history). Handles the modern object format
-    `mServiceState={mVoiceRegState=0(IN_SERVICE), ...}` and, as a
-    best-effort, the legacy flat `ServiceState: <voice> <data> ...` form.
+    Uses the top-level `mServiceState=` lines. On multi-phone dumps
+    (separate `Phone Id` blocks, dual-SIM) the IN_SERVICE subscription is
+    preferred over an out-of-service first record — SIM 0 must not shadow
+    the healthy active SIM (A-50); single-phone dumps keep first-record
+    semantics. Handles the modern object format and the legacy flat form.
     Returns a dict with None for fields the build does not expose.
     """
-    svc = None
+    blocks = []
     for line in text.splitlines():
         if line.lstrip().startswith('mServiceState='):
-            svc = line.split('mServiceState=', 1)[1].strip()
-            break
-    if not svc:
+            blocks.append(line.split('mServiceState=', 1)[1].strip())
+    if not blocks:
         return None
+    parsed = []
+    for svc in blocks:
+        reg = _parse_service_state(svc, text)
+        if reg is not None:
+            parsed.append(reg)
+    if not parsed:
+        return None
+    if 'Phone Id=' in text:
+        for reg in parsed:
+            if reg["service_state"] == "IN_SERVICE":
+                return reg
+    return parsed[0]
 
+
+def _parse_service_state(svc, text):
+    """Parse ONE `mServiceState=` block into a reg dict.
+
+    Handles the modern object format
+    `mServiceState={mVoiceRegState=0(IN_SERVICE), ...}` and, as a
+    best-effort, the legacy flat `ServiceState: <voice> <data> ...` form
+    (with its top-level companion lines). Returns a dict with None for
+    fields the build does not expose.
+    """
     reg = {
         "service_state": None,
         "data_state": None,
@@ -1045,9 +1333,11 @@ def _parse_registration(text):
         reg["service_state"] = _reg_label(svc, 'mVoiceRegState')
         reg["data_state"] = _reg_label(svc, 'mDataRegState')
 
-        m = re.search(r'getRilDataRadioTechnology=(-?\d+)\(([A-Za-z]+)\)', svc)
+        # A-47: network labels may carry punctuation (LTE_CA, HSPA+) that
+        # the old [A-Za-z]+ pattern dropped, leaving network_type null.
+        m = re.search(r'getRilDataRadioTechnology=(-?\d+)\(([A-Za-z0-9_+]+)\)', svc)
         if not m:
-            m = re.search(r'getRilVoiceRadioTechnology=(-?\d+)\(([A-Za-z]+)\)', svc)
+            m = re.search(r'getRilVoiceRadioTechnology=(-?\d+)\(([A-Za-z0-9_+]+)\)', svc)
         if m:
             reg["network_type"] = m.group(2)
 
@@ -1149,11 +1439,18 @@ def _parse_registration_infos(svc):
 
 
 def _radio_reg_state():
-    """Current mVoiceRegState label (e.g. IN_SERVICE, POWER_OFF) or None."""
+    """Current mVoiceRegState label (e.g. IN_SERVICE, POWER_OFF) or None.
+
+    Accepts both the object form `mVoiceRegState=3(POWER_OFF)` and the
+    bare legacy numeric form `mVoiceRegState=3` — modem-reset verification
+    must work on legacy dumps the rest of the app supports (A-98)."""
     try:
         text = _run_dumpsys("telephony.registry")
         m = re.search(r'mVoiceRegState=-?\d+\(([A-Z_]+)\)', text)
-        return m.group(1) if m else None
+        if m:
+            return m.group(1)
+        m = re.search(r'mVoiceRegState=(-?\d+)', text)
+        return _REG_STATE_LABELS.get(m.group(1)) if m else None
     except Exception:
         return None
 
@@ -1180,9 +1477,26 @@ def _wait_for_radio_recovery(attempts=30, interval=2):
     return _radio_reg_state() == "IN_SERVICE"
 
 
+def _wait_radio_on(attempts=10, interval=1):
+    """Poll until the radio reports a definite non-POWER_OFF state.
+
+    An unparseable registration read (None) does NOT count as recovered —
+    certifying "radio is back" without proof is the A-20/A-148 bug."""
+    for _ in range(attempts):
+        state = _radio_reg_state()
+        if state is not None and state != "POWER_OFF":
+            return True
+        time.sleep(interval)
+    return False
+
+
 def _modem_reset():
     """Soft modem reset (module-level so the drop watchdog's auto-
     recovery A-196 can invoke the same path as the API endpoint).
+
+    A-51: a concurrent reset is refused, not raced — the lock is held
+    for the whole procedure, so the API endpoint and the watchdog's
+    auto-recovery path serialize on it.
 
     Preferred: `cmd phone radio power` off/on (3s apart), used only
     when `cmd phone help` actually lists the subcommand. Fallback:
@@ -1192,6 +1506,16 @@ def _modem_reset():
     honest ok:false with the observed post-reset state is returned —
     a reset that never recovered is not reported as success.
     """
+    if not _MODEM_RESET_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "already in progress"}
+    try:
+        return _modem_reset_locked()
+    finally:
+        _MODEM_RESET_LOCK.release()
+
+
+def _modem_reset_locked():
+    """Actual reset procedure — caller holds _MODEM_RESET_LOCK (A-51)."""
     # Preferred mechanism: cmd phone radio power (only if listed in help)
     if _cmd_available("phone", "radio power"):
         try:
@@ -1199,14 +1523,20 @@ def _modem_reset():
             time.sleep(3)
             if _wait_for_radio_state("POWER_OFF"):
                 _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "on"], timeout=10)
-                if _wait_for_radio_recovery():
-                    return {"ok": True}
-                state = _radio_reg_state()
-                return {"ok": False,
-                        "error": "radio did not return to service (state: {})".format(
-                            state or "unknown")}
+                if not _wait_radio_on():
+                    return {"ok": False,
+                            "error": "radio did not power back on after reset"}
+                if not _wait_for_radio_recovery():
+                    state = _radio_reg_state()
+                    return {"ok": False,
+                            "error": "radio did not return to service (state: {})".format(
+                                state or "unknown")}
+                return {"ok": True}
+            # A-137: the listed command ran but the radio never powered
+            # off — leave the radio on and try the airplane-mode fallback
+            # instead of failing outright.
             _run_cmd(["/system/bin/cmd", "phone", "radio", "power", "on"], timeout=10)
-            return {"ok": False, "error": "radio power off did not take effect"}
+            print("radio power off did not take effect; trying airplane-mode fallback")
         except Exception as e:
             print(f"Modem reset via radio power failed: {e}")
 
@@ -1216,21 +1546,39 @@ def _modem_reset():
     # enable/disable commands are separate, so even a mid-toggle
     # exception still runs the cleanup before reporting.
     if _cmd_available("connectivity", "airplane-mode"):
+        was_airplane_on = _airplane_on()
         try:
             _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "enable"], timeout=10)
             time.sleep(3)
             powered_off = _wait_for_radio_state("POWER_OFF")
-            # Guaranteed cleanup: disable + verify, retried.
+            if was_airplane_on:
+                # A-62: the user had airplane mode on before the reset;
+                # restore that choice, never silently turn connectivity
+                # back on.
+                if _airplane_on() is True:
+                    return {"ok": True}
+                _run_cmd(["/system/bin/cmd", "connectivity", "airplane-mode", "enable"], timeout=10)
+                time.sleep(2)
+                if _airplane_on() is True:
+                    return {"ok": True}
+                return {"ok": False,
+                        "error": "airplane mode was not restored after modem reset"}
+            # Guaranteed cleanup: disable + verify, retried (A-46).
             if not _disable_airplane():
                 return {"ok": False,
                         "error": "airplane mode left on after modem reset (disable failed)"}
             if powered_off:
-                if _wait_for_radio_recovery():
-                    return {"ok": True}
-                state = _radio_reg_state()
-                return {"ok": False,
-                        "error": "radio did not return to service (state: {})".format(
-                            state or "unknown")}
+                # A-148: the radio must verifiably leave POWER_OFF.
+                if not _wait_radio_on():
+                    return {"ok": False,
+                            "error": "radio did not power back on after modem reset"}
+                # A-197: and return to IN_SERVICE (re-camping).
+                if not _wait_for_radio_recovery():
+                    state = _radio_reg_state()
+                    return {"ok": False,
+                            "error": "radio did not return to service (state: {})".format(
+                                state or "unknown")}
+                return {"ok": True}
             return {"ok": False, "error": "airplane-mode toggle did not power off the radio"}
         except Exception as e:
             # Mid-toggle failure: try to leave the radio on before
@@ -1257,9 +1605,11 @@ def _query_md_pid(device):
         fd = os.open(device, os.O_RDWR)
         try:
             buf = bytearray(16)
-            res = fcntl.ioctl(fd, DIAG_IOCTL_QUERY_MD_PID, buf)
-            if len(res) == 16:
-                buf = res
+            # fcntl.ioctl on a mutable buffer returns the kernel status
+            # int and fills the buffer IN PLACE — the return value is not
+            # the payload (A-143: the old len(res) path raised TypeError
+            # and health always reported md_session_owner null).
+            fcntl.ioctl(fd, DIAG_IOCTL_QUERY_MD_PID, buf)
             _, _, pid, _ = struct.unpack('<IIiI', bytes(buf))
             return pid if pid > 0 else None
         finally:
@@ -1268,73 +1618,236 @@ def _query_md_pid(device):
         return None
 
 
-def _parse_band_camping(text):
-    """Parse serving EARFCN and band from `dumpsys telephony.registry`.
+# NR-ARFCN (DL) -> band fallback for CellIdentityNr blocks that omit
+# mBands. DL ranges from 3GPP TS 38.104 Table 5.4.2.3-1, restricted to the
+# app's NR catalog. Overlapping ranges are inherently ambiguous (n2/n25,
+# n1/n66, n7/n41, n77/n78) — first match wins; mBands from the identity
+# block is authoritative when present.
+_NR_ARFCN_BANDS = (
+    (422000, 434000, 1),
+    (386000, 398000, 2),
+    (361000, 376000, 3),
+    (173800, 178800, 5),
+    (524000, 538000, 7),
+    (185000, 192000, 8),
+    (158200, 164200, 20),
+    (386000, 399000, 25),
+    (151600, 160600, 28),
+    (514000, 524000, 38),
+    (460000, 480000, 40),
+    (499200, 538000, 41),
+    (422000, 440000, 66),
+    (123400, 130400, 71),
+    (620000, 680000, 77),
+    (620000, 653333, 78),
+    (693334, 733333, 79),
+)
 
-    Prefers the LTE identity from an mCellInfo entry marked mRegistered=YES
-    (the cell actually camped on — e.g. Rogers EARFCN 2050 reports
-    mBands=[4] there, while the registered-identity block can carry a
-    misleading mBands list). Falls back to the registered-identity block
-    (mCellIdentity=CellIdentityLte). band is the first entry of the
-    mBands list. Returns (None, None) when no LTE cell identity with an
-    EARFCN is present (radio off, or camped on another RAT).
+
+def _nr_arfcn_band(nrarfcn):
+    """Best-effort NR-ARFCN -> band (first matching DL range)."""
+    for lo, hi, band in _NR_ARFCN_BANDS:
+        if lo <= nrarfcn <= hi:
+            return band
+    return None
+
+
+def _parse_band_camping(text):
+    """Parse serving EARFCN/NRARFCN and band from `dumpsys telephony.registry`.
+
+    Prefers the camped-on identity from an mCellInfo entry marked
+    mRegistered=YES (LTE or NR — the cell actually camped on; Rogers
+    EARFCN 2050 reports mBands=[4] there while the registered-identity
+    block can carry a misleading mBands list). Falls back to the
+    registered-identity blocks (mCellIdentity=CellIdentityLte /
+    CellIdentityNr). band is the first entry of the identity's mBands
+    list; NR identities without mBands use the _NR_ARFCN_BANDS fallback.
+    Returns (freq, band, rat) with rat "LTE"|"NR", or (None, None, None)
+    when no cell identity is present (radio off, or camped on a RAT the
+    dumpsys identity dump does not expose).
     """
-    def _earfcn_band(identity):
+    def _mbands_first(identity):
+        bm = re.search(r'mBands=\[?([0-9,\s]*)\]?', identity)
+        if bm:
+            # A-139: only real band identities (1..79, the app's band
+            # contract) count; junk like 0 or 999 is not a camped band.
+            bands = [int(x) for x in bm.group(1).split(',') if x.strip()]
+            bands = [b for b in bands if 1 <= b <= 79]
+            if bands:
+                return bands[0]
+        return None
+
+    def _lte_identity(identity):
         em = re.search(r'mEarfcn=(\d+)', identity)
         if not em:
             return None
         earfcn = _parse_int(em.group(1))
-        band = None
-        bm = re.search(r'mBands=\[?([0-9,\s]*)\]?', identity)
-        if bm:
-            bands = [int(x) for x in bm.group(1).split(',') if x.strip()]
-            if bands:
-                band = bands[0]
-        return earfcn, band
+        # A-136: the unknown/sentinel EARFCN (Integer.MAX_VALUE) and any
+        # value outside the LTE EARFCN domain (0..65535) are NOT a camped
+        # cell — do not render a placeholder identity as a serving cell.
+        if earfcn is None or not (0 <= earfcn <= 65535):
+            return None
+        return (earfcn, _mbands_first(identity), "LTE")
 
-    # 1) The camped-on cell: CellInfoLte entries marked mRegistered=YES.
+    def _nr_identity(identity):
+        em = re.search(r'mNrarfcn=(\d+)', identity)
+        if not em:
+            return None
+        nrarfcn = _parse_int(em.group(1))
+        band = _mbands_first(identity)
+        if band is None:
+            band = _nr_arfcn_band(nrarfcn)
+        return (nrarfcn, band, "NR")
+
+    # 1) The camped-on cell: CellInfo{Lte,Nr} entries marked mRegistered=YES.
     for m in re.finditer(
-            r'CellInfoLte:\{mRegistered=YES[^}]*?CellIdentityLte:\{([^}]*)\}',
+            r'CellInfo(Lte|Nr):\{mRegistered=YES[^}]*?CellIdentity\1:\{([^}]*)\}',
             text):
-        hit = _earfcn_band(m.group(1))
+        hit = _lte_identity(m.group(2)) if m.group(1) == "Lte" \
+            else _nr_identity(m.group(2))
         if hit:
             return hit
-    # 2) Registered-identity block (mCellIdentity=CellIdentityLte).
-    for m in re.finditer(r'mCellIdentity=CellIdentityLte:\s*\{([^}]*)\}', text):
-        hit = _earfcn_band(m.group(1))
+    # 2) Registered-identity blocks (mCellIdentity=CellIdentity{Lte,Nr}).
+    for m in re.finditer(
+            r'mCellIdentity=CellIdentity(Lte|Nr):\s*\{([^}]*)\}', text):
+        hit = _lte_identity(m.group(2)) if m.group(1) == "Lte" \
+            else _nr_identity(m.group(2))
         if hit:
             return hit
-    return None, None
+    return None, None, None
+
+
+def _trim_band_camping_log(path, max_lines=BAND_CAMPING_MAX_LINES):
+    """Cap the camping log at max_lines lines (rewrite only when large).
+
+    A-28: the old sampler appended forever with no rotation, so disk
+    growth was unbounded and every /api/band-camping read re-read the
+    whole file. The trim is a cheap size check on the common path and a
+    bounded rewrite only when the log has grown past the cap."""
+    try:
+        if os.path.getsize(path) < 64 * 1024:
+            return
+        with open(path, 'r') as f:
+            lines = f.readlines()
+        if len(lines) <= max_lines:
+            return
+        with open(path, 'w') as f:
+            f.writelines(lines[-max_lines:])
+    except OSError:
+        pass
+
+
+def _read_tail(path, limit):
+    """Return the last `limit` lines of `path` without a full-file read.
+
+    A-28: the log is polled every 5s; reading the whole (potentially
+    large) file per poll is the exact cost the finding calls out. Reads a
+    bounded tail chunk; when the chunk starts mid-line its first line is
+    a fragment and is dropped. Never raises."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return []
+            want = min(size, 4096 + limit * 256)
+            f.seek(size - want)
+            data = f.read().decode('utf-8', 'replace')
+        lines = data.splitlines()
+        if want < size:
+            lines = lines[1:]
+        return lines[-limit:]
+    except OSError:
+        return []
+
+
+def _band_camping_sample():
+    """One sampling pass: dump telephony, append a CSV line when an
+    EARFCN is present, trim the log. Returns True when a line was
+    appended. Never raises."""
+    try:
+        os.makedirs(os.path.dirname(BAND_CAMPING_LOG), exist_ok=True)
+        freq, band, rat = _parse_band_camping(
+            _run_dumpsys("telephony.registry"))
+        if freq is None:
+            return False
+        line = "{},{},{},{}\n".format(
+            int(time.time() * 1000), freq,
+            band if band is not None else "",
+            rat if rat is not None else "")
+        with open(BAND_CAMPING_LOG, 'a') as f:
+            f.write(line)
+        _trim_band_camping_log(BAND_CAMPING_LOG)
+        return True
+    except Exception as e:
+        print("Band camping sample failed: {}".format(e))
+        return False
 
 
 def _band_camping_loop():
-    """Background sampler (daemon): every BAND_CAMPING_INTERVAL seconds,
-    dump telephony.registry, extract the serving EARFCN/band, and append
-    a `timestamp,earfcn,band` CSV line to BAND_CAMPING_LOG. Lines are
-    written only when an EARFCN is present; failures are logged and
-    skipped, never fatal."""
+    """Background sampler (daemon): while the band_camping setting is
+    enabled, dump telephony.registry every BAND_CAMPING_INTERVAL seconds,
+    extract the serving freq/band, and append a `timestamp,freq,band,rat`
+    CSV line to BAND_CAMPING_LOG (rat LTE|NR since A-030). Gated on the
+    settings toggle (A-120/A-201: the old sampler ran unconditionally at
+    boot, 24/7, with no way to disable it) and live-toggled like the drop
+    logger. Failures are logged and skipped, never fatal."""
     while True:
         try:
-            os.makedirs(os.path.dirname(BAND_CAMPING_LOG), exist_ok=True)
-            earfcn, band = _parse_band_camping(
-                _run_dumpsys("telephony.registry"))
-            if earfcn is not None:
-                # A-154: keep CSV timestamps strictly increasing even if
-                # the wall clock steps backwards (NTP/carrier sync) — the
-                # last-N chart must never show time going backwards.
-                raw = int(time.time() * 1000)
-                ms = max(raw, _BAND_CAMPING_LAST_MS[0] + 1)
-                _BAND_CAMPING_LAST_MS[0] = ms
-                line = "{},{},{}\n".format(
-                    ms, earfcn, band if band is not None else "")
-                with open(BAND_CAMPING_LOG, 'a') as f:
-                    f.write(line)
+            if SETTINGS.get("band_camping"):
+                _band_camping_sample()
         except Exception as e:
-            print("Band camping sample failed: {}".format(e))
+            print("Band camping loop failed: {}".format(e))
         time.sleep(BAND_CAMPING_INTERVAL)
 
 
+# Per-endpoint in-flight guards for the 2s signal/registration polls
+# (A-34): a slow dumpsys must not stack overlapping subprocesses and
+# worker threads. A concurrent poll reuses the last successful result
+# instead of running a second dumpsys.
+_SIGNAL_READ = {"lock": threading.Lock(), "last": None}
+_REG_READ = {"lock": threading.Lock(), "last": None}
+
+
+def _poll_once(cache, fn):
+    """Run `fn` under `cache`'s in-flight guard (A-34).
+
+    When another poll is already in flight, reuse its last successful
+    result instead of stacking a second dumpsys subprocess; the first
+    concurrent caller (nothing cached yet) waits for the in-flight read.
+    Only successful results are cached, so a transient dumpsys failure is
+    retried on the next poll rather than served forever."""
+    lock = cache["lock"]
+    if not lock.acquire(blocking=False):
+        cached = cache["last"]
+        if cached is not None:
+            return cached
+        lock.acquire()
+    try:
+        result = fn()
+        if "error" not in result:
+            cache["last"] = result
+        return result
+    finally:
+        lock.release()
+
+
 class BandHandler(http.server.BaseHTTPRequestHandler):
+    # A-60: bound the per-connection socket read so a client that sends an
+    # incomplete request line/body cannot pin a worker thread forever
+    # (BaseHTTPRequestHandler applies `timeout` to the connection socket
+    # in setup()).
+    timeout = 15
+    # A-169: HTTP/1.1 keep-alive — the UI's 2s/5s polling reuses one
+    # connection instead of churning a TCP handshake + TIME_WAIT per
+    # request, and pipelined requests are read instead of abandoned.
+    protocol_version = "HTTP/1.1"
+
+    def version_string(self):
+        # A-168: do not fingerprint the bundled CPython version in every
+        # response's Server header.
+        return "Bandctl/2.6"
+
     def do_GET(self):
         if self.path.startswith('/api/'):
             self.handle_api()
@@ -1370,24 +1883,88 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _is_loopback(self):
-        """True when the client connected via a loopback address."""
+        """True when the client connected via a loopback address.
+
+        Uses ipaddress so the WHOLE 127.0.0.0/8 range (127.0.0.2, ...),
+        ::1, and IPv4-mapped forms count — not just the literal 127.0.0.1
+        (A-073)."""
         host = self.client_address[0]
-        return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    # State-changing actions that an unprivileged local app must not reach
+    # without the bearer token when one is configured (A-178/A-189). All
+    # other actions are read-only diagnostics.
+    _WRITE_ACTIONS = frozenset(
+        ["write", "modem-reset", "boot-apply", "restart", "export"])
 
     def _auth_required(self, action):
-        """LAN auth gate (batch contract + bootstrap amendment).
+        """LAN auth gate (A-026/A-049/A-158/A-178).
 
-        A bearer token is required iff LAN is enabled AND the client is
-        not loopback — except GET /api/settings, which returns no token
-        material and must stay readable so a fresh laptop page can learn
-        that a token is required before it can store one."""
-        if SETTINGS["bind"] != "0.0.0.0":
+        Remote (non-loopback) clients are gated whenever the server is
+        actually reachable on a non-loopback interface (the EFFECTIVE bind,
+        A-049 — not the pending SETTINGS value, which update_settings flips
+        before the socket is rebound). The only remote exemption is the
+        read-only GET /api/settings bootstrap, keyed on the PATH so the
+        documented bare route is exempt too (A-158).
+
+        Loopback clients are exempt only for read-only diagnostics; the
+        state-changing actions in _WRITE_ACTIONS (and the drop-log toggle)
+        require the bearer token when one is configured, so an unprivileged
+        phone app or web page cannot drive the modem, restart the server,
+        export files, or mint/steal LAN credentials (A-178/A-189). With no
+        token configured (LAN never enabled), loopback state changes pass —
+        the documented "the phone itself never needs the token" bootstrap.
+        POST /api/settings is handled here as the exposure control and its
+        regenerate path is separately gated on the current token."""
+        effective_bind = _EFFECTIVE_BIND or SETTINGS.get("bind", "127.0.0.1")
+        settings_get = (self.command == "GET"
+                        and self.path.split('?', 1)[0] == '/api/settings')
+        if not self._is_loopback():
+            if effective_bind != "0.0.0.0":
+                return False  # server not listening on this interface
+            if settings_get:
+                return False
+            return True
+        # Loopback client.
+        if settings_get:
             return False
-        if self._is_loopback():
+        if action in self._WRITE_ACTIONS:
+            return SETTINGS.get("token") is not None
+        if action == "drop-log" and self.command == "POST":
+            return SETTINGS.get("token") is not None
+        return False
+
+    def _host_allowed(self):
+        """Validate the Host header (A-178 DNS-rebinding defense).
+
+        Allows the loopback names/addresses and the LOCAL address of this
+        connection (the phone's LAN IP the client actually used). A missing
+        Host (HTTP/1.0) is accepted. Anything else — a rebinding domain —
+        is rejected, so a remote page cannot point its own name at
+        127.0.0.1 and drive the API."""
+        host = (self.headers.get('Host') or '').strip() if self.headers else ''
+        if not host:
+            return True
+        hostname = host
+        if hostname.startswith('['):  # [::1]:8080
+            hostname = hostname.split(']', 1)[0][1:]
+        elif hostname.count(':') == 1:
+            hostname = hostname.rsplit(':', 1)[0]
+        if hostname in ("localhost", "127.0.0.1", "::1"):
+            return True
+        try:
+            local = self.connection.getsockname()[0]
+        except Exception:
+            local = None
+        if local and hostname == local:
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
             return False
-        if action == "settings" and self.command == "GET":
-            return False
-        return True
 
     def _check_auth(self):
         """Validate the bearer token against SETTINGS["token"].
@@ -1430,17 +2007,37 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, TypeError) as e:
             raise ValueError("invalid JSON body: {}".format(e))
 
+    @staticmethod
+    def _cors_origin(origin):
+        """Reflect a cross-origin request's Origin only for the trusted
+        WebView schemes (KernelSU WebUI, Android asset WebViews). Never
+        wildcard: an arbitrary web page must not be able to READ API
+        responses (A-026). LAN-mode laptop clients are same-origin (the
+        page is served by this server) and need no CORS at all."""
+        if not origin:
+            return None
+        origin = origin.strip()
+        if origin.startswith("ksu://") or origin.startswith("appassets://"):
+            return origin
+        return None
+
     def do_OPTIONS(self):
         # CORS preflight for cross-origin POSTs from the KernelSU WebUI
-        # origin (ksu://webui/bandctl/ or appassets://...) and LAN-mode
-        # browser clients. Authorization must be allowed so a laptop page
-        # can send the bearer token on POST /api/settings. Preflights
-        # carry no Authorization header, so OPTIONS stays ungated.
+        # (ksu://webui/bandctl/) and Android asset WebViews (appassets://).
+        # Preflights carry no Authorization header, so the gate is
+        # origin-based: only trusted origins receive allow headers (plus
+        # the Private-Network-Access acknowledgement); everyone else gets a
+        # bare 204 and the browser blocks the request (A-026).
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers',
-                         'Content-Type, Authorization')
+        origin = self.headers.get('Origin') if self.headers else None
+        allowed = self._cors_origin(origin)
+        if allowed:
+            self.send_header('Access-Control-Allow-Origin', allowed)
+            self.send_header('Access-Control-Allow-Methods',
+                             'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers',
+                             'Content-Type, Authorization')
+            self.send_header('Access-Control-Allow-Private-Network', 'true')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -1453,7 +2050,27 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         {"ok": false, "error": str(e)} instead of a 500."""
         try:
             if not self.path.startswith('/api/'):
-                self.send_json({"error": "unknown action"})
+                self.send_json({"error": "unknown action"}, status=400)
+                return
+
+            # A-169: HTTP/1.1 chunked bodies are not decoded — reject them
+            # explicitly instead of silently dropping the body and
+            # answering "invalid JSON body". The body is not consumed, so
+            # keep-alive must be disabled (see _body_may_be_unread).
+            if self.headers.get('Transfer-Encoding'):
+                if self._body_may_be_unread():
+                    self.close_connection = True
+                self.send_json(
+                    {"ok": False,
+                     "error": "chunked transfer encoding not supported"},
+                    status=501)
+                return
+
+            # A-178: DNS-rebinding defense — the Host must be a loopback
+            # name or this connection's own local address.
+            if not self._host_allowed():
+                self.send_json({"ok": False, "error": "invalid host"},
+                               status=403)
                 return
 
             query = self.path.split('?', 1)[1] if '?' in self.path else ''
@@ -1462,12 +2079,36 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 if part.startswith('action='):
                     action = part.split('=', 1)[1]
                     break
+            if not action:
+                # A-65: the documented bare routes (GET /api/read,
+                # /api/defaults, /api/health, ...) carry no ?action= —
+                # derive the action from the path so the README contract
+                # works for scripts/proxies/users, not just the UI.
+                seg = self.path.split('?', 1)[0].rstrip('/')
+                if seg.startswith('/api/'):
+                    action = seg[len('/api/'):]
 
             if self._auth_required(action):
                 auth_error = self._check_auth()
                 if auth_error is not None:
+                    # The body (if any) is not consumed on the 401 path —
+                    # close the connection so leftover bytes are not
+                    # misparsed as a pipelined request under keep-alive.
+                    if self._body_may_be_unread():
+                        self.close_connection = True
                     self.send_json(auth_error, status=401)
                     return
+
+            # A-66/A-71: state-changing endpoints are POST-only. GET must
+            # never trigger a restart, modem reset, boot apply, band write,
+            # or export — a link, prefetcher, retrying proxy, or <img> tag
+            # could fire it.
+            if self.command != 'POST' and action in (
+                    'write', 'restart', 'boot-apply', 'export',
+                    'modem-reset'):
+                self.send_json({"ok": False, "error": "method not allowed"},
+                               status=405)
+                return
 
             if action == 'read':
                 self.send_json(self.read_config())
@@ -1475,7 +2116,27 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(self.read_defaults())
             elif action == 'settings':
                 if self.command == 'POST':
-                    self.send_json(self.update_settings(self._read_json_body()))
+                    data = self._read_json_body()
+                    # A-178/A-220: token rotation is gated on the CURRENT
+                    # token — an unauthenticated caller cannot mint-and-
+                    # steal a fresh credential. (First-ever enable with no
+                    # token configured is the legitimate bootstrap and stays
+                    # allowed.)
+                    if (isinstance(data, dict)
+                            and data.get("regenerate") is True):
+                        auth_error = self._check_auth()
+                        if auth_error is not None:
+                            self.send_json(auth_error, status=401)
+                            return
+                    res = self.update_settings(data)
+                    status = 200
+                    if res.get("ok") is False:
+                        # A-017: a failed persistence is distinguishable by
+                        # HTTP status so status-checking clients see the
+                        # failure; client validation errors are 400.
+                        status = 500 if res.get("error", "").startswith(
+                            "settings save failed") else 400
+                    self.send_json(res, status=status)
                 else:
                     self.send_json(self.read_settings())
             elif action == 'restart':
@@ -1487,16 +2148,29 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
             elif action == 'export':
                 self.send_json(self.export_config(self._read_json_body()))
             elif action == 'signal':
-                self.send_json(self.read_signal())
+                result = self.read_signal()
+                # A-02: transport errors must not look healthy — the
+                # frontend gates on r.ok, so surface them as 503.
+                self.send_json(result,
+                               status=503 if "error" in result else 200)
             elif action == 'registration':
-                self.send_json(self.read_registration())
+                result = self.read_registration()
+                self.send_json(result,
+                               status=503 if "error" in result else 200)
             elif action == 'health':
-                self.send_json(self.modem_health())
+                result = self.modem_health()
+                self.send_json(
+                    result,
+                    status=503 if result.get("status") == "error" else 200)
             elif action == 'modem-reset':
                 self.send_json(self.modem_reset())
             elif action == 'drop-log':
                 if self.command == 'POST':
-                    self.send_json(self.update_drop_log(self._read_json_body()))
+                    res = self.update_drop_log(self._read_json_body())
+                    status = 500 if (res.get("ok") is False
+                                     and res.get("error", "").startswith(
+                                         "settings save failed")) else 200
+                    self.send_json(res, status=status)
                 else:
                     self.send_json(self.read_drop_log())
             elif action == 'band-camping':
@@ -1508,11 +2182,43 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                                 limit = max(1, int(part.split('=', 1)[1]))
                             except (TypeError, ValueError):
                                 pass
-                self.send_json(self.read_band_camping(limit))
+                if self.command == 'POST':
+                    self.send_json(
+                        self.update_band_camping(self._read_json_body()))
+                else:
+                    result = self.read_band_camping(limit)
+                    # A-142: a read failure must not erase the UI's last
+                    # known cell — surface it as a non-200 error instead
+                    # of an ok:false 200 the frontend treats as empty.
+                    self.send_json(
+                        result,
+                        status=503 if "error" in result else 200)
             else:
-                self.send_json({"error": "unknown action"})
+                # Unknown action: the body (if any) is never consumed.
+                if self._body_may_be_unread():
+                    self.close_connection = True
+                self.send_json({"error": "unknown action"}, status=400)
         except Exception as e:
+            # Guard path: a body read may have failed/been skipped (e.g.
+            # oversized Content-Length), so keep-alive cannot be trusted.
+            if self._body_may_be_unread():
+                self.close_connection = True
             self.send_json({"ok": False, "error": str(e)})
+
+    def _body_may_be_unread(self):
+        """True when the request may carry a body this handler did not
+        consume (chunked, non-numeric/oversized Content-Length).
+
+        Under HTTP/1.1 keep-alive the stdlib would otherwise re-read the
+        leftover body bytes as a pipelined request and answer a spurious
+        400 — error paths set close_connection in that case."""
+        if self.headers.get('Transfer-Encoding'):
+            return True
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (TypeError, ValueError):
+            return True
+        return length > 0
 
     def _normalize_bands(self, bands):
         """Coerce a raw band list to deduped ints 1..79, order preserved.
@@ -1548,9 +2254,12 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         """Validate lte/nr band lists (M8), returning (bands, error).
 
         Each band must be an int 1..79 (numeric strings accepted), lists
-        are deduped preserving order, and LTE must be non-empty. Returns
-        ({"lte": [...], "nr": [...]}, None) on success or (None, msg) on
-        violation — never raises."""
+        are deduped preserving order, and LTE must be non-empty.
+        Additionally each LTE band must be in the LTE catalog and each NR
+        band in the NR catalog (A-131): the same catalogs the UI renders,
+        so the modem is never asked to apply a band in the wrong RAT
+        preference namespace. Returns ({"lte": [...], "nr": [...]}, None)
+        on success or (None, msg) on violation — never raises."""
         if not isinstance(data, dict):
             return None, "request body must be a JSON object"
         lte_raw = data.get('lte', [])
@@ -1565,6 +2274,14 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
             return None, "invalid nr band list: each band must be an integer 1-79"
         if not lte:
             return None, "lte must contain at least one band"
+        bad_lte = [b for b in lte if b not in _LTE_CATALOG]
+        if bad_lte:
+            return None, "invalid lte band list: {} not in the LTE band catalog".format(
+                ",".join(str(b) for b in bad_lte))
+        bad_nr = [b for b in nr if b not in _NR_CATALOG]
+        if bad_nr:
+            return None, "invalid nr band list: {} not in the NR band catalog".format(
+                ",".join(str(b) for b in bad_nr))
         return {"lte": lte, "nr": nr}, None
 
     def read_settings(self):
@@ -1580,10 +2297,14 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         bearer token.
 
         lan_enabled must be a bool. The token is created when enabling
-        with no token set or when regenerate=true, and is returned ONLY
-        when it was created/regenerated in this call (otherwise null).
-        Settings are persisted atomically; a save failure is reported as
-        ok:false."""
+        with no token set or when regenerate=true (regeneration requires
+        the current token — enforced by the dispatcher, A-178/A-220), and
+        is returned ONLY when it was created/regenerated in this call
+        (otherwise null). The new state is computed on a COPY and persisted
+        BEFORE the live SETTINGS dict is mutated, so a failed save leaves
+        the running configuration — and the token every LAN client holds —
+        untouched (A-017/A-153). Calls are serialized so concurrent
+        requests cannot interleave the read-modify-write (A-041)."""
         if not isinstance(data, dict):
             return {"ok": False, "error": "request body must be a JSON object"}
         lan_enabled = data.get("lan_enabled")
@@ -1591,20 +2312,27 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "error": "lan_enabled must be a bool"}
         regenerate = data.get("regenerate") is True
 
-        created = False
-        if (lan_enabled and SETTINGS["token"] is None) or regenerate:
-            SETTINGS["token"] = secrets.token_urlsafe(24)
-            created = True
-        SETTINGS["bind"] = "0.0.0.0" if lan_enabled else "127.0.0.1"
-        try:
-            _save_settings()
-        except Exception as e:
-            return {"ok": False, "error": "settings save failed: {}".format(e)}
+        with _SETTINGS_UPDATE_LOCK:
+            new_settings = dict(SETTINGS)
+            created = False
+            if (lan_enabled and new_settings["token"] is None) or regenerate:
+                new_settings["token"] = secrets.token_urlsafe(24)
+                created = True
+            new_settings["bind"] = "0.0.0.0" if lan_enabled else "127.0.0.1"
+            try:
+                _save_settings(new_settings)
+            except Exception as e:
+                # Persist first: SETTINGS is untouched on failure, so a
+                # failed regenerate does not revoke the token in use.
+                return {"ok": False,
+                        "error": "settings save failed: {}".format(e)}
+            SETTINGS["token"] = new_settings["token"]
+            SETTINGS["bind"] = new_settings["bind"]
         return {
             "ok": True,
             "lan_enabled": lan_enabled,
-            "token_required": SETTINGS["token"] is not None,
-            "token": SETTINGS["token"] if created else None,
+            "token_required": new_settings["token"] is not None,
+            "token": new_settings["token"] if created else None,
         }
 
     def restart_service(self):
@@ -1612,37 +2340,59 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
 
         service.sh kills the old server and starts a fresh one; it is
         launched ~1s later from a background thread so the {"ok": true}
-        response is delivered first. Returns immediately."""
+        response is delivered first. Returns immediately. Serialized
+        (A-041): only one restart may be pending at a time, so repeated
+        taps cannot stack detached service.sh runs that each kill and
+        replace the server. The response carries the CURRENT process pid
+        so a client can prove the restart by polling /api/health until it
+        reports a DIFFERENT pid (A-24/A-118) — an HTTP-OK health answer
+        from the old, still-running process must not certify a restart.
+        """
+        global _RESTART_PENDING
+        with _RESTART_LOCK:
+            if _RESTART_PENDING:
+                return {"ok": False, "error": "restart already scheduled"}
+            _RESTART_PENDING = True
         def _do_restart():
-            time.sleep(1)
+            global _RESTART_PENDING
             try:
+                time.sleep(1)
                 subprocess.Popen(["sh", str(MODDIR / "service.sh")],
                                  start_new_session=True,
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
             except Exception as e:
                 print("Service restart failed: {}".format(e))
+            finally:
+                with _RESTART_LOCK:
+                    _RESTART_PENDING = False
         threading.Thread(target=_do_restart, daemon=True).start()
-        return {"ok": True}
+        return {"ok": True, "pid": os.getpid()}
 
     def read_defaults(self):
         """Carrier-aware default band lists (GET /api/defaults).
 
         Carrier is detected from `getprop gsm.operator.numeric` (Rogers
         and Fido share 302720); the operator name comes from
-        `getprop gsm.operator.alpha`. Never raises: on any failure the
-        response degrades to carrier "other" with unrestricted defaults.
-        """
+        `getprop gsm.operator.alpha`. When the operator property cannot be
+        read the response still carries (crash-pair-free) defaults, but
+        carrier_detected=false lets clients warn instead of trusting an
+        unverified carrier — detection failure must not silently select
+        unrestricted defaults (A-58). Never raises."""
+        detected = True
         try:
             mccmnc = (_get_prop("gsm.operator.numeric") or "").strip(" ,") or None
             carrier = carrier_for_mccmnc(mccmnc)
             operator = (_get_prop("gsm.operator.alpha") or "").strip(" ,") or None
+            detected = mccmnc is not None
         except Exception as e:
             print(f"Carrier detection failed: {e}")
             mccmnc, carrier, operator = None, "other", None
+            detected = False
         defaults = defaults_for_carrier(carrier)
         return {
             "carrier": carrier,
+            "carrier_detected": detected,
             "mccmnc": mccmnc or None,
             "operator": operator,
             "lte": defaults["lte"],
@@ -1651,83 +2401,158 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
 
     def read_config(self):
         """Read band configuration: QMI (QRTR) first, then diag, then the
-        fallback config file."""
+        fallback config file.
+
+        A transport is only authoritative when the exchange verifiably
+        succeeded: QMI must exit 0 and carry a success result TLV
+        (A-14/A-44), a diag read that returns no bands is treated as a
+        failed read rather than an authoritative empty config (A-15), and
+        a corrupt or invalid persisted file is reported, not silently
+        replaced by carrier defaults (A-149)."""
         qmi_cfg = self._read_qmi_config()
         if qmi_cfg is not None:
             return qmi_cfg
         try:
-            # Try direct diag read next
             bands = read_bands(DIAG_DEVICE)
-            return {
-                "lte": [str(b) for b in bands['lte_bands']],
-                "nr": [str(b) for b in bands['nr_bands']],
-                "source": "diag"
-            }
+            lte = [str(b) for b in bands.get('lte_bands', [])
+                   if b in _LTE_CATALOG]
+            nr = [str(b) for b in bands.get('nr_bands', [])
+                  if b in _NR_CATALOG]
+            if not lte and not nr:
+                # A failed/partial NV read is indistinguishable from
+                # "nothing configured" — do not present it as verified
+                # diag state (A-15); fall through to the persisted file.
+                raise ValueError("diag read returned no bands (read failed?)")
+            return self._read_result(lte, nr, "diag")
         except Exception as e:
-            # Fallback to config file
             print(f"Diag read failed: {e}, trying config file")
             return self._read_config_file()
 
     def _read_qmi_config(self):
-        """Read bands via the QMI client; None when QMI is unavailable."""
-        _rc, out = _run_qmi(["--get"], QMI_GET_TIMEOUT)
+        """Read bands via the QMI client.
+
+        Returns a full read-result dict, or None when QMI is unavailable,
+        the helper exited nonzero, or the response carried no success
+        result TLV (A-14/A-44) — a failed/partial QMI exchange must never
+        be labelled `source: qmi` and suppress the diag/config fallback.
+        """
+        rc, out = _run_qmi(["--get"], QMI_GET_TIMEOUT)
+        if rc != 0 or not out:
+            return None
+        if re.search(r"result: status=0", out) is None:
+            return None
         parsed = _parse_qmi_get(out)
         if parsed is None:
             return None
-        parsed["source"] = "qmi"
-        return parsed
+        return self._read_result(parsed["lte"], parsed["nr"], "qmi")
+
+    def _read_result(self, lte, nr, source):
+        """Shape a successful read response.
+
+        Includes ok:true (so clients can uniformly distinguish success
+        from the HTTP-200 error dicts) and the current persisted-intent
+        revision rev (so a client can detect that another client changed
+        the config before its write — A-97)."""
+        return {"ok": True,
+                "lte": [str(b) for b in lte],
+                "nr": [str(b) for b in nr],
+                "source": source,
+                "rev": _CONFIG_REV}
 
     def _read_config_file(self):
-        """Read from fallback config file."""
-        try:
-            if os.path.exists(CONFIG_FILE):
+        """Read from the fallback config file, validated.
+
+        The persisted file goes through the same per-RAT validation as
+        /api/write (A-42): list types, ranges, dedup, non-empty LTE, and
+        catalog membership. Malformed JSON or invalid bands are reported
+        as {"ok": false, ...} instead of silently substituting carrier
+        defaults (A-149). A missing file falls back to carrier-aware
+        defaults (Rogers: curated whitelist; other: crash-pair-free
+        all-bands)."""
+        if os.path.exists(CONFIG_FILE):
+            try:
                 with open(CONFIG_FILE, 'r') as f:
                     data = json.load(f)
-                    data['source'] = 'config_file'
-                    return data
-        except Exception as e:
-            print(f"Config file read error: {e}")
-
-        # Default: carrier-aware. Rogers devices (MCC/MNC 302720) fall
-        # back to the curated whitelist; all other carriers get the
-        # unrestricted all-bands defaults.
+            except Exception as e:
+                return {"ok": False,
+                        "error": "config file corrupt: {}".format(e)}
+            bands, err = self._validate_bands(data)
+            if bands is None:
+                return {"ok": False,
+                        "error": "invalid config file: {}".format(err)}
+            return self._read_result(bands["lte"], bands["nr"], "config_file")
         defaults = defaults_for_carrier(
             carrier_for_mccmnc(_get_prop("gsm.operator.numeric")))
-        defaults["source"] = "default"
-        return defaults
+        return {"ok": True,
+                "lte": [str(b) for b in defaults["lte"]],
+                "nr": [str(b) for b in defaults["nr"]],
+                "source": "default",
+                "rev": _CONFIG_REV}
 
     def write_config(self, data):
         """Write band configuration to the modem: QMI (QRTR) first, then
-        diag. The config file is always mirrored so intent persists."""
+        diag.
+
+        The config file is mirrored only after a VERIFIED apply: a failed
+        apply is never promoted to boot-time source of truth (A-68), and
+        a persistence failure is reported instead of claiming a save that
+        did not happen (A-16). Writes are serialized end to end (A-45);
+        an optional rev from a prior /api/read rejects stale writes from
+        another client (A-97)."""
         bands, err = self._validate_bands(data)
         if bands is None:
             return {"ok": False, "error": err}
-        ok, source, error = self._apply_bands(bands["lte"], bands["nr"])
-        # Mirror intent regardless of outcome (matches historical
-        # behavior: the file is saved on success AND on failure).
-        self._save_config_file(bands)
-        if ok:
-            return {"ok": True, "source": source}
-        return {"ok": False, "error": error}
+        rev = data.get("rev")
+        if rev is not None and not isinstance(rev, int):
+            try:
+                rev = int(rev)  # tolerate string-digit revs from clients
+            except (TypeError, ValueError):
+                rev = None  # garbage rev is treated as absent (allow)
+        global _CONFIG_REV
+        with _BAND_WRITE_LOCK:
+            if rev is not None and rev != _CONFIG_REV:
+                return {"ok": False,
+                        "error": "config changed by another client; refresh and retry"}
+            ok, source, error = self._apply_bands(bands["lte"], bands["nr"])
+            if not ok:
+                # Keep the persisted file describing the last VERIFIED
+                # state — boot re-apply must not retry a rejected set.
+                return {"ok": False, "error": error}
+            try:
+                self._save_config_file(bands)
+            except Exception as e:
+                return {"ok": False, "error": "config save failed: {}".format(e)}
+            _CONFIG_REV += 1
+            return {"ok": True, "source": source, "rev": _CONFIG_REV}
 
     def _apply_bands(self, lte_bands, nr_bands):
         """Apply bands to the modem: QMI (QRTR) first, then diag.
 
-        Returns (ok, source, error) with error None on success. QMI
-        success means the client printed `result: status=0`; diag success
-        means write_bands() returned True. Never raises: QMI failure
-        falls through to diag, and any diag exception is reported as
+        Returns (ok, source, error) with error None on success. Both
+        transports are verified by read-back, so success is only certified
+        when the requested set was actually applied: QMI requires exit 0 +
+        a success result TLV + a read-back showing every requested band
+        (A-13/A-138), diag requires write_bands() True + a read-back
+        showing the bands (A-33). Never raises: QMI failure falls through
+        to diag, and any diag exception is reported as
         (False, "diag", str(e)).
         """
         # QMI write first (real band apply via QRTR)
         if self._write_qmi_config(lte_bands, nr_bands):
             return True, "qmi", None
 
-        # Fallback: diag write
+        # Fallback: diag write, verified by read-back so a half-applied
+        # config (LTE written, NR failed) is never reported as success.
         try:
-            if write_bands(lte_bands, nr_bands, DIAG_DEVICE):
+            if not write_bands(lte_bands, nr_bands, DIAG_DEVICE):
+                return False, "diag", "diag write failed"
+            bands = read_bands(DIAG_DEVICE)
+            applied_lte = set(bands.get('lte_bands', []))
+            applied_nr = set(bands.get('nr_bands', []))
+            if set(lte_bands) <= applied_lte and set(nr_bands) <= applied_nr:
                 return True, "diag", None
-            return False, "diag", "diag write failed"
+            return False, "diag", \
+                "diag write verification failed (some bands not applied)"
         except Exception as e:
             return False, "diag", str(e)
 
@@ -1736,83 +2561,168 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
 
         Reads the config file written by /api/write and runs it through
         the same QMI->diag apply chain. The config file is the source of
-        truth here - it is NEVER rewritten. A missing or unreadable config
-        is a skip ({"ok": true, "skipped": true}); malformed JSON,
-        invalid bands (each must be an int 1..79, LTE non-empty), or an
-        apply failure return ok:false with a short error. Never raises -
-        any exception becomes {"ok": false, "error": ...}.
+        truth here - boot apply NEVER rewrites or re-seeds it: a missing
+        config is always a skip, so deleting bands.json reliably disables
+        boot re-apply, even on Rogers devices (A-216/A-119: the endpoint
+        is read-only w.r.t. the config — v2.3+ seeded from inside this
+        endpoint, silently breaking the documented "config-file absent =
+        no-op" contract, and the file is never re-created at startup
+        either). Malformed JSON, invalid bands (per-RAT catalogs, LTE
+        non-empty), or an apply failure return ok:false with a short
+        error. Never raises - any exception becomes
+        {"ok": false, "error": ...}. Serialized with /api/write so
+        concurrent applies cannot interleave (A-45).
         """
-        seed_config_if_absent()
-        try:
-            if not os.path.exists(CONFIG_FILE):
+        with _BAND_WRITE_LOCK:
+            try:
+                if not os.path.exists(CONFIG_FILE):
+                    return {"ok": True, "skipped": True}
+                with open(CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+            except (OSError, IOError):
+                # Missing/unreadable config file -> nothing to re-apply.
                 return {"ok": True, "skipped": True}
-            with open(CONFIG_FILE, 'r') as f:
-                data = json.load(f)
-        except (OSError, IOError):
-            # Missing/unreadable config file -> nothing to re-apply.
-            return {"ok": True, "skipped": True}
-        except Exception:
-            # File exists but is not valid JSON -> report it.
-            return {"ok": False, "error": "invalid config"}
+            except Exception:
+                # File exists but is not valid JSON -> report it.
+                return {"ok": False, "error": "invalid config"}
 
-        bands, err = self._validate_bands(data)
-        if bands is None:
-            return {"ok": False, "error": err}
-        lte_bands = bands["lte"]
-        nr_bands = bands["nr"]
+            bands, err = self._validate_bands(data)
+            if bands is None:
+                return {"ok": False, "error": err}
+            lte_bands = bands["lte"]
+            nr_bands = bands["nr"]
 
-        try:
-            ok, source, error = self._apply_bands(lte_bands, nr_bands)
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-        if not ok:
-            return {"ok": False, "error": error or "band apply failed"}
-        # Bands as reported to the modem (ints normalized to strings,
-        # same shape as the rest of the API).
-        return {
-            "ok": True,
-            "source": source,
-            "lte": [str(b) for b in lte_bands],
-            "nr": [str(b) for b in nr_bands],
-        }
+            try:
+                ok, source, error = self._apply_bands(lte_bands, nr_bands)
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            if not ok:
+                return {"ok": False, "error": error or "band apply failed"}
+            # Bands as reported to the modem (ints normalized to strings,
+            # same shape as the rest of the API).
+            return {
+                "ok": True,
+                "source": source,
+                "lte": [str(b) for b in lte_bands],
+                "nr": [str(b) for b in nr_bands],
+            }
+
+    def _verify_qmi_applied(self, requested_lte, requested_nr, attempts=2):
+        """Verify a QMI --set took effect by reading the preference back.
+
+        Returns True when a successful read-back shows every requested
+        band present (subset check). The helper's LTE mask path cannot
+        represent bands >64 and would silently drop them on SET, so a
+        "successful" exchange must be verified (A-13); one retry absorbs
+        a briefly-async preference store."""
+        for _ in range(attempts):
+            rc, out = _run_qmi(["--get"], QMI_GET_TIMEOUT)
+            if rc == 0 and out and re.search(r"result: status=0", out):
+                parsed = _parse_qmi_get(out)
+                if parsed is not None:
+                    applied_lte = set(int(b) for b in parsed["lte"])
+                    applied_nr = set(int(b) for b in parsed["nr"])
+                    if set(requested_lte) <= applied_lte \
+                            and set(requested_nr) <= applied_nr:
+                        return True
+            time.sleep(1)
+        return False
 
     def _write_qmi_config(self, lte_bands, nr_bands):
-        """Apply bands via the QMI client. True on QMI status 0 - the client
-        prints `result: status=0`; the exit code alone is not sufficient
-        (it returns 0 as long as the QMI exchange completed)."""
+        """Apply bands via the QMI client.
+
+        True only when the helper exited 0 AND its output carried a
+        success result TLV (A-138: printing `result: status=0` then
+        exiting nonzero must not certify an apply) AND a follow-up
+        read-back shows every requested band applied (A-13)."""
         lte_csv = ",".join(str(b) for b in lte_bands)
         nr_csv = ",".join(str(b) for b in nr_bands)
         rc, out = _run_qmi(["--set", lte_csv, nr_csv], QMI_SET_TIMEOUT)
-        if rc is None or not out:
+        if rc != 0 or not out:
             return False
-        return re.search(r"result: status=0", out) is not None
+        if re.search(r"result: status=0", out) is None:
+            return False
+        return self._verify_qmi_applied(lte_bands, nr_bands)
 
     def _save_config_file(self, data):
-        """Save config to file as fallback (atomic temp+replace, M7)."""
-        try:
-            _atomic_write_json(CONFIG_FILE, data)
-        except Exception as e:
-            print(f"Config save error: {e}")
+        """Save config to file as fallback (atomic temp+replace, M7).
+
+        Raises on failure so write_config can report the persistence
+        failure instead of returning ok:true for a save that did not
+        happen (A-16)."""
+        _atomic_write_json(CONFIG_FILE, data)
 
     def export_config(self, data):
         """Write a submitted band config to a timestamped JSON file in the
         config dir. WebView-compatible export: the Manager WebView drops
         blob downloads, so the server delivers the file on-device and the
-        UI toasts the path. Returns {"ok": true, "path": ...} or
-        {"ok": false, "error": ...} - never raises."""
+        UI toasts the path.
+
+        The body is validated exactly like /api/write — non-dict bodies and
+        out-of-range bands are rejected instead of persisted verbatim
+        (A-155). The write is symlink-proof and collision-free (A-211/A-054):
+        content goes to a random O_EXCL|O_NOFOLLOW temp file (0o600) that is
+        os.replace()d over the timestamped name, so a planted symlink in the
+        config dir can neither be followed nor clobber another export. An
+        interrupted export never strands a corrupt file (A-135), and only the
+        newest EXPORT_KEEP exports are retained (A-082: exports used to
+        accumulate without bound).
+        Returns {"ok": true, "path": ...} or {"ok": false, "error": ...} —
+        never raises."""
+        bands, err = self._validate_bands(data)
+        if bands is None:
+            return {"ok": False, "error": err}
+        tmp = None
         try:
-            os.makedirs(EXPORT_DIR, exist_ok=True)
+            _ensure_private_dir(EXPORT_DIR)
             stamp = time.strftime('%Y%m%d-%H%M%S') + '.{:03d}'.format(
                 int(time.time() * 1000) % 1000)
-            # Uniqueness guard (A-154): a wall-clock step or same-ms
-            # export must never overwrite an existing backup.
-            path = os.path.join(EXPORT_DIR, "bandctl-export-{}-{}.json".format(
-                stamp, next(_EPISODE_COUNTER)))
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
+            # A-054/A-211: a random suffix keeps concurrent exports from
+            # overwriting each other AND makes the final name unpredictable
+            # (an attacker cannot pre-plant symlinks across the name space).
+            path = os.path.join(
+                EXPORT_DIR, "bandctl-export-{}-{}.json".format(
+                    stamp, secrets.token_hex(3)))
+            tmp = os.path.join(EXPORT_DIR, ".export-{}-{}.tmp".format(
+                os.getpid(), secrets.token_hex(4)))
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp, flags, 0o600)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(bands, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, path)
+            self._prune_exports()
             return {"ok": True, "path": path}
         except Exception as e:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             return {"ok": False, "error": str(e)}
+
+    def _prune_exports(self, keep=EXPORT_KEEP):
+        """Keep only the newest `keep` bandctl-export-*.json files.
+
+        A-82: repeated exports otherwise consume module config storage
+        forever, with no way to identify or remove stale copies."""
+        try:
+            exports = sorted(glob.glob(
+                os.path.join(EXPORT_DIR, "bandctl-export-*.json")))
+            for old in exports[:-keep]:
+                os.unlink(old)
+        except OSError:
+            pass
 
     def read_signal(self):
         """Read current signal strength from `dumpsys telephony.registry`.
@@ -1822,15 +2732,19 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         the response includes a timestamp. Returns {"error": ...} only when
         dumpsys fails or no signal data exists.
         """
-        try:
-            text = _run_dumpsys("telephony.registry")
-        except Exception as e:
-            return {"error": f"dumpsys failed: {e}"}
-        parsed = _parse_signal_strength(text)
-        if parsed is None:
-            return {"error": "no signal strength data in dumpsys telephony.registry"}
-        parsed["timestamp"] = int(time.time() * 1000)
-        return parsed
+        def _do():
+            try:
+                text = _run_dumpsys("telephony.registry")
+            except Exception as e:
+                return {"error": f"dumpsys failed: {e}"}
+            parsed = _parse_signal_strength(text)
+            if parsed is None:
+                return {"error": "no signal strength data in dumpsys telephony.registry"}
+            parsed["timestamp"] = int(time.time() * 1000)
+            return parsed
+        # A-34: serialize the poll — a concurrent 2s poll reuses the last
+        # successful result instead of stacking a second dumpsys.
+        return _poll_once(_SIGNAL_READ, _do)
 
     def read_registration(self):
         """Read registration state from `dumpsys telephony.registry`.
@@ -1839,15 +2753,19 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         null; the response includes a timestamp. Returns {"error": ...}
         only when dumpsys fails or no service state exists.
         """
-        try:
-            text = _run_dumpsys("telephony.registry")
-        except Exception as e:
-            return {"error": f"dumpsys failed: {e}"}
-        parsed = _parse_registration(text)
-        if parsed is None:
-            return {"error": "no service state data in dumpsys telephony.registry"}
-        parsed["timestamp"] = int(time.time() * 1000)
-        return parsed
+        def _do():
+            try:
+                text = _run_dumpsys("telephony.registry")
+            except Exception as e:
+                return {"error": f"dumpsys failed: {e}"}
+            parsed = _parse_registration(text)
+            if parsed is None:
+                return {"error": "no service state data in dumpsys telephony.registry"}
+            parsed["timestamp"] = int(time.time() * 1000)
+            return parsed
+        # A-34: serialize the poll — a concurrent 2s poll reuses the last
+        # successful result instead of stacking a second dumpsys.
+        return _poll_once(_REG_READ, _do)
 
     def read_drop_log(self):
         """GET /api/drop-log — drop-logger state + snapshot files.
@@ -1865,50 +2783,88 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         """POST /api/drop-log — enable/disable the drop logger (v2.5).
 
         The setting is persisted to settings.json and picked up live by
-        the watchdog thread (no restart needed). The mutation and the
-        save happen under _CONFIG_WRITE_LOCK as one critical section
-        (A-116): a concurrent toggle can never report a state that was
-        not the one this request persisted."""
-        try:
-            if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
-                return {"ok": False, "error": "enabled must be a bool"}
-            with _CONFIG_WRITE_LOCK:
-                SETTINGS["drop_log"] = data["enabled"]
-                _save_settings()
-                enabled = SETTINGS["drop_log"]
-            return {"ok": True, "enabled": enabled,
+        the watchdog thread (no restart needed). Persist-first, like
+        update_settings: a failed save leaves the live snapshot unchanged
+        (A-153 family), so the in-memory value never disagrees with disk
+        (A-63), and concurrent toggles are serialized (A-041)."""
+        if not isinstance(data, dict) or not isinstance(
+                data.get("enabled"), bool):
+            return {"ok": False, "error": "enabled must be a bool"}
+        with _SETTINGS_UPDATE_LOCK:
+            new_settings = dict(SETTINGS)
+            new_settings["drop_log"] = data["enabled"]
+            try:
+                _save_settings(new_settings)
+            except Exception as e:
+                return {"ok": False,
+                        "error": "settings save failed: {}".format(e)}
+            SETTINGS["drop_log"] = data["enabled"]
+            return {"ok": True, "enabled": data["enabled"],
                     "dir": str(DROP_LOG_DIR)}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
 
     def read_band_camping(self, limit=50):
         """Return the last `limit` lines of the band camping log as JSON.
 
-        Each CSV line is `timestamp,earfcn,band` (epoch ms ints; band
-        empty when the mBands list was absent). Never raises - an absent
+        Each CSV line is `timestamp,freq,band,rat` (epoch ms ints; band
+        empty when the mBands list was absent; rat "LTE"|"NR" since the
+        A-030 fix, absent on older lines). Reads only the log tail
+        (A-28: full re-reads per 5s poll cost grew with the log), reports
+        the sampler toggle state (A-120/A-201), and returns the log path
+        as a string (A-74/A-200: a pathlib.Path is not JSON-serializable
+        and crashed the endpoint on every call). Never raises - an absent
         or unreadable log yields an empty sample list with ok:true.
         """
         try:
+            enabled = bool(SETTINGS.get("band_camping"))
             if not os.path.exists(BAND_CAMPING_LOG):
-                return {"ok": True, "samples": [], "log": BAND_CAMPING_LOG}
-            with open(BAND_CAMPING_LOG, 'r') as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
+                return {"ok": True, "enabled": enabled, "samples": [],
+                        "log": str(BAND_CAMPING_LOG)}
             samples = []
-            for ln in lines[-limit:]:
+            for ln in _read_tail(BAND_CAMPING_LOG, limit):
                 parts = ln.split(',')
                 sample = {"timestamp": _parse_int(parts[0]) if parts else None}
                 if len(parts) > 1:
                     sample["earfcn"] = _parse_int(parts[1])
                 if len(parts) > 2:
                     sample["band"] = _parse_int(parts[2]) if parts[2] else None
+                if len(parts) > 3:
+                    sample["rat"] = parts[3] or None
                 samples.append(sample)
-            return {"ok": True, "samples": samples, "log": BAND_CAMPING_LOG}
+            return {"ok": True, "enabled": enabled, "samples": samples,
+                    "log": str(BAND_CAMPING_LOG)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_band_camping(self, data):
+        """POST /api/band-camping — enable/disable the serving-cell sampler.
+
+        A-120/A-201: the sampler used to run unconditionally at boot with
+        no way to disable it. The setting is persisted to settings.json
+        and picked up live by the daemon thread (no restart needed)."""
+        try:
+            if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+                return {"ok": False, "error": "enabled must be a bool"}
+            SETTINGS["band_camping"] = data["enabled"]
+            _save_settings()
+            return {"ok": True, "enabled": data["enabled"]}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def modem_reset(self):
         """Soft modem reset — delegates to the module-level _modem_reset
-        so the drop watchdog's auto-recovery (A-196) uses the same path."""
+        so the drop watchdog's auto-recovery (A-196) uses the same path.
+
+        Preferred: `cmd phone radio power` off/on (3s apart), used only
+        when `cmd phone help` actually lists the subcommand; if it runs
+        but never powers the radio off, the airplane-mode fallback is
+        tried instead of failing outright (A-137). Fallback:
+        airplane-mode toggle (`cmd connectivity airplane-mode` enable, 3s,
+        disable). Success is reported only when the radio verifiably
+        recovers: the preferred path verifies the radio left POWER_OFF
+        after power-on (A-20/A-148) and then returns to IN_SERVICE
+        (A-197), the airplane path restores a pre-existing airplane-mode
+        choice (A-62), and cleanup whose verification is unavailable
+        (getprop failure) is never certified (A-46)."""
         return _modem_reset()
 
     def modem_health(self):
@@ -1918,10 +2874,14 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         status is "ok" when a transport reads bands, "degraded" when the
         transport answers but no bands are configured, and "error" when
         nothing is readable (message included). transport is "qmi" when
-        the QRTR client works, "diag" otherwise.
+        the QRTR client verifiably works (exit 0 + success result TLV —
+        A-14), "diag" otherwise. pid is the current server process, so a
+        client can prove a restart by observing a pid change (A-118).
         """
         rc, out = _run_qmi(["--get"], QMI_GET_TIMEOUT)
-        parsed = _parse_qmi_get(out) if rc is not None else None
+        parsed = None
+        if rc == 0 and out and re.search(r"result: status=0", out):
+            parsed = _parse_qmi_get(out)
         if parsed is not None:
             lte_bands = parsed["lte"]
             nr_bands = parsed["nr"]
@@ -1932,6 +2892,7 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 "lte_bands": len(lte_bands),
                 "nr_bands": len(nr_bands),
                 "md_session_owner": None,
+                "pid": os.getpid(),
             }
             if status == "degraded":
                 result["error"] = "QMI responded but no bands are configured"
@@ -1951,6 +2912,7 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 "lte_bands": len(lte_bands),
                 "nr_bands": len(nr_bands),
                 "md_session_owner": _query_md_pid(DIAG_DEVICE),
+                "pid": os.getpid(),
             }
             if status == "degraded":
                 result["error"] = "diag responded but no bands are configured"
@@ -1963,6 +2925,7 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
                 "lte_bands": 0,
                 "nr_bands": 0,
                 "md_session_owner": None,
+                "pid": os.getpid(),
                 "error": str(e),
             }
 
@@ -1970,9 +2933,15 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        origin = self.headers.get('Origin') if self.headers else None
+        allowed = self._cors_origin(origin)
+        if allowed:
+            self.send_header('Access-Control-Allow-Origin', allowed)
+            self.send_header('Access-Control-Allow-Methods',
+                             'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers',
+                             'Content-Type, Authorization')
+            self.send_header('Access-Control-Allow-Private-Network', 'true')
         self.send_header('Content-Length', len(body))
         self.end_headers()
         self.wfile.write(body)
@@ -1989,16 +2958,27 @@ if __name__ == '__main__':
     # server; never blocks shutdown.
     threading.Thread(target=_band_camping_loop, daemon=True).start()
 
-    # Persist the carrier-aware default when a fresh install has no
-    # config/bands.json (customize.sh's install-time seed is lost in the
-    # metainstall staging). Runs here AND lazily in boot_apply so the
-    # config_file read-fallback and the boot re-apply both see it.
-    seed_config_if_absent()
+    # NOTE (A-119): config/bands.json is deliberately NOT seeded at startup.
+    # A missing file must be a permanent no-op for boot re-apply — the
+    # documented escape hatch for disabling persistent band forcing — so
+    # deleting the file must never be undone by a later server start.
 
     # v2.5 drop logger (daemon): stamps radio drops with correlation
     # context while Settings > Debug > Drop logging is enabled. The
     # setting is live — the thread sleeps cheaply when disabled.
     threading.Thread(target=_drop_log_loop, daemon=True).start()
+
+    # A-180: harden the module config tree even when service.sh created it
+    # with the boot umask (world-writable). The server runs as root and is
+    # the only legitimate reader of these dirs.
+    _ensure_private_dir(MODDIR / "config")
+    _ensure_private_dir(DROP_LOG_DIR)
+
+    # A-198: refuse to substitute third-party binaries — surface a missing
+    # bundled QMI client loudly instead of silently exec'ing adb scratch.
+    if QMI_BIN is None:
+        print("WARNING: bundled qmi/qmi_band missing — QMI band apply "
+              "disabled (no fallback binary is used)")
 
     # Threaded: the 2s signal/registration polling (each dumpsys call takes
     # seconds on this device) must not starve other requests — a single-
@@ -2007,6 +2987,10 @@ if __name__ == '__main__':
     # Bind comes from settings.json (default 127.0.0.1; 0.0.0.0 = LAN).
     bind = SETTINGS.get("bind", "127.0.0.1")
     server = http.server.ThreadingHTTPServer((bind, PORT), BandHandler)
+    # A-049: the auth gate keys on the ACTUAL listening address, not the
+    # settings value — a pending settings change must not drop auth before
+    # the socket is actually rebound (which happens on restart).
+    _EFFECTIVE_BIND = bind
     print(f"Band Controller server running on http://{bind}:{PORT}")
     print(f"QMI binary: {QMI_BIN}")
     print(f"Diag device: {DIAG_DEVICE or 'disabled'}")
