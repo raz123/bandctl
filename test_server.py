@@ -2444,7 +2444,9 @@ class TestHttpSemantics(unittest.TestCase):
 
     def test_version_string_does_not_fingerprint_python(self):
         h = make_handler()
-        self.assertEqual(h.version_string(), 'Bandctl/2.6')
+        # Header reflects the shipped module version (module.prop, or "dev"
+        # when absent in the test env); must never leak the CPython version.
+        self.assertTrue(h.version_string().startswith('Bandctl/'))
         self.assertNotIn('Python', h.version_string())
 
     def test_protocol_version_http11(self):

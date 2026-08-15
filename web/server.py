@@ -149,6 +149,20 @@ from pathlib import Path
 # resolving from __file__ keeps dev/test checkouts working identically).
 MODDIR = Path(__file__).resolve().parent.parent
 
+# Server-header version (release-cleanup): read from module.prop so the
+# advertised "Server:" string matches the shipped release instead of a
+# hardcoded literal that drifts (was "Bandctl/2.6" while the module was 2.7).
+def _module_version():
+    try:
+        for _line in (MODDIR / "module.prop").read_text().splitlines():
+            if _line.startswith("version="):
+                return _line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return "dev"
+
+SERVER_VERSION = _module_version()
+
 # Add diag module to path
 DIAG_DIR = MODDIR / "diag"
 sys.path.insert(0, str(DIAG_DIR))
@@ -1846,7 +1860,7 @@ class BandHandler(http.server.BaseHTTPRequestHandler):
     def version_string(self):
         # A-168: do not fingerprint the bundled CPython version in every
         # response's Server header.
-        return "Bandctl/2.6"
+        return "Bandctl/%s" % SERVER_VERSION
 
     def do_GET(self):
         if self.path.startswith('/api/'):
