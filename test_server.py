@@ -82,7 +82,7 @@ class SettingsFileCase(unittest.TestCase):
         server.SETTINGS_FILE = Path(self._tmp.name) / "settings.json"
         server.CONFIG_FILE = Path(self._tmp.name) / "bands.json"
         server.EXPORT_DIR = Path(self._tmp.name)
-        server.SETTINGS = {"bind": "127.0.0.1", "token": None}
+        server.SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": None}
 
     def tearDown(self):
         server.SETTINGS_FILE = self._orig_file
@@ -97,20 +97,20 @@ class TestSettingsLoad(SettingsFileCase):
 
     def test_missing_file_defaults(self):
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": None,
+                         {"bind": "127.0.0.1", "port": 8080, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_malformed_json_defaults(self):
         server.SETTINGS_FILE.write_text("{not json")
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": None,
+                         {"bind": "127.0.0.1", "port": 8080, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_invalid_bind_falls_back_to_localhost(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "9.9.9.9", "token": "tok"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": "tok",
+                         {"bind": "127.0.0.1", "port": 8080, "token": "tok",
                           "drop_log": False, "band_camping": True})
 
     def test_invalid_token_downgrades_lan_bind(self):
@@ -119,30 +119,30 @@ class TestSettingsLoad(SettingsFileCase):
         recovery POST is itself gated). Loading it must downgrade the bind
         to loopback-only instead of accepting the lockout."""
         server.SETTINGS_FILE.write_text(
-            json.dumps({"bind": "0.0.0.0", "token": 12345}))
+            json.dumps({"bind": "0.0.0.0", "port": 8080, "token": 12345}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": None,
+                         {"bind": "127.0.0.1", "port": 8080, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_lan_bind_without_token_field_downgrades(self):
         server.SETTINGS_FILE.write_text(
             json.dumps({"bind": "0.0.0.0"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "127.0.0.1", "token": None,
+                         {"bind": "127.0.0.1", "port": 8080, "token": None,
                           "drop_log": False, "band_camping": True})
 
     def test_lan_bind_with_valid_token_kept(self):
         server.SETTINGS_FILE.write_text(
-            json.dumps({"bind": "0.0.0.0", "token": "ok-token"}))
+            json.dumps({"bind": "0.0.0.0", "port": 8080, "token": "ok-token"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "0.0.0.0", "token": "ok-token",
+                         {"bind": "0.0.0.0", "port": 8080, "token": "ok-token",
                           "drop_log": False, "band_camping": True})
 
     def test_load_persisted_values(self):
         server.SETTINGS_FILE.write_text(
-            json.dumps({"bind": "0.0.0.0", "token": "tok"}))
+            json.dumps({"bind": "0.0.0.0", "port": 8080, "token": "tok"}))
         self.assertEqual(server._load_settings(),
-                         {"bind": "0.0.0.0", "token": "tok",
+                         {"bind": "0.0.0.0", "port": 8080, "token": "tok",
                           "drop_log": False, "band_camping": True})
 
     def test_load_persisted_drop_log(self):
@@ -151,6 +151,35 @@ class TestSettingsLoad(SettingsFileCase):
         loaded = server._load_settings()
         self.assertTrue(loaded["drop_log"])
         self.assertEqual(loaded["bind"], "127.0.0.1")
+
+    def test_custom_port_honored(self):
+        """release follow-up: "port" in settings.json overrides the 8080
+        default (dodge a LAN app squatting 8080)."""
+        server.SETTINGS_FILE.write_text(
+            json.dumps({"bind": "127.0.0.1", "port": 8090, "token": None}))
+        self.assertEqual(server._load_settings()["port"], 8090)
+
+    def test_invalid_port_falls_back_to_default(self):
+        """release follow-up: bool/zero/out-of-range/non-int port is
+        rejected and the 8080 default is kept."""
+        for bad in (0, 70000, True, "8080", -1, 3.5):
+            server.SETTINGS_FILE.write_text(
+                json.dumps({"bind": "127.0.0.1", "port": bad}))
+            self.assertEqual(server._load_settings()["port"], 8080,
+                             "port {} should not be accepted".format(bad))
+
+    def test_update_settings_preserves_custom_port(self):
+        """release follow-up: a UI LAN-toggle save must not drop a
+        user-set port (update_settings starts from the live SETTINGS)."""
+        server.SETTINGS_FILE.write_text(
+            json.dumps({"bind": "127.0.0.1", "port": 8090, "token": None}))
+        loaded = server._load_settings()
+        server.SETTINGS.update(loaded)
+        h = server.BandHandler.__new__(server.BandHandler)
+        res = h.update_settings({"lan_enabled": False, "regenerate": False})
+        self.assertTrue(res["ok"])
+        self.assertEqual(json.loads(server.SETTINGS_FILE.read_text())["port"],
+                         8090)
 
 
 class TestSettingsSave(SettingsFileCase):
@@ -162,7 +191,7 @@ class TestSettingsSave(SettingsFileCase):
         server._save_settings()
         self.assertEqual(
             json.loads(server.SETTINGS_FILE.read_text()),
-            {"bind": "0.0.0.0", "token": "tok-1"})
+            {"bind": "0.0.0.0", "port": 8080, "token": "tok-1"})
 
     def test_atomic_failure_keeps_old_content(self):
         server.SETTINGS["token"] = "old-token"
@@ -173,7 +202,7 @@ class TestSettingsSave(SettingsFileCase):
         # Old content intact, no temp litter left behind.
         self.assertEqual(
             json.loads(server.SETTINGS_FILE.read_text()),
-            {"bind": "127.0.0.1", "token": "old-token"})
+            {"bind": "127.0.0.1", "port": 8080, "token": "old-token"})
         leftovers = [p.name for p in Path(self._tmp.name).iterdir()
                      if p.name != "settings.json"]
         self.assertEqual(leftovers, [])
@@ -189,7 +218,7 @@ class TestSettingsSave(SettingsFileCase):
         """A-153/A-017: a failed save must not rotate the token or flip the
         bind in the live snapshot — clients keep their credential and the
         server keeps its current exposure."""
-        server.SETTINGS = {"bind": "127.0.0.1", "token": "old-token",
+        server.SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": "old-token",
                            "drop_log": False}
         server._save_settings()  # baseline on disk
         with mock.patch("json.dump", side_effect=RuntimeError("disk full")):
@@ -262,7 +291,7 @@ class TestUpdateSettings(SettingsFileCase):
             res["token"])
 
     def test_disable_keeps_token_but_closes_lan(self):
-        server.SETTINGS = {"bind": "0.0.0.0", "token": "keep-me"}
+        server.SETTINGS = {"bind": "0.0.0.0", "port": 8080, "token": "keep-me"}
         res = server.BandHandler.update_settings(
             None, {"lan_enabled": False})
         self.assertTrue(res["ok"])
@@ -314,7 +343,7 @@ class TestAuth(SettingsFileCase):
 
     def setUp(self):
         super().setUp()
-        self.lan = {"bind": "0.0.0.0", "token": "sekret-token"}
+        self.lan = {"bind": "0.0.0.0", "port": 8080, "token": "sekret-token"}
 
     def test_loopback_read_only_exempt_without_token(self):
         """A-189: loopback read-only diagnostics stay exempt — a fresh
@@ -393,7 +422,7 @@ class TestAuth(SettingsFileCase):
         self.assertEqual(status, 401)
 
     def test_lan_disabled_no_gate(self):
-        server.SETTINGS = {"bind": "127.0.0.1", "token": "sekret-token"}
+        server.SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": "sekret-token"}
         with mock.patch.object(
                 server.BandHandler, 'modem_health',
                 return_value={"status": "ok", "transport": "qmi",
@@ -404,7 +433,7 @@ class TestAuth(SettingsFileCase):
         self.assertEqual(status, 200)
 
     def test_lan_without_configured_token_rejects_all(self):
-        server.SETTINGS = {"bind": "0.0.0.0", "token": None}
+        server.SETTINGS = {"bind": "0.0.0.0", "port": 8080, "token": None}
         status, _ = run_api('/api/health?action=health', 'GET',
                             addr=('192.168.1.42', 54321))
         self.assertEqual(status, 401)
@@ -503,7 +532,7 @@ class TestRegenerateAuth(SettingsFileCase):
     unauthenticated caller cannot mint-and-steal a fresh credential."""
 
     def test_regenerate_without_token_401(self):
-        server.SETTINGS = {"bind": "0.0.0.0", "token": "old-token",
+        server.SETTINGS = {"bind": "0.0.0.0", "port": 8080, "token": "old-token",
                            "drop_log": False}
         server._save_settings()  # baseline on disk
         body = json.dumps({"lan_enabled": True,
@@ -521,7 +550,7 @@ class TestRegenerateAuth(SettingsFileCase):
             "old-token")
 
     def test_regenerate_with_token_rotates(self):
-        server.SETTINGS = {"bind": "0.0.0.0", "token": "old-token",
+        server.SETTINGS = {"bind": "0.0.0.0", "port": 8080, "token": "old-token",
                            "drop_log": False}
         body = json.dumps({"lan_enabled": True,
                            "regenerate": True}).encode()
@@ -548,7 +577,7 @@ class TestEffectiveBindAuth(SettingsFileCase):
         super().setUp()
         self._orig_effective = server._EFFECTIVE_BIND
         server._EFFECTIVE_BIND = "0.0.0.0"  # socket still on the LAN
-        server.SETTINGS = {"bind": "127.0.0.1", "token": "tok",
+        server.SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": "tok",
                            "drop_log": False}  # settings say loopback
 
     def tearDown(self):
@@ -1842,7 +1871,7 @@ class TestDropLogConcurrency(unittest.TestCase):
         self._orig_file = server.SETTINGS_FILE
         self._orig_settings = server.SETTINGS
         server.SETTINGS_FILE = Path(self._tmp.name) / "settings.json"
-        server.SETTINGS = {"bind": "127.0.0.1", "token": None,
+        server.SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": None,
                            "drop_log": False}
 
     def tearDown(self):
@@ -2488,7 +2517,7 @@ class TestHttpSemantics(unittest.TestCase):
         self.assertTrue(h.close_connection)
 
     def test_401_with_body_closes_connection(self):
-        server.SETTINGS = {"bind": "0.0.0.0", "token": "sekret"}
+        server.SETTINGS = {"bind": "0.0.0.0", "port": 8080, "token": "sekret"}
         try:
             body = b'{"lan_enabled": true}'
             h = make_handler('/api/settings?action=settings', 'POST',
@@ -2499,7 +2528,7 @@ class TestHttpSemantics(unittest.TestCase):
                 int(h.wfile.getvalue().split(b'\r\n', 1)[0].split()[1]), 401)
             self.assertTrue(h.close_connection)
         finally:
-            server.SETTINGS = {"bind": "127.0.0.1", "token": None}
+            server.SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": None}
 
 
 class TestQmiNrSort(unittest.TestCase):

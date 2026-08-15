@@ -170,7 +170,6 @@ sys.path.insert(0, str(DIAG_DIR))
 from diag_client import DiagClient, read_bands, write_bands
 from protocol import band_bitmask_to_list, band_list_to_bitmask
 
-PORT = 8080
 WEB_DIR = MODDIR / "web"
 DIAG_DEVICE = "/dev/diag"
 
@@ -183,8 +182,8 @@ SETTINGS_FILE = MODDIR / "config" / "settings.json"
 # way drop_log gates the drop watchdog. Default True preserves the shipped
 # Diagnostics behavior (the UI polls and renders camping data); the toggle
 # makes the always-on daemon user-controllable.
-DEFAULT_SETTINGS = {"bind": "127.0.0.1", "token": None, "drop_log": False,
-                    "band_camping": True}
+DEFAULT_SETTINGS = {"bind": "127.0.0.1", "port": 8080, "token": None,
+                    "drop_log": False, "band_camping": True}
 
 # Serialize config/settings writes so concurrent saves cannot interleave
 # (each save is temp-file + os.replace, atomic per write). RLock so a
@@ -225,6 +224,12 @@ def _load_settings():
             return settings
         if data.get("bind") in ("127.0.0.1", "0.0.0.0"):
             settings["bind"] = data["bind"]
+        # Configurable listen port (release follow-up): a user-set int in
+        # [1, 65535] overrides the 8080 default, e.g. to dodge a LAN app
+        # squatting 8080. Invalid/absent values fall back to 8080.
+        p = data.get("port")
+        if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535:
+            settings["port"] = p
         token = data.get("token")
         settings["token"] = token if isinstance(token, str) and token else None
         if isinstance(data.get("drop_log"), bool):
@@ -2998,14 +3003,18 @@ if __name__ == '__main__':
     # seconds on this device) must not starve other requests — a single-
     # threaded server stalls /api/defaults, /api/read, and button actions
     # behind an endless polling queue.
-    # Bind comes from settings.json (default 127.0.0.1; 0.0.0.0 = LAN).
+    # Bind comes from settings.json (default 127.0.0.1; 0.0.0.0 = LAN); the
+    # port likewise (default 8080 — set "port" in settings.json to dodge a
+    # LAN app squatting 8080). Only the listen PORT is re-read here; a bind
+    # change still needs a restart to rebind the socket.
     bind = SETTINGS.get("bind", "127.0.0.1")
-    server = http.server.ThreadingHTTPServer((bind, PORT), BandHandler)
+    port = SETTINGS.get("port", 8080)
+    server = http.server.ThreadingHTTPServer((bind, port), BandHandler)
     # A-049: the auth gate keys on the ACTUAL listening address, not the
     # settings value — a pending settings change must not drop auth before
     # the socket is actually rebound (which happens on restart).
     _EFFECTIVE_BIND = bind
-    print(f"Band Controller server running on http://{bind}:{PORT}")
+    print(f"Band Controller server running on http://{bind}:{port}")
     print(f"QMI binary: {QMI_BIN}")
     print(f"Diag device: {DIAG_DEVICE or 'disabled'}")
     server.serve_forever()

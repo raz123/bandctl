@@ -26,6 +26,18 @@ fi
 
 WEB_DIR="$MODDIR/web"
 PORT=8080
+# Configurable listen port (release follow-up): read "port" from
+# config/settings.json so the boot/restart health-checks hit the SAME port
+# the server binds (default 8080 — set "port" in settings.json to dodge a
+# LAN app squatting 8080). Invalid/absent value falls back to 8080.
+if [ -r "$MODDIR/config/settings.json" ]; then
+  _PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$MODDIR/config/settings.json" | head -n1)
+  case "$_PORT" in
+    ''|*[!0-9]*) : ;;   # absent / non-numeric -> keep default 8080
+    *) PORT=$_PORT ;;
+  esac
+fi
 LOG="$MODDIR/config/bandctl.log"
 SERVER_LOG="$MODDIR/config/server.log"
 
