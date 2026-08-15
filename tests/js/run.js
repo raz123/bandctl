@@ -414,6 +414,27 @@ const okRoutes = (over = {}) => Object.assign({
     lanDom.window.fetch = (url) => { seen.push(String(url)); return Promise.resolve(jsonRes({ ok: true })); };
     await lanDom.window.apiFetch('/api/read?action=read');
     assert(seen.some((u) => u.indexOf('http://192.168.1.50:8080/api/read') === 0), 'S14 LAN apiFetch targets page origin');
+    // phone browser on a NON-8080 loopback port (configurable "port" in
+    // settings.json): the page origin answers JSON -> use SAME origin, NOT
+    // the hardcoded 8080 base (regression: loopback used to skip the probe
+    // and hardcode 8080, so a localhost:8090 page's API calls died).
+    const loDom = new JSDOM(html, {
+      runScripts: 'dangerously',
+      url: 'http://127.0.0.1:8090/',
+      pretendToBeVisual: true,
+      beforeParse(window) {
+        window.fetch = makeFetch(okRoutes());
+        window.scrollTo = () => {};
+        Object.defineProperty(window.HTMLCanvasElement.prototype, 'clientWidth', { configurable: true, get: () => 300 });
+        window.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, { get: () => () => {}, set: () => true });
+      },
+    });
+    const lbase = await loDom.window.resolveApiBase();
+    assert(lbase === 'http://127.0.0.1:8090', 'S14 loopback non-8080 page resolves to page origin');
+    const lseen = [];
+    loDom.window.fetch = (url) => { lseen.push(String(url)); return Promise.resolve(jsonRes({ ok: true })); };
+    await loDom.window.apiFetch('/api/read?action=read');
+    assert(lseen.some((u) => u.indexOf('http://127.0.0.1:8090/api/read') === 0), 'S14 loopback non-8080 apiFetch targets page origin');
     // container origin (KSU WebView): non-JSON health -> phone loopback
     const containerDom = new JSDOM(html, {
       runScripts: 'dangerously',

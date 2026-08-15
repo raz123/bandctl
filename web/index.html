@@ -1158,13 +1158,15 @@ button, input { font: inherit; }
 
 /* ============ API contract ============ */
 // Endpoint paths; apiFetch() prepends the resolved base. The module python
-// server always listens on 127.0.0.1:8080, but when this page was served by
-// that server over the network (LAN mode, e.g. http://<phone-ip>:8080/) the
-// API must go back to the same origin — hardcoding loopback would send a
-// laptop's requests to the laptop's own loopback instead of the phone
-// (A-004). Container schemes (KSU Manager WebView, appassets://) keep the
-// phone-loopback base; resolveApiBase() probes the page origin's /api/health
-// to tell the two apart (the module server answers JSON, containers don't).
+// server listens on the port from settings.json (default 127.0.0.1:8080),
+// but when this page was served by that server over the network (LAN mode,
+// e.g. http://<phone-ip>:<port>/) the API must go back to the same origin —
+// hardcoding loopback would send a laptop's requests to the laptop's own
+// loopback instead of the phone (A-004). Container schemes (KSU Manager
+// WebView, appassets://) keep the phone-loopback base. resolveApiBase()
+// probes the page origin's /api/health for ANY http(s) origin to tell the
+// two apart (the module server answers JSON, containers don't) — including
+// a phone browser on a NON-8080 loopback port (configurable "port").
 var API_READ = '/api/read?action=read';
 var API_WRITE = '/api/write?action=write';
 var API_SIGNAL = '/api/signal?action=signal';
@@ -1186,29 +1188,30 @@ function resolveApiBase() {
   if (resolvingApiBase) return resolvingApiBase;
   var loc = window.location;
   if (loc.protocol === 'http:' || loc.protocol === 'https:') {
-    var h = loc.hostname;
-    if (h !== '127.0.0.1' && h !== 'localhost' && h !== '::1') {
-      // Non-loopback HTTP(S): the page may be served by the module server
-      // (LAN mode) or by a container (KSU Manager WebView). Probe the page
-      // origin — only the module server answers JSON on /api/health.
-      var originBase = loc.protocol + '//' + loc.host;
-      var probeCtrl = new AbortController();
-      var probeTimer = setTimeout(function () { probeCtrl.abort(); }, 5000);
-      resolvingApiBase = fetch(originBase + '/api/health?action=health', { signal: probeCtrl.signal })
-        .then(function (r) {
-          var ct = r.headers.get('content-type') || '';
-          return ct.indexOf('application/json') >= 0 ? originBase : API_LOOPBACK_BASE;
-        })
-        .catch(function () { return API_LOOPBACK_BASE; })
-        .then(function (base) {
-          clearTimeout(probeTimer);
-          resolvedApiBase = base;
-          resolvingApiBase = null;
-          return base;
-        });
-      return resolvingApiBase;
-    }
+    // Probe the page origin's /api/health for ANY http(s) origin — the
+    // module server answers JSON, containers and unrelated origins don't.
+    // This keeps LAN mode AND a phone browser on a NON-8080 loopback port
+    // (configurable "port" in settings.json) pointing at the real server;
+    // only a non-JSON/non-responding origin falls back to the 8080 base.
+    var originBase = loc.protocol + '//' + loc.host;
+    var probeCtrl = new AbortController();
+    var probeTimer = setTimeout(function () { probeCtrl.abort(); }, 5000);
+    resolvingApiBase = fetch(originBase + '/api/health?action=health', { signal: probeCtrl.signal })
+      .then(function (r) {
+        var ct = r.headers.get('content-type') || '';
+        return ct.indexOf('application/json') >= 0 ? originBase : API_LOOPBACK_BASE;
+      })
+      .catch(function () { return API_LOOPBACK_BASE; })
+      .then(function (base) {
+        clearTimeout(probeTimer);
+        resolvedApiBase = base;
+        resolvingApiBase = null;
+        return base;
+      });
+    return resolvingApiBase;
   }
+  // Container schemes (KSU Manager WebView, appassets://): no page-origin
+  // HTTP server, so the module-loopback 8080 base is the only answer.
   resolvedApiBase = API_LOOPBACK_BASE;
   return Promise.resolve(resolvedApiBase);
 }
