@@ -1,7 +1,7 @@
 """Qualcomm Diag Protocol - HDLC framing and CRC handling.
 
 Matches the kernel-verified protocol contract (drivers/char/diag on the
-4.19.325-aptusitu kernel, docs/protocol_kernel.md):
+4.19.325-aptusitu kernel):
 
 - HDLC frame layout: ``[payload][~crc16 low][~crc16 high][0x7E]`` -- no
   leading flag; escape 0x7D/0x7E as 0x7D + (byte ^ 0x20).
@@ -22,7 +22,13 @@ HDLC_ESCAPE_XOR = 0x20
 DIAG_CMD_NV_READ = 0x3D  # DIAG_NV_READ_F
 DIAG_CMD_NV_WRITE = 0x3E  # DIAG_NV_WRITE_F
 
-# NV items (Qualcomm standard)
+# NV items (Qualcomm standard). The numbers are expressed in HEXADECIMAL
+# (QXDM-style NV item ids): 0x06828 == 26664 decimal and 0x06946 == 26950,
+# sent little-endian on the wire. The classic decimal readings 6828/6829
+# (LTE BC configuration) are NOT what this transport sends. NOTE: these ids
+# have never been hardware-validated (the diag path never completed a parse
+# before v2.6.1); verify with one QXDM/QRCT read on a working diag session
+# before trusting band results on a new device.
 NV_LTE_BAND_PREF = 0x06828  # LTE band preference
 NV_NR5G_BAND_PREF = 0x06946  # NR band preference (SM8250)
 
@@ -74,8 +80,11 @@ def hdlc_decode(frame: bytes) -> Optional[bytes]:
     """Decode an HDLC frame ``[payload][crc_lo][crc_hi][0x7E]``.
 
     Tolerates stray leading 0x7E flags at frame start (the kernel decoder
-    accepts one at message start). Verifies the CRC: ``crc_ccitt(payload) ^
-    0xFFFF`` must equal the little-endian uint16 before the trailing 0x7E.
+    accepts one at message start). The trailing 0x7E terminator must be the
+    final byte of the input -- an unterminated frame or a frame with bytes
+    after the flag is rejected, as is any CRC failure:
+    ``crc_ccitt(payload) ^ 0xFFFF`` must equal the little-endian uint16
+    before the terminator.
 
     Returns the decoded payload, or None on any malformation/CRC failure.
     """
@@ -89,6 +98,7 @@ def hdlc_decode(frame: bytes) -> Optional[bytes]:
     while i < n and frame[i] == HDLC_FLAG:
         i += 1
 
+    terminated = False
     while i < n:
         byte = frame[i]
         if byte == HDLC_ESCAPE:
@@ -97,10 +107,18 @@ def hdlc_decode(frame: bytes) -> Optional[bytes]:
                 return None
             data.append(frame[i] ^ HDLC_ESCAPE_XOR)
         elif byte == HDLC_FLAG:
+            terminated = True
             break  # end of frame (trailing terminator)
         else:
             data.append(byte)
         i += 1
+
+    # A frame is only valid when its trailing 0x7E terminator is the FINAL
+    # byte: an unterminated frame (loop ran off the end, CRC would still
+    # pass) and a frame with trailing bytes after the flag are both framing
+    # errors, not canonical frames.
+    if not terminated or i != n - 1:
+        return None
 
     # data == payload + 2 CRC bytes (the trailing 0x7E was consumed by `break`)
     if len(data) < 3:
@@ -232,14 +250,12 @@ def band_bitmask_to_list(mask: int, max_band: int = 79) -> list:
 def band_list_to_bitmask(bands: list) -> int:
     """Convert a list of band numbers to a bitmask (Band N -> bit N-1).
 
-    Ponytail: this builds a 64-bit mask, which is fine for LTE (bands 1-64),
-    but NR bands 77/78 fall outside the 64-bit ceiling and are silently
-    dropped here. If NR 77/78 support is ever needed, use an
-    arbitrary-precision int end to end and stop packing the mask into 8
-    bytes (struct '<Q') on the wire.
+    Uses an arbitrary-precision integer, so bands above 64 (LTE B66/B71,
+    NR B77/B78) are represented instead of being silently dropped; the
+    caller packs the mask into as many little-endian bytes as needed.
     """
     mask = 0
     for band in bands:
-        if 1 <= band <= 64:
+        if band >= 1:
             mask |= (1 << (band - 1))
     return mask

@@ -7,8 +7,13 @@
  *
  * Usage:
  *   qmi_band --get
- *   qmi_band --set <lte_csv> <nr_csv>     e.g. --set 1,2,3,5,8 1,3,5,77,78
+ *   qmi_band --set <lte_csv> <nr_csv> [nsa_csv]
+ *                                    e.g. --set 1,2,3,5,8 1,3,5,77 [78,257]
  *   qmi_band --set-all-lte <lte_csv>      convenience: NR masks empty
+ *
+ * The <nr_csv> list sets the NR5G SA band preference; an optional third
+ * list sets the NR5G NSA preference separately (default: empty, i.e. the
+ * SA list is not duplicated into NSA).
  *
  * Build: aarch64-linux-musl-gcc -static -O2 -o qmi_band qmi_band.c
  */
@@ -95,6 +100,19 @@ static int wait_recv(int fd, unsigned char *rx, int max, int ms)
 	int ret = poll(&pfd, 1, ms);
 	if (ret <= 0) return ret; /* 0=timeout, <0=err */
 	return (int)recv(fd, rx, max, 0);
+}
+
+/* Milliseconds remaining until a CLOCK_MONOTONIC deadline (<=0 = expired).
+ * Monotonic so NITZ/carrier wall-clock steps cannot stretch or truncate
+ * probe/discovery timeouts. Mirrors recv_response's deadline accounting. */
+static int deadline_ms(const struct timespec *start, int budget_ms)
+{
+	struct timespec now;
+	int elapsed;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	elapsed = (int)((now.tv_sec - start->tv_sec) * 1000 +
+			(now.tv_nsec - start->tv_nsec) / 1000000);
+	return budget_ms - elapsed;
 }
 
 /* --- message building --- */
@@ -184,17 +202,25 @@ static void parse_response(const unsigned char *rx, int n)
 		}
 		switch (type) {
 		case TLV_RESULT: {
-			uint16_t status = le16(v);
-			uint16_t err = len >= 4 ? le16(v + 2) : 0;
-			printf("  result: status=%u error=0x%04x %s\n", status, err,
-			       status == 0 ? "SUCCESS" : "FAILURE");
+			if (len >= 2) {
+				uint16_t status = le16(v);
+				uint16_t err = len >= 4 ? le16(v + 2) : 0;
+				printf("  result: status=%u error=0x%04x %s\n", status, err,
+				       status == 0 ? "SUCCESS" : "FAILURE");
+			} else {
+				printf("  result TLV too short (len %u)\n", len);
+			}
 			have_result = 1;
 			break;
 		}
 		case TLV_MODE_PREF: {
-			uint16_t mode = le16(v);
-			printf("  mode pref: 0x%04x (LTE=%d NR5G=%d)\n", mode,
-			       !!(mode & QMI_RAT_LTE), !!(mode & QMI_RAT_NR5G));
+			if (len >= 2) {
+				uint16_t mode = le16(v);
+				printf("  mode pref: 0x%04x (LTE=%d NR5G=%d)\n", mode,
+				       !!(mode & QMI_RAT_LTE), !!(mode & QMI_RAT_NR5G));
+			} else {
+				printf("  mode pref TLV too short (len %u)\n", len);
+			}
 			break;
 		}
 		case TLV_LTE_BAND_PREF:
@@ -220,56 +246,78 @@ static void parse_response(const unsigned char *rx, int n)
 
 /* --- CSV parsing -> masks --- */
 
+/* Parse a comma/space-separated list of band numbers into bands[] (max
+ * entries). Returns the parsed count, or -1 with a message printed on any
+ * invalid token: garbage text, ERANGE overflow, or a band outside 1..max. */
 static int parse_csv(const char *csv, int *bands, int max)
 {
 	int n = 0;
 	const char *p = csv;
 	while (*p && n < max) {
+		long b;
+		char *end;
 		while (*p == ' ' || *p == ',') p++;
 		if (!*p) break;
-		char *end;
-		long b = strtol(p, &end, 10);
-		if (end == p) { p++; continue; }
+		errno = 0;
+		b = strtol(p, &end, 10);
+		if (end == p) {
+			printf("ERROR: invalid band token '%s'\n", p);
+			return -1;
+		}
+		if (errno == ERANGE || b < 1 || b > max) {
+			printf("ERROR: band %ld out of range (1..%d)\n", b, max);
+			return -1;
+		}
 		bands[n++] = (int)b;
 		p = end;
+	}
+	if (*p) {
+		printf("ERROR: too many bands (max %d)\n", max);
+		return -1;
 	}
 	return n;
 }
 
+/* Returns the mask, or -1 (with parse_csv's message) on invalid input. */
 static int build_lte_mask(const char *csv, uint64_t *mask)
 {
 	int bands[64];
 	int n = parse_csv(csv, bands, 64);
 	int i;
+	if (n < 0)
+		return -1;
 	*mask = 0;
 	for (i = 0; i < n; i++)
-		if (bands[i] >= 1 && bands[i] <= 64)
-			*mask |= (1ULL << (bands[i] - 1));
+		*mask |= (1ULL << (bands[i] - 1));
 	return n;
 }
 
+/* Returns the number of bands actually placed in the mask, or -1 (with
+ * parse_csv's message) on invalid input. parse_csv already enforces the
+ * 1..512 range, so every parsed band lands in the mask. */
 static int build_nr_masks(const char *csv, uint64_t *masks /*[8]*/)
 {
 	int bands[512];
 	int n = parse_csv(csv, bands, 512);
 	int i;
+	if (n < 0)
+		return -1;
 	memset(masks, 0, 8 * sizeof(uint64_t));
 	for (i = 0; i < n; i++) {
 		int b = bands[i];
-		if (b < 1) continue;
-		{
-			int idx = (b - 1) / 64;
-			int bit = (b - 1) % 64;
-			if (idx < 8)
-				masks[idx] |= (1ULL << bit);
-		}
+		int idx = (b - 1) / 64;
+		int bit = (b - 1) % 64;
+		masks[idx] |= (1ULL << bit);
 	}
 	return n;
 }
 
 /* --- operations --- */
 
-/* Probe a port with a raw QMI request; returns response length (>0) or <=0. */
+/* Probe a port with a raw QMI request; returns response length (>0) or <=0.
+ * Accepts only the response from the probed endpoint carrying our
+ * transaction handle and message id, so a stale datagram from an earlier
+ * probe can never masquerade as this endpoint's answer. */
 static int probe_raw(int fd, uint32_t node, uint32_t port, uint16_t msg_id,
 		     const unsigned char *tlvs, int tlv_len,
 		     unsigned char *rx, int rxmax, int timeout_ms)
@@ -277,11 +325,17 @@ static int probe_raw(int fd, uint32_t node, uint32_t port, uint16_t msg_id,
 	unsigned char msg[512];
 	struct qmi_hdr q;
 	struct sockaddr_qrtr dst;
+	struct timespec start;
+	static uint16_t next_txn = 1;
+	uint16_t txn;
 	int len;
 
 	memset(&q, 0, sizeof(q));
 	q.type = 0x00;
-	q.txn_id = 1;
+	txn = next_txn++;
+	if (txn == 0)
+		txn = next_txn++; /* never send txn 0 */
+	q.txn_id = txn;
 	q.msg_id = msg_id;
 	q.msg_len = (uint16_t)tlv_len;
 	memcpy(msg, &q, sizeof(q));
@@ -297,20 +351,33 @@ static int probe_raw(int fd, uint32_t node, uint32_t port, uint16_t msg_id,
 
 	if (sendto(fd, msg, len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0)
 		return -1;
-	{
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
 		struct pollfd pfd = {fd, POLLIN, 0};
-		time_t end = time(NULL) + timeout_ms / 1000 + 1;
-		while (time(NULL) < end) {
-			int ms = (int)(end - time(NULL)) * 1000;
-			int pr = poll(&pfd, 1, ms < 20 ? 20 : ms);
-			if (pr <= 0) return 0; /* timeout */
-			int n = (int)recv(fd, rx, rxmax, 0);
-			if (n < 0) return -1;
-			if (n >= 7 && rx[0] == 0x02) return n;
-			/* ignore stray datagrams (e.g. late NEW_SERVER) */
-		}
+		struct sockaddr_qrtr from;
+		socklen_t flen = sizeof(from);
+		int ms, pr, n;
+
+		ms = deadline_ms(&start, timeout_ms);
+		if (ms <= 0)
+			return 0; /* bounded timeout */
+		if (ms > 200)
+			ms = 200; /* poll in slices so strays can't starve the deadline */
+		pr = poll(&pfd, 1, ms);
+		if (pr < 0)
+			return -1;
+		if (pr == 0)
+			return 0; /* no matching response within budget */
+		n = (int)recvfrom(fd, rx, rxmax, 0,
+				  (struct sockaddr *)&from, &flen);
+		if (n < 0)
+			return -1;
+		if (n >= 7 && rx[0] == 0x02 &&
+		    from.sq_node == node && from.sq_port == port &&
+		    le16(rx + 1) == txn && le16(rx + 3) == msg_id)
+			return n;
+		/* stray datagram (late NEW_SERVER, stale probe reply): skip */
 	}
-	return 0;
 }
 
 /* Receive the QMI response matching (txn, msg_id) from node:port, skipping
@@ -366,6 +433,8 @@ static int response_status(const unsigned char *rx, int n, uint16_t *err)
 	while (off + 3 <= n) {
 		uint8_t t = rx[off];
 		uint16_t l = le16(rx + off + 1);
+		if (off + 3 + (int)l > n)
+			break; /* truncated TLV: never read past the buffer */
 		if (t == TLV_RESULT && l >= 4) {
 			*err = le16(rx + off + 5);
 			return le16(rx + off + 3);
@@ -429,10 +498,13 @@ static int do_scan(int fd)
 		}
 	}
 	{
-		time_t end = time(NULL) + 3;
-		while (time(NULL) < end) {
-			int ms = (int)(end - time(NULL)) * 1000;
-			int ret = wait_recv(fd, rx, sizeof(rx), ms < 50 ? 50 : ms);
+		struct timespec start;
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		for (;;) {
+			int ms = deadline_ms(&start, 3000);
+			int ret;
+			if (ms <= 0) break;
+			ret = wait_recv(fd, rx, sizeof(rx), ms < 50 ? 50 : ms);
 			if (ret <= 0) break;
 			if (ret >= 20 && le32(rx) == QRTR_TYPE_NEW_SERVER) {
 				uint32_t svc = le32(rx + 4), node = le32(rx + 12), port = le32(rx + 16);
@@ -537,6 +609,18 @@ static int send_set(int fd, uint32_t node, uint32_t port,
 	}
 	hexdump("SET response", rx, ret);
 	parse_response(rx, ret);
+	{
+		uint16_t err = 0;
+		int st = response_status(rx, ret, &err);
+		if (st == -1) {
+			printf("SET response: missing or malformed result TLV\n");
+			return 1;
+		}
+		if (st != 0) {
+			printf("SET rejected: status=%d error=0x%04x\n", st, err);
+			return 1;
+		}
+	}
 	return 0;
 }
 
@@ -547,8 +631,11 @@ static void usage(const char *a0)
 	printf("usage:\n"
 	       "  %s --scan\n"
 	       "  %s --get\n"
-	       "  %s --set <lte_csv> <nr_csv>\n"
-	       "  %s --set-all-lte <lte_csv>\n",
+	       "  %s --set <lte_csv> <nr_sa_csv> [nr_nsa_csv]\n"
+	       "  %s --set-all-lte <lte_csv>\n"
+	       "nr_sa_csv sets the NR5G SA band preference; the optional\n"
+	       "nr_nsa_csv sets the NR5G NSA preference separately\n"
+	       "(default: empty - the SA list is not duplicated into NSA).\n",
 	       a0, a0, a0, a0);
 }
 
@@ -606,10 +693,13 @@ static int find_nas(int fd, uint32_t *node, uint32_t *port)
 		}
 	}
 	{
-		time_t end = time(NULL) + 3;
-		while (time(NULL) < end) {
-			int ms = (int)(end - time(NULL)) * 1000;
-			int ret = wait_recv(fd, rx, sizeof(rx), ms < 50 ? 50 : ms);
+		struct timespec start;
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		for (;;) {
+			int ms = deadline_ms(&start, 3000);
+			int ret;
+			if (ms <= 0) break;
+			ret = wait_recv(fd, rx, sizeof(rx), ms < 50 ? 50 : ms);
 			if (ret <= 0) break;
 			if (ret >= 20 && le32(rx) == QRTR_TYPE_NEW_SERVER) {
 				uint32_t svc = le32(rx + 4), n = le32(rx + 12), p = le32(rx + 16);
@@ -677,7 +767,7 @@ int main(int argc, char **argv)
 {
 	int fd, mode = 0; /* 1=get 2=set */
 	uint32_t nas_node = 0, nas_port = 0;
-	const char *lte_csv = NULL, *nr_csv = NULL;
+	const char *lte_csv = NULL, *nr_csv = NULL, *nsa_csv = "";
 
 	if (argc < 2) { usage(argv[0]); return 2; }
 	if (!strcmp(argv[1], "--scan")) {
@@ -692,11 +782,13 @@ int main(int argc, char **argv)
 		mode = 2;
 		lte_csv = argv[2];
 		nr_csv = argv[3];
+		nsa_csv = argc >= 5 ? argv[4] : "";
 	} else if (!strcmp(argv[1], "--set-all-lte")) {
 		if (argc < 3) { usage(argv[0]); return 2; }
 		mode = 2;
 		lte_csv = argv[2];
 		nr_csv = "";
+		nsa_csv = "";
 	} else {
 		usage(argv[0]);
 		return 2;
@@ -720,18 +812,23 @@ int main(int argc, char **argv)
 	{
 		uint64_t lte = 0, sa[8], nsa[8];
 		uint16_t mode_pref;
-		int nlte, nsa_n, nnsa;
+		int nlte, sa_n, nsa_n;
 		nlte = build_lte_mask(lte_csv, &lte);
-		nsa_n = build_nr_masks(nr_csv, sa);
-		nnsa = build_nr_masks(nr_csv, nsa);
+		sa_n = build_nr_masks(nr_csv, sa);
+		nsa_n = build_nr_masks(nsa_csv, nsa);
+		if (nlte < 0 || sa_n < 0 || nsa_n < 0) {
+			printf("ERROR: invalid band list\n");
+			return 1;
+		}
 		if (nlte <= 0 || lte == 0) {
 			printf("ERROR: empty LTE mask (refusing; would disable all LTE)\n");
 			return 1;
 		}
 		mode_pref = QMI_RAT_LTE;
-		if (nsa_n > 0 || nnsa > 0)
+		if (sa_n > 0 || nsa_n > 0)
 			mode_pref |= QMI_RAT_NR5G;
-		printf("SET lte bands=%d nr bands=%d mode=0x%04x\n", nlte, nsa_n, mode_pref);
+		printf("SET lte bands=%d nr sa bands=%d nr nsa bands=%d mode=0x%04x\n",
+		       nlte, sa_n, nsa_n, mode_pref);
 		return send_set(fd, nas_node, nas_port, mode_pref, &lte, sa, nsa);
 	}
 }
