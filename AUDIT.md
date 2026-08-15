@@ -2351,6 +2351,873 @@ Evidence: `web/server.py:1257-1302,1339-1365`; a focused probe with
 NR bands from `/api/read`, while `/api/boot-apply` returned
 `{'ok': False, 'error': 'invalid config'}`.
 
+## Continuation audit (2026-08-10) — findings A-150..A-223
+
+Captured on `main` after PR #1 merged (HEAD `8e940e4`, branch
+`audit/2026-08-deep`). The tree is byte-identical to the audited
+`55b0e2d` except for AUDIT.md, so every prior finding above stands.
+Method: five parallel slices (web UI, backend/API, diag/QMI,
+boot/packaging/release, and independent prior-claims verification),
+plus re-verification of 15 high-value prior findings — all 15
+CONFIRMED (A-01 shipped diag ABI, A-04 hardcoded API base, A-13/A-145
+QMI masks, A-26 wildcard CORS + preflight, A-57 OOB read, A-65
+undocumented `action`, A-74 PosixPath serialization, A-105 remote
+lockout, A-119 seed-before-skip, A-129 fd race, A-143 ioctl, A-146,
+A-149). Verification discrepancies: (1) A-01's "compatible signature
+only in uncommitted v2.6.1 worktree" is stale — the fixed 3-arg parser
+IS committed in the repo-ROOT `protocol.py` mirror while the shipped
+`diag/protocol.py` and both zips carry the broken 1-arg ABI (see
+A-151); (2) A-146's cited lines drifted ~4 lines, content identical;
+(3) the settings-GET auth exemption keys on `action==settings`, so the
+README-documented bare `GET /api/settings` is not exempt remotely
+(see A-158).
+
+Baseline verifications (no defect found): diag CRC-16/X-25 variant,
+HDLC 0x7D/0x7E escaping, and little-endian field widths all match the
+CAF diag HDLC layer (cross-checked against CAF kernel sources); no
+XSS-reachable innerHTML interpolation in the v2.6 UI (three sites, all
+static data); no eval/Function/document.write/external resources;
+localStorage key names consistent; clipboard code guards
+`navigator.clipboard`; no interval pileup in startPolling; qmi_band has
+no malloc paths and no 64-bit shift UB; `_run_cmd` args and `_get_prop`
+names are compile-time constants (no injection surface); token
+comparison is constant-time; v2.6 zip hygiene clean (no tests, pyc,
+config, symlinks) and its python layout satisfies service.sh (v2.5 zip
+does not — A-152); both zips pass `unzip -t`; test_server.py 64/64 and
+test_diag_client.py 2/2 pass.
+
+### A-150 — Shipped diag parser has no NV echo validation (P1)
+
+`parse_nv_read_response()` accepts any 0x3D/0x3E frame with status 0,
+regardless of which request it answers. `_scan_stream()` returns the
+first decoded NV frame in the stream, and delayed/cross replies are
+real mechanics on this transport (A-126/A-129). `get_band_config()`
+can therefore label NR data as `lte_bands` (or the reverse) and
+`write_nv` can attribute the wrong write's echo. The client comment at
+`diag/diag_client.py:367-369` promises an echo-validate guard that is
+not implemented anywhere in the shipped parser. The repo-root mirror
+`protocol.py:143-169` contains the real `expected_nv_id`/
+`expected_sub_id` logic — a naive A-01 fix that drops the extra
+arguments at the call site instead of restoring validation leaves this
+hole open.
+
+A probe loaded the shipped parser and the root mirror side by side: a
+NR reply (nv_id 26950) submitted to `parse_nv_read_response()` for an
+LTE 26664 request returned `{'nv_id': 26950, 'status': 0, 'success':
+True}` (accepted — its bitmask would be shown as the LTE bands); the
+root mirror with `expected_nv_id=26664` returned `None` (rejected).
+
+Evidence: `diag/protocol.py:143-169,172-191`; `diag/diag_client.py:
+367-369,289-329,382-405`. Affected: diag `read_nv`/`write_nv`/
+`get_band_config`/`set_band_config`, `/api/read`, `/api/write`,
+boot-apply fallback on diag-only devices. Remediation: restore the
+echo-validation parameters into the shipped `diag/protocol.py`
+(validate both nv_id and sub_id); do not fix A-01 by ignoring the
+extra arguments. Distinct from A-01 (signature TypeError) and A-61
+(non-NV notifications). Confirmed.
+
+### A-151 — Repo-root mirrors mask the shipped A-01 defect (P1)
+
+Root `protocol.py` (245 lines, committed since v2.2 `f92dc30`) carries
+the v2.6.1-compatible 3-arg signatures `parse_nv_read_response(
+response, expected_nv_id=None, expected_sub_id=None)` and the write
+equivalent; the shipped `diag/protocol.py` (219 lines, unchanged since
+v1.0 `b333f0d`) accepts only `response`. `diag/diag_client.py:370,379`
+call the 3-arg form, so a repo-root dev checkout runs fine while every
+shipped copy — the diag/ package and both zips — fails on-device with
+the A-01 TypeError. This explains how the P0 shipped: the only code
+path developers and CI exercise masks the defect, and the root mirror
+documents an API that does not exist in any artifact. The shipped
+v2.6 zip's `diag/protocol.py` md5 equals the repo `diag/protocol.py`
+(ea5200c8), so the broken ABI is in the release. `python3 test_server.py`
+(64 tests) passes from the root tree because root `protocol.py`
+satisfies the callers.
+
+Evidence: `protocol.py:143-147,186-190` vs `diag/protocol.py:143,172`;
+`diag/diag_client.py:370,379`; `git log --all -- protocol.py`
+(f92dc30 only) vs `-- diag/protocol.py` (b333f0d only). Affected:
+dev/CI verification, docs, diag transport on-device. Remediation:
+delete the root mirror (or make it a copy/symlink of diag/) and fix
+`diag/protocol.py`; add a build gate asserting the zipped protocol
+matches the tested file. Extension of A-01 (shipped-artifact angle).
+Confirmed.
+
+### A-152 — Released bandctl-v2.5.zip contains no Python interpreter (P1)
+
+The v2.5 zip ships 21 members; the python/ subtree is only shared
+libraries under `python/usr/lib/` — no `python/bin/python3.14`, no
+`python/lib/`. `service.sh:33` `[ -f "$BUNDLED_PYTHON" ]` therefore
+fails on every fresh install; on ArrowOS 13.1 (no python, no Termux,
+no pyroot) all three selection branches fail and the module aborts
+with "Python not found" — the server never starts. The field device's
+boot log "bundled python missing, using pyroot fallback" is the exact
+mechanism (that device had pyroot installed by hand). The v2.5 tag
+tree (9b250c0) DOES contain the full python runtime (611 files under
+python/), so the zip was built from an incomplete tree; the repo still
+hosts and advertises the broken artifact. The v2.6 zip layout
+(python/bin/python3.14 + python/usr/lib + python/lib) satisfies
+service.sh. Confirmed.
+
+Evidence: `service.sh:17,33-48`; `unzip -Z1 bandctl-v2.5.zip` (21
+members, zero python/bin or python/lib entries); `git ls-tree -r
+--name-only v2.5 python/ | wc -l` (611); v2.5 zip module.prop claims
+"bundled Python runtime — no Termux". Affected: install → boot on
+stock ROMs; the v2.5 release artifact; upgrade paths from v2.5.
+Remediation: rebuild the v2.5 zip from the tag tree or remove it; add
+a CI gate that fails a release build whose zip lacks
+`python/bin/python3.14`. Confirmed.
+
+### A-153 — Failed settings save silently revokes the bearer token (P2)
+
+`update_settings()` mutates the live `SETTINGS` dict before
+persistence and returns `ok:false` without the token field when the
+save fails. `_check_auth()` reads the live `SETTINGS["token"]` on
+every request, so a failed `regenerate:true` revokes the token every
+LAN client holds (they receive 401s for the rest of the process
+lifetime) while the new token is never persisted and never disclosed
+— unrecoverable until a restart reloads the old token from disk.
+With `lan_enabled:true` the bind also flips to 0.0.0.0 in-memory
+despite the failure. Trigger is realistic: full /data partition or
+EPERM on the module config dir.
+
+Probe (in-process with a natural EPERM save failure):
+`update_settings(None, {"lan_enabled": True, "regenerate": True})`
+→ `{'ok': False, 'error': 'settings save failed: ...'}`; afterwards
+`_check_auth('Bearer OLD-TOKEN-ON-DISK')` → unauthorized, the new
+in-memory token accepted, and `'token' not in res` (never returned).
+
+Evidence: `web/server.py:1200-1207,1010-1014,1211`. Affected: POST
+/api/settings, LAN auth gate for every non-loopback request.
+Remediation: compute the new state in a copy, persist first, mutate
+`SETTINGS` only after success (or restore on failure); never rotate
+the token until save succeeds. Extension of A-17/A-41/A-63 (new
+angle: credential revocation + multi-client lockout). Confirmed.
+
+### A-154 — Drop-log durations derive from wall-clock time (P2)
+
+`_drop_log_loop()` stamps `w.drop_start` with `time.time()` and
+computes the recovery duration as `now - drop_start`. A backward clock
+step (NTP/carrier time sync, which phones perform at boot/reconnect)
+between detection and recovery persists a NEGATIVE duration in the
+snapshot file, and the DETECTED/RECOVERED stamps can be identical or
+out of order. The episode filename `drop_YYYYMMDD_HHMMSS.txt` is
+re-derivable after a backward step, aggravating A-128's same-second
+overwrite. The band-camping CSV timestamps (`int(time.time()*1000)`)
+become non-monotonic, so the last-N-sample chart can show time going
+backwards.
+
+Probe: `_drop_log_loop()` with mocked `_drop_state` (POWER_OFF then
+IN_SERVICE) and a 1-hour backward `time.time` step persisted
+`=== DROP DETECTED 2026-08-10 00:08:36 ===` then
+`=== RECOVERED 2026-08-10 00:08:36 (duration -3600s) ===`.
+
+Evidence: `web/server.py:364,369,371-372,376-377,387,394-396,933`.
+Affected: drop-log watchdog, band-camping CSV, Diagnostics plot.
+Remediation: use `time.monotonic()` for durations/gaps; keep
+wall-clock only for display stamps; add a uniqueness guard to episode
+and export filenames. Confirmed.
+
+### A-155 — POST /api/export persists unvalidated bodies verbatim (P2)
+
+`export_config()` dumps the raw submitted JSON to a config-dir file
+without the M8 validation `write_config()` applies. A body of
+`["not","a","dict"]` or `{"lte":[999,"x"],"nr":[1337]}` returns
+`ok:true` and persists the invalid content, which the UI presents as
+a band-config backup and offers for later Import. A LAN attacker with
+the token (the export auth surface) can plant garbage configs; the
+export endpoint's contract diverges from the write endpoint's for
+identical input. The 1 MiB body cap still bounds the write primitive.
+
+Probe: with mocked FS, body `["not","a","dict"]` → `{'ok': True,
+'path': ...}` with verbatim content; `{"lte":[999,"x"],"nr":[1337]}`
+→ `{'ok': True}`; contrast `_validate_bands({"lte":[999],"nr":[]})`
+→ `(None, 'invalid lte band list: each band must be an integer 1-79')`.
+
+Evidence: `web/server.py:1402-1416` vs `:1304-1315`. Affected: POST
+/api/export, the UI Import flow. Remediation: run `_validate_bands`
+normalization on the export path (and reject non-dict bodies).
+Confirmed.
+
+### A-156 — NV item constants are hex-vs-decimal ambiguous and never hardware-validated (P2)
+
+`NV_LTE_BAND_PREF = 0x06828` (26664 decimal) and `NV_NR5G_BAND_PREF =
+0x06946` (26950) are sent little-endian on the wire. The classic,
+widely-documented Qualcomm items are NV 6828 decimal (0x1AAC, "LTE BC
+Configuration") and 6829; the hex reading is consistent with QXDM-style
+hex NV ids. If the correct numbering is decimal, every diag-only
+read/write targets a nonexistent item: reads return status!=0 and
+writes are silently rejected while the API reports success. The diag
+path has NEVER completed a parse in any release (A-01 TypeError), so
+the constants were never confirmed by a working round trip, and no
+provenance exists in the repo.
+
+Probe: `build_nv_read_cmd(26664,0)` → `3d 28 68 00 ...` vs
+`build_nv_read_cmd(6828,0)` → `3d ac 1a 00 ...`; repo-wide search
+finds 6828/6946/26664/26950 only at `diag/protocol.py:26-27`.
+
+Evidence: `diag/protocol.py:26-27`. Affected: diag `read_nv`/
+`write_nv` for LTE/NR band preference. Remediation: verify the two NV
+ids with one QXDM/QRCT read on a working diag session; state the
+numbering convention in a comment. Hypothesis (unresolvable without
+device access).
+
+### A-157 — Repo-root index.html is the stale v2.5 dark UI (P2)
+
+Root `index.html` (1753 lines, md5 e5adc638) is byte-identical to the
+v2.5 zip's `web/index.html` — the previous release's UI — while the
+shipped v2.6 white skin lives only in `web/index.html` and
+`webroot/index.html` (2156 lines, md5 7fccca1b, byte-identical to
+each other). GitHub presents a checkout whose root UI is not what
+ships; contributors, CI, and tooling read the wrong copy, and the
+root `server.py` (identical to web/) serves whichever index.html sits
+in its web/ sibling, so a root checkout is internally inconsistent.
+(The webroot copy is not dead: KernelSU Manager serves `$MODDIR/
+webroot/index.html` by directory convention; the duplication is by
+design. The defect is the root mirror.)
+
+Evidence: root `index.html` md5 e5adc638 == `unzip -p
+bandctl-v2.5.zip web/index.html`; `web/index.html` == `webroot/
+index.html` md5 7fccca1b; both root and web copies are tracked in git.
+Affected: repo docs/CI/devs. Remediation: replace root `index.html`
+with the web/ copy (or remove it) and add a CI mirror check. A-19
+covers screenshots only; this is the tracked source-copy drift.
+Confirmed.
+
+### A-158 — LAN settings-GET auth exemption is query-dependent (P2)
+
+The settings-GET auth exemption keys on the query parameter
+`action==settings`, so the README-documented bare `GET /api/settings`
+(README.md:49) is NOT exempt for a non-loopback client: it hits the
+gate and returns 401 even though the intended exempt route
+`GET /api/settings?action=settings` (the frontend's form) works. On
+the A-105 lockout state (persisted `bind: 0.0.0.0` with no token)
+this removes even the diagnostic `token_required` read that a remote
+operator could use to understand the lockout, and it compounds the
+"recovery surface hidden" problem: the only documented remote route
+that should reveal LAN state fails before the exemption applies.
+
+Probe: with LAN on and no token, non-loopback
+`GET /api/settings?action=settings` → 200 with `token_required: true`
+(exempt), while bare `GET /api/settings` → 401 (not exempt).
+
+Evidence: `web/server.py:985-1017` (exemption condition on
+`action`), `README.md:49`. Affected: LAN admin surface, A-105
+recovery path. Remediation: key the exemption on the path
+(`/api/settings`) rather than the query, or document the
+`?action=settings` requirement. Interaction found during prior-claims
+verification. Confirmed.
+
+### A-159 — Custom switch checkboxes have no accessible name (P2)
+
+Both LAN and Drop-logging toggles put `aria-label` on the wrapping
+`<label>` and leave the `<input>` unnamed. Per the accname
+algorithm, an input's name comes from its own aria-label/aria-
+labelledby or the label's TEXT content — the label element's aria-
+label contributes nothing, and the label's text content is just the
+empty slider span. Screen readers announce two nameless checkboxes;
+the purpose of the toggles is unknowable non-visually.
+
+Probe: node extraction of both blocks → both inputs have 0
+aria-label/aria-labelledby attributes; enclosing label text is empty.
+
+Evidence: `web/index.html:1038-1041` (lan-toggle), `:1067-1070`
+(drop-log-toggle). Affected: Settings → Network access / Debug.
+Remediation: put `aria-label` on the `<input>` or add
+`aria-labelledby` to the row text. A-39 covers the token/preset-name
+text inputs only. Confirmed.
+
+### A-160 — toggleLan() lacks a failure resync (P2)
+
+When the `/api/settings` POST fails at the transport level (server
+down, network error, 401), `toggleLan()`'s catch only toasts; the
+switch keeps the user's flip, `lanEnabled` stays stale, and the token
+section visibility matches neither the server nor the user's intent.
+`toggleDropLog()` is asymmetric: its catch calls `fetchDropLog()` to
+resync. Transport failure is a distinct trigger from A-17's
+HTTP-200-error-payload path.
+
+Probe: function-body extraction — toggleDropLog catch resyncs via
+fetchDropLog (true); toggleLan catch resyncs (false); catch body is
+`catch (e) { toast('Failed to change network access: ' + e.message,
+true); }`.
+
+Evidence: `web/index.html:1972-1988` vs `:1954-1971`. Affected:
+Settings → Network access switch; feeds the stale-state family in
+A-49/A-125. Remediation: restore `$('lan-toggle').checked =
+lanEnabled` (or re-fetch settings) in the catch, mirroring
+toggleDropLog. Confirmed.
+
+### A-161 — Export can report success without producing a file (P2)
+
+`exportConfig()` uses the reliable on-device server export only when
+`typeof window.ksu !== 'undefined'`; otherwise it takes the desktop
+blob-`<a download>` path, whose own comment says the Manager WebView
+drops blob downloads. In any host without the injected `ksu` bridge
+(older Manager builds, alternate WebUI hosts, browsers blocking the
+download), the click is silently dropped while the unconditional
+toast claims "Config exported (n LTE, m NR)" and no file exists
+anywhere. There is no check that the blob download was accepted.
+Export is a data-preservation action; a false success strands the
+user's configuration. KernelSU's WebUI bridge injection is
+host/version-dependent (KsuWebUIStandalone exposes it as an injected
+`ksu` object), so the sniff is fragile.
+
+Evidence: `web/index.html:1733` (ksu gate), `:1734-1735` (comment),
+`:1755-1762` (blob path + unconditional toast); server export at
+`web/server.py:1402-1415`. Affected: Settings → Export config.
+Remediation: default to the server export and verify `d.ok`, or
+detect download acceptance and fall back to the server path.
+A-82 covers accumulation when the ksu path works; this is the
+silent no-file failure when it does not. Hypothesis (WebView
+unavailable; static branch trace).
+
+### A-162 — Active-state teal text fails small-text contrast (P2)
+
+The selected-band tile name/freq and the selected Camped chip use
+`#087f91` on light teal-tinted fills: 4.29:1 on `#e4f8fb` and 4.45:1
+on `#f1fcfd` — below the 4.5:1 AA threshold for the 14px/800 and 9px
+text that renders there. The active state is the primary feedback for
+band selection and the live serving-cell readout, so low-vision users
+fail to read exactly where state matters. Not covered by A-29 (white
+on `#079eb3`) or A-79 (state palette): this is a distinct pair that
+passes on white (4.71:1) but fails on the fills.
+
+Probe: node WCAG relative-luminance math; algorithm validated by
+exactly reproducing A-29 (3.21) and A-79 (3.80/4.02/3.93) values.
+
+Evidence: `web/index.html:787,789-791,838-841`. Affected: Bands tab
+selected tiles, Diagnostics selected chip. Remediation: darken the
+active-state teal or lighten the fill to reach ≥4.5:1. Confirmed.
+
+### A-163 — No diag protocol tests, fixtures, or committed test file (P2)
+
+`test_diag_client.py` has 2 tests, both for the abandoned-reader race;
+nothing exercises crc_ccitt, HDLC encode/decode, NV command build/
+parse, endianness, or `_scan_stream` against a captured stream, and
+no captured diag stream exists anywhere in the repo (no .bin/.raw/.
+cap/.hex/.qcn). The docstrings cite "kernel-verified protocol contract
+(docs/protocol_kernel.md)" and `test_server.py:8` cites
+"module/diag/tests/test_protocol.py" — neither file nor directory
+exists in the committed tree; `test_diag_protocol.py` (present in the
+v2.6.1 worktree per the AUDIT header) is also absent. Because every
+release ships the A-01 TypeError, no real NV response has ever been
+parsed by this code, so the whole parser is unvalidated against
+hardware. Separately, the v2.6 release changed only web/index.html
+(+591/-195 lines) and neither suite exercises it — the static-serving
+test writes its own stub `<html>bandctl test</html>`
+(test_server.py:536) and never loads the shipped page.
+
+Evidence: `test_diag_client.py` (2 tests); `diag/protocol.py:7-9`,
+`diag/diag_client.py:5`, `test_server.py:8`; glob of `**/test*.py`
+and `**/*.bin|raw|cap|hex|qcn|xml` returns only the two test files.
+Affected: test/verification pipeline, reproducibility of the
+"kernel-verified" claim. Remediation: add golden-fixture tests (a
+captured real NV read stream with expected output), a CRC check-value
+test (0x906E footer for "123456789"), escape round-trips, commit
+test_diag_protocol.py, and a smoke test asserting the shipped
+index.html parses; restore or drop the phantom doc references.
+Confirmed.
+
+### A-164 — qmi_band --set writes identical SA and NSA NR masks (P2)
+
+`main()` calls `build_nr_masks(nr_csv, sa)` and
+`build_nr_masks(nr_csv, nsa)` with the same string, so the SA and NSA
+preference TLVs always carry the same bands; the UI's single 'nr'
+list offers no way to express the SA/NSA split the QMI protocol
+supports. On SM8250 this forces every selected NR band into the SA
+preference, which can make the modem attempt or prefer SA registration
+on bands the network only offers via EN-DC/NSA, degrading service —
+while the mode-pref NR5G bit is set whenever either duplicate is
+non-empty. The shipped binary contains all 42 source string literals
+of this file, so it was built from this source.
+
+Evidence: `qmi/qmi_band.c:724-726` (both calls with the same
+`nr_csv`), `:251-267` (build_nr_masks), `:78-102` (build_set emits
+both TLVs), `:732`; caller `web/server.py:1388-1390`. Affected:
+`qmi_band --set`/`--set-all-lte` NR path, `/api/write` via QMI.
+Remediation: accept separate SA and NR lists (or a documented
+single-list policy) and stop duplicating the mask. Distinct from
+A-13 (LTE B66/B71 drop) and A-122 (output label overwrite).
+Confirmed.
+
+### A-165 — qmi_band --set exits 0 on a QMI FAILURE response (P3)
+
+`send_set()` prints `result: status=1 FAILURE` but returns 0, and
+`main` returns it directly, so a scripted `--set` gets exit code 0
+for a rejected band write. The web server compensates by regex-
+grepping `result: status=0` from stdout, so the UI path is protected,
+but the CLI contract is misleading and other consumers of the helper
+inherit the same gap A-44 documents for `--get`.
+
+Evidence: `qmi/qmi_band.c:509-541` (`send_set` returns 0 at 539-540
+regardless of printed status), `:735`; `parse_response` prints the
+status at `:189-190` with no flow into the return value. Affected:
+`qmi_band --set` CLI exit code (server compensated at
+`web/server.py:1390-1393`). Remediation: return nonzero when the
+result TLV status != 0. A-44 extension (SET path). Confirmed.
+
+### A-166 — parse_csv silently drops garbage and wraps overflow (P3)
+
+`strtol` overflow (e.g. 99999999999999999999) sets ERANGE and returns
+LONG_MAX, which `(int)` wraps to -1 and the range checks then skip;
+garbage tokens are skipped one character at a time ('1,abc,2' parses
+band 1 only). A typo can quietly produce a different mask with no
+error. The web server pre-validates band values, so this only affects
+direct CLI use.
+
+Evidence: `qmi/qmi_band.c:223-235` (no ERANGE check, no full-token
+consume), `:239-248,251-267` (silent range skips). Affected: `qmi_band
+--set`/`--set-all-lte` direct CLI. Remediation: validate each token
+(ERANGE, full-token consume, 1..N range) and abort with a message.
+Confirmed.
+
+### A-167 — README's documented 13 endpoints omit POST /api/export (P3)
+
+The dispatcher supports 13 actions including `export`
+(web/server.py:1078-1082), but README.md:45-57 documents 13 bullets
+that exclude /api/export; the only export mention is the settings.png
+caption. A user following the README cannot discover the on-device
+export endpoint the UI depends on; A-65 already showed the README/API
+documentation is not authoritative for the `action=` requirement.
+
+Evidence: `README.md:45-57` vs `web/server.py:1077-1113`; endpoint
+census intersection = 12. Affected: documentation, API consumers.
+Remediation: add `POST /api/export` to the README endpoint list (and
+note the `?action=` requirement). Confirmed.
+
+### A-168 — Responses disclose the exact bundled Python version (P3)
+
+`send_json()` never overrides `version_string()`, so every API
+response — including unauthenticated 401s and the CORS preflight —
+carries `Server: BaseHTTP/0.6 Python/3.14.5` (the bundled runtime).
+Combined with A-52 (plaintext HTTP on LAN) this gives any LAN
+observer exact version fingerprints for targeting known
+stdlib/CPython vulnerabilities in the shipped 3.14 runtime.
+
+Evidence: `web/server.py:1610-1624`; `service.sh:17`. Affected: all
+/api/* and static responses. Remediation: override `version_string()`
+(e.g. `server_version="Bandctl/2.6"`). Confirmed.
+
+### A-169 — HTTP/1.0 close-only semantics; chunked bodies silently dropped (P3)
+
+The handler keeps the stdlib default `protocol_version = "HTTP/1.0"`,
+so every request — even HTTP/1.1 keep-alive — is answered HTTP/1.0
+with `Connection: close`, pipelined requests left unread, and the UI's
+2s/5s polling churns a fresh TCP connection per request (TIME_WAIT
+accumulation). Requests with `Transfer-Encoding: chunked` and no
+Content-Length are treated as bodyless: the handler returns 200 with
+"invalid JSON body" and closes, silently dropping the client's body
+without a 411/501 explanation.
+
+Probe (socket-free parse_request harness): pipelined HTTP/1.1 second
+request → `HTTP/1.0 200 OK`, `close_connection=True`, 125 bytes left
+unread; chunked POST /api/settings → 200 invalid-JSON error + close;
+HEAD/TRACE/PUT → 501; 200KB header line → 431; 70KB URI → 414
+(stdlib guards present in the shipped 3.14 runtime).
+
+Evidence: `web/server.py:942-953` (no protocol_version override);
+shipped stdlib `python/lib/python3.14/http/server.py:694`. Affected:
+all /api/* and static responses; polling traffic pattern.
+Remediation: set `protocol_version="HTTP/1.1"` with keep-alive +
+chunked handling, or explicitly reject Transfer-Encoding with
+411/501 (keeping A-60's thread-pinning caveat in mind). Distinct
+from A-60 (no socket timeout) and A-34 (poll pileup). Confirmed.
+
+### A-170 — LTE bands 1-79 outside the 25-entry catalog render without tiles and are silently saved (P3)
+
+`setBands` keeps any band value; `renderGrid` renders only catalog
+entries. A modem/diag read or an imported file containing e.g. LTE
+B19/B21/B27 (valid 1-79 values absent from `LTE_BANDS`) shows
+"2 active" with one tile, and Save & Apply submits the invisible band
+— the server accepts it (validation is 1-79 only) — so the applied
+set silently differs from what the user sees. Unlike A-145 (NR>79
+rejected), here the save SUCCEEDS server-side, making the mismatch
+invisible end-to-end.
+
+Evidence: catalog `web/index.html:1138-1145` (25 LTE bands);
+`renderGrid` at `:1216-1219`; `setBands` at `:1230-1238`; server
+validation `web/server.py:1152-1173`. Affected: Bands tab read/save
+for non-Rogers/imported/other-carrier configs. Remediation: filter
+non-catalog bands with a visible warning, or add tiles (and enforce
+per-RAT catalogs server-side, cf. A-131). Extension of A-145
+(different trigger and outcome). Confirmed.
+
+### A-171 — service.sh lacks customize.sh's MODDIR self-heal (P3)
+
+`MODDIR=${0%/*}` (service.sh:7) yields "service.sh" when the script
+is invoked as `sh service.sh` from within the module dir — the same
+mangling customize.sh guards against with its module.prop-resolution
+loop. All subsequent state writes (config/, bandctl.log, chmod
+paths, nohup server path) then resolve under a stray "service.sh/"
+directory in the caller's cwd. Boot-time invocation by absolute path
+is safe; the UI restart path inherits whatever MODDIR the running
+server derived, and a manual `sh service.sh` from the module dir is a
+plausible user action.
+
+Evidence: `service.sh:7` (no guard) vs `customize.sh:13-30`
+(module.prop search self-heal); `service.sh:10,16,59,62` rely on
+MODDIR. Affected: manual restarts, non-boot invocations.
+Remediation: port customize.sh's module.prop-resolution loop (or
+`cd "$(dirname "$0")"` + realpath guard) into service.sh.
+Hypothesis (expansion verified statically).
+
+### A-172 — #lan-token-input is below the 44px touch-target minimum (P3)
+
+The token-entry field — the critical re-auth surface on remote LAN
+pages — computes to ≈37px tall (14px font × 1.5 line-height + 16px
+padding) with no white-skin min-height override, while the skin
+applies 44px to modal inputs and 48px to `.btn`. On-device taps near
+its edge can miss or hit the adjacent Save button. A-76 audits the
+buttons/switches but not this input.
+
+Evidence: `web/index.html:497-505` (the only #lan-token-input rule);
+contrast with the modal-input min-height rule. Affected: Settings →
+Network access → token entry. Remediation: add `min-height: 44px` to
+`#lan-token-input` in the white-skin block. Confirmed.
+
+### A-173 — Module updates wipe exports and drop-log evidence — both persistence features self-destruct (P2)
+
+`EXPORT_DIR = MODDIR / "config"` and `DROP_LOG_DIR = MODDIR / "config" / "drop_log"` place every export and drop snapshot inside the module directory, which a KernelSU module update replaces wholesale (the zips ship zero `config/` members, and settings.json is already known not to survive updates). The Settings-tab Export is presented as a backup — "Config exported" — but the copy lives in the directory the next update deletes, so the backup is unusable across the upgrade it is most needed for. The drop-log snapshots, whose purpose is cross-reboot/cross-update correlation of radio outages, vanish the same way; the band-camping log has already suffered exactly this loss in the field (the log that could have measured a drop duration was wiped by the v2.4 update).
+
+Evidence: `web/server.py:238` (`EXPORT_DIR = MODDIR / "config"`), `:249` (`DROP_LOG_DIR = MODDIR / "config" / "drop_log"`); `unzip -Z1 bandctl-v2.6.zip | grep -c '^config/'` → 0; prior audit note that settings.json resets on update. Affected: Settings → Export config; Debug → Drop logging evidence; boot re-apply intent. Remediation: persist exports/snapshots outside the module dir (e.g. `/data/local/tmp/bandctl/` or a data dir) or teach customize.sh to preserve `config/` across updates. Confirmed (structural).
+
+### A-174 — Drop-log snapshots have no UI/API reader (P3)
+
+`read_drop_log()` returns only the snapshot filenames; no endpoint serves snapshot content, and the Settings Debug note points the user at a root-only module path. The feature exists to capture correlation evidence (registration, Wi-Fi, counters, radio tail), but once captured the evidence cannot be viewed or exported through the app — only via a root shell into the module dir. The "N snapshots" count in the UI is not actionable: there is no list, preview, or export surface.
+
+Evidence: `web/server.py:1460-1474` (`read_drop_log` returns `dir` + `files` only; the drop-log dispatch has no `file=` path); `web/index.html` drop-log-note renders the dir path + count. Affected: Debug → Drop logging. Remediation: add an auth-gated `GET /api/drop-log` content/export path (validate the filename against the directory) or a list+view in the Settings Debug section. Confirmed.
+
+### A-175 — Boot-apply result logging discards the response on slow applies (P3)
+
+The service's boot-apply POST uses a 10-second urllib timeout while the server-side apply has no matching deadline (QMI discovery alone can take ~98s worst case, A-64). When the apply outlives the client timeout, the shell captures an empty `resp` and logs `boot-apply -> ` — a blank line — even though the server continues applying and may succeed. Slow-but-successful boot applies are therefore logged as failures/no-ops, which has already caused a false "boot-apply skipped" diagnosis in the field (the v2.5 timeout regression).
+
+Evidence: `service.sh` boot-apply POST (`urllib.request.urlopen(req, timeout=10)`; `sys.exit(1)` on exception with no stdout) → `resp` empty; server apply path bounded only by `_run_qmi` subprocess timeouts per A-64. Affected: boot-time re-apply logging. Remediation: separate the response read from the timeout (accept a fire-and-forget 202 or log "apply started") or raise the POST timeout to cover the apply bound. Confirmed (structural; P3 — log-only misreport).
+
+### A-176 — Drop watchdog never triggers on IWLAN/VoWiFi transport transitions (P2)
+
+The watchdog's drop decision examines only `service_state` (`state = (reg or {}).get("service_state")`; the episode branch tests `POWER_OFF` / `OUT_OF_SERVICE` / `EMERGENCY_ONLY`). `network_type` is parsed and carried in the registration dict (line 787-791) but is consumed only by the UI chips — the logger never looks at it. A radio drop that manifests as a transport change — the field-observed IWLAN/VoWiFi signature where `network_type` becomes `IWLAN` while `service_state` and `data_state` stay `IN_SERVICE`, or where data silently fails over to the WLAN path — therefore enters neither the drop branch nor the snapshot, even though the snapshot machinery (registration dict, wifi status, per-interface counters, radio tail) is exactly the evidence needed to test the IWLAN hypothesis. This is distinct from A-85 (which covers `data_state=OUT_OF_SERVICE` while voice stays up): here there is no state transition at all — only the transport/technology field changes.
+
+Probe: `_drop_log_loop()` with mocked `_drop_state` returning `{"service_state": "IN_SERVICE", "data_state": "IN_SERVICE", "network_type": "IWLAN", ...}` runs a full poll cycle with no episode opened and no file written — the loop only branches on the three service-state strings.
+
+Evidence: `web/server.py:362-365` (state decision), `:787-791` (network_type parsed, never consumed by the watchdog). Affected: Debug → Drop logging — the IWLAN drop signature under investigation produces no snapshot or recovery duration. Remediation: treat a `network_type` transition into `IWLAN` (or a `data_state` regression) as an episode trigger, and/or snapshot on any registration transition. Confirmed.
+
+### A-177 — The published v2.5 release asset is the broken no-python zip (P3)
+
+The earlier finding (A-152) documented the committed `bandctl-v2.5.zip` shipping no Python interpreter and listed the Releases page as an unverifiable blind spot. That blind spot is now closed: the GitHub **release** asset `bandctl-v2.5.zip` is byte-identical to the committed broken artifact (md5 `168f24b0767118ec3549ffd0c716a329` both sides; 20 members, zero `python/bin/` entries). Every user who installed v2.5 from the Releases page received a module whose `service.sh` cannot find `python/bin/python3.14` and aborts on any ROM without a pre-existing Termux or `/data/local/tmp/pyroot` — the module's own "bundled Python runtime — no Termux" claim is false for the artifact that was actually published.
+
+Probe: `gh release download v2.5` → `unzip -Z1 bandctl-v2.5.zip | grep -c python/bin` → 0; `md5 -q` release asset vs committed zip → identical. The v2.6 release asset matches the committed v2.6 zip (md5 `81473599…`), whose layout is correct.
+
+Evidence: GitHub release v2.5 asset (md5 `168f24b0…`); `service.sh:17,33-48`; A-152. Affected: all v2.5 installs from Releases; the v2.5 tag's advertised behavior. Remediation: re-cut the v2.5 release from the v2.5 tag tree (which contains the full 611-file python runtime) or unpublish the broken asset; add the CI gate proposed in A-152. Confirmed.
+
+### A-178 — Loopback is a trusted surface: unprivileged apps (or web pages) get full modem control and can mint + steal the LAN token (P1)
+
+`_auth_required()` exempts every loopback client from authentication on EVERY action — `if self._is_loopback(): return False` comes before any per-action check — and `update_settings()` creates AND returns a fresh `secrets.token_urlsafe(24)` bearer token in the response. The "phone itself never needs the token" intent ignores that the phone's apps and web pages are not the phone:
+
+- **Unprivileged app vector**: any app on the phone (INTERNET permission is default) can POST to `http://127.0.0.1:8080` with no token and reach every endpoint: `/api/write` (modem band control — privilege escalation from an unprivileged context with no native band API), `/api/modem-reset` (radio DoS, repeatable), `/api/restart`, `/api/export`, `/api/boot-apply`.
+- **Token theft + LAN pivot**: one unauthenticated POST `/api/settings?action=settings` with `{"lan_enabled": true, "regenerate": true}` both mints a fresh token and persists `bind: 0.0.0.0`; the response discloses the token. After the attacker triggers a restart (also unauthenticated), the server binds all interfaces with a token only the attacker holds — remote modem control from anywhere on the LAN, and the legitimate user's old token is invalidated (A-105 lockout for the owner, control for the attacker).
+- **Browser vector**: the wildcard CORS (A-26) makes preflighted `fetch` calls to the loopback server succeed (no auth required there), and the GET-mutation routes (A-66: `modem-reset`, `restart`, `boot-apply` via GET) work even without CORS — a plain `<img src="http://127.0.0.1:8080/api/modem-reset?action=modem-reset">` on any page the phone's browser renders triggers a radio reset. The KernelSU WebUI itself depends on cross-origin loopback access, so PNA is clearly not enforced in the primary client context.
+- **DNS-rebinding precondition**: the server never validates the `Host` header, so a remote page can rebind its own domain to 127.0.0.1 and drive the same endpoints; wildcard CORS makes the responses readable.
+
+Probe (local server instance, no auth headers anywhere): `POST /api/settings?action=settings` body `{"lan_enabled":true,"regenerate":true}` → `{"ok": true, "lan_enabled": true, "token_required": true, "token": "aiboq7PdqPMzdpsRKMdzO1gOrYIN9Ml8"}`; `config/settings.json` afterwards contains `"bind": "0.0.0.0"` + that token; unauthenticated `POST /api/write` and `GET /api/modem-reset` reach the modem apply/reset paths (they fail only because this host has no `/dev/diag` or `cmd phone` — on-device they execute); `Host: attacker.example` is accepted (HTTP 200).
+
+Evidence: `web/server.py:982-996` (`_auth_required` loopback exemption), `:1200-1211` (`update_settings` mint + return), `:1215-1231` (unauthenticated restart scheduling), A-26 (wildcard CORS), A-66 (GET mutations). Affected: every `/api/*` action while the server is loopback-bound (the default); the LAN pivot after restart. Remediation: require the bearer token (or a device-local secret) for state-changing actions even from loopback, and exempt only read-only diagnostics; validate the `Host` header against `localhost`/the configured bind; add `Access-Control-Allow-Private-Network` awareness and drop wildcard CORS on non-loopback binds; rotate the token when LAN is enabled from an unauthenticated context is not possible — instead make the mint require the existing token or a per-install secret. Confirmed.
+
+### A-179 — Bundled python launcher hardcodes the Termux RUNPATH; works only via service.sh's LD_LIBRARY_PATH (P3)
+
+`python/bin/python3.14` (v2.6 zip) has `DT_RUNPATH = /data/data/com.termux/files/usr/lib` (twice) and `DT_NEEDED = libandroid-support.so, libpython3.14.so, libc.so`, while the bundled shared libs live at `python/usr/lib/` (a mangled Termux prefix — launcher at `python/bin/`, stdlib at `python/lib/python3.14/`, libs left at `python/usr/lib/`). The interpreter starts at boot ONLY because `service.sh` exports `LD_LIBRARY_PATH="$MODDIR/python/usr/lib"` and bionic searches LD_LIBRARY_PATH before DT_RUNPATH; the RUNPATH is vestigial. Additionally, the Python selection test is `[ -f "$BUNDLED_PYTHON" ]` (`service.sh:33`), not `-x`: a present-but-inexecutable launcher (partial install, lost perms) makes `nohup "$PYTHON" …` fail silently with no fallback (the elif chain was already consumed).
+
+Probe: ELF parse of `python/bin/python3.14` — NEEDED `libandroid-support.so`/`libpython3.14.so`/`libc.so`, RUNPATH `/data/data/com.termux/files/usr/lib`; `libpython3.14.so` at `python/usr/lib/` exports `Py_BytesMain` (0x43a138) so the pair is symbol-consistent under LD_LIBRARY_PATH; stdlib import graph (http.server, socketserver, secrets, pathlib package, urllib, email, encodings, hmac, json + C deps fcntl, select, math, _posixsubprocess, _struct, _json, _hashlib, _socket, binascii, _ctypes, zlib, _interpchannels) all present in the zip — the bundle is import-complete, unlike v2.5's absent python (A-152/A-177). Not executable on macOS to fully confirm runtime (aarch64-android), but the static link chain is complete.
+
+Evidence: `python/bin/python3.14` RUNPATH/NEEDED (zip), `python/usr/lib/*.so` placement, `service.sh:33` (`-f`), `:59` (chmod 755 re-assert), `customize.sh:86` (chmod 755), `:17` (`BUNDLED_PYTHON`), `:18` (`BUNDLED_LD`). Affected: any direct invocation of the bundled interpreter outside service.sh (adb shell, manager terminal) fails on devices without Termux; bootstrap fragility if the LD_LIBRARY_PATH export is ever removed. Remediation: build the bundle with a relative RUNPATH (`$ORIGIN/../usr/lib` or `$ORIGIN/../lib` per final layout), place libpython under `python/lib/`, and gate on `-x` with an explicit fallback on exec failure. Confirmed (static).
+
+### A-180 — config/ is world-writable on-device: unprivileged apps can replace settings.json and pivot to LAN control (P1)
+
+The module config dir ends up mode 777 on the device (observed: `settings.json` 600, `config/` 777). The permission fix is conditionally skipped: `customize.sh` bails with `exit 0` before any chmod when it cannot resolve the module root (the known KernelSU metainstall mangling, same family as the seed that never lands), and the chmod that would cover the dir targets `$CONFIG_DIR` — which in the skip case is never created by customize.sh at all. At boot, `service.sh`'s bare `mkdir -p "$MODDIR/config"` (line 10) creates it with the ambient umask (000 in the boot context → 777), and nothing ever chmods it.
+
+In a world-writable dir, an unprivileged app can unlink and recreate **any** file regardless of its own mode (600 settings.json is read-protected only):
+
+- **Settings replacement → LAN pivot (second path to A-178's outcome)**: plant `config/settings.json` with `{"bind": "0.0.0.0", "token": "<attacker-known>", "drop_log": false}`; the server's `_load_settings` accepts it wholesale, so after a loopback-triggered `POST /api/restart` (unauthenticated — A-178) — or the next boot — the server binds all interfaces with a token the attacker holds. Distinct root cause from A-178 (directory permissions, not the auth gate), same blast radius.
+- **bands.json replacement**: force a hostile-but-valid band list on the next boot-apply.
+- **Drop-file symlink truncation**: the drop logger's `open(w.episode_file, 'w')` has no O_NOFOLLOW — a pre-planted symlink `drop_<ts>.txt` → `settings.json` truncates the server's own settings on the next drop.
+- **Log poisoning / disk fill**: `bandctl.log` (service.sh appends boot-apply results) is replaceable; junk files fill /data (tight partition on phones).
+- The temp-file guard in `_atomic_write_json` (O_NOFOLLOW on the temp name) does not help: the directory-level write permission governs unlink/replace, and a pre-created hard link at the temp name lets the app truncate `bands.json` through O_TRUNC when settings are saved.
+
+Probe: `ls -ld` of the module config dir on-device shows 777 (root, observed); `_load_settings` (`web/server.py:151-175`) accepts any dict with `bind` ∈ {127.0.0.1, 0.0.0.0} and any string token; `mkdir -p` at `service.sh:10` with no chmod follows; `customize.sh:14-22` (`exit 0` path skips `:77` chmod). Affected: every phone with the module installed (any app = any uid, INTERNET not even required — filesystem access needs no network). Remediation: chmod 755 config/ in service.sh (unconditionally, after mkdir) and re-assert on every boot; create drop_log with explicit 700/750; use O_NOFOLLOW in the drop logger; treat config/ as untrusted input. Confirmed (code + on-device mode observation; live app-level exploit not re-run this pass — adb detached).
+
+### A-181 — Drop watchdog stamps a false RECOVERED and resets the episode when dumpsys fails mid-drop (P2)
+
+`_drop_log_loop` derives the trigger state as `state = (reg or {}).get("service_state")` where `reg = _drop_state()` returns **None** on any dumpsys failure (timeout after 5s — `_run_dumpsys` → `_run_cmd` timeout; `TimeoutExpired`; empty/partial output with no `mServiceState=` line → `_parse_registration` returns None). None is not in the drop-state tuple, so the loop falls into the **recovery** branch: it appends `=== RECOVERED … (duration Ns) ===`, clears `in_drop`, and the next poll re-detects the still-down radio as a brand-new episode. The logger therefore records its most misleading data exactly when the modem is wedged — the moment dumpsys is most likely to hang (the RIL desync events this feature exists to capture). The recovery stamp is also used by the operator to decide the drop self-healed; a dumpsys glitch manufactures a fake "recovered in 10s".
+
+Probe (traced mock, `_drop_state` stubbed OUT_OF_SERVICE → None → OUT_OF_SERVICE): iteration 2 appends `RECOVERED (duration 10s)`, resets `in_drop`; iteration 3 starts a new episode; final file contains a spurious recovery between two drops that were one.
+
+Evidence: `web/server.py:378-379` (None → recovery branch), `:387-393` (recovery stamp + reset), `:316-321` (`_drop_state` → None), `:470-472` (`_run_dumpsys` timeout=5). Affected: drop-log analysis quality on every device with drop logging enabled; compounds A-176 (IWLAN signature missed entirely) and A-154 (wall-clock durations). Remediation: treat None as "unknown" — skip the poll (no stamp, no reset) and only stamp recovery on an explicit non-drop state; fold `network_type` into the recovery decision per A-176. Confirmed (mocked trace).
+
+### A-182 — The in-page drop record has the same IWLAN blind spot as the server watchdog, and is ephemeral (P2)
+
+The UI's own drop detection (`checkRegChange`, `web/index.html:1494-1508`) watches only `service_state` transitions: a DROP entry is logged only when service leaves `IN_SERVICE` (`if (!isIn && wasIn) logDrop(...)`). The field-observed drop signature — IWLAN/VoWiFi transport handover with both states IN_SERVICE (A-176) — is logged as a plain `REG` entry (`cur.net !== lastReg.net` fires, but the DROP tag does not), so the page the user watches misses the same precursor the server watchdog misses. Separately, the entire history is DOM-only (`logEntry` appends to `#history-list`, capped at `HISTORY_MAX = 200`): it is lost on every page reload and is never persisted, while the durable server-side snapshots (A-174) have no reader — the visible record is ephemeral and the durable record is invisible.
+
+Evidence: `web/index.html:1494-1528` (`checkRegChange` service-only gate, `logEntry` DOM append, `logDrop`), `:1127` (`HISTORY_MAX`). Affected: Diag tab history on every device; compounds A-176 (server watchdog) and A-174 (no snapshot reader). Remediation: tag DROP on `network_type` transport changes (IWLAN→LTE) while IN_SERVICE; persist the history (localStorage or the server API) so a reload does not erase the record. Confirmed (code read; IWLAN case traced — service unchanged → no DROP tag).
+
+### A-183 — service.sh kills unrelated processes whose cmdline contains "server.py" (P3)
+
+`kill $(pgrep -f "server.py") 2>/dev/null` (`service.sh:52`) uses `pgrep -f`, which regex-matches the FULL command line — `"server.py"` is a substring match, so any process whose cmdline contains `server.py` (e.g. `webserver.py`, `django-server.py`, another KernelSU module's python server, a Termux script) is SIGTERM'd on every boot AND every API restart. Verified locally: `pgrep -f "server.py"` returns both a plain `server.py` process and an unrelated `webserver.py` process. Also a boot/restart race: a manual "Restart server" during service.sh's boot window (the boot script runs ~1-2 min with wait_server/wait_radio) spawns a second service.sh whose kill takes out the first's freshly started server, and both proceed to boot-apply — a double QMI apply.
+
+Probe: on any POSIX host, `python3 -c 'import time; time.sleep(5)' & ` plus a process literally named `webserver.py` — `pgrep -f "server.py"` lists both. Evidence: `service.sh:52`. Affected: unrelated python servers on the phone (the installed voiprecorder module if it runs one), boot/restart races. Remediation: kill by exact path (`pgrep -f "$MODDIR/web/server.py"`) or record the PID at start; serialize restarts. Confirmed (local pgrep repro).
+
+### A-184 — The UI-facing dumpsys parsers have zero test coverage (P3)
+
+`test_server.py` (64 tests) covers settings/auth/validation/atomic-writes, but has NO test for `_parse_signal_object`, `_parse_signal_legacy`, `_parse_registration`, or the band-camping parse — the parsers that drive the entire Diag tab (signal graph, registration chips, camping list) and the drop-logger's trigger. The dual-format branches (modern `mServiceState={...}` object vs legacy flat `ServiceState: <voice> <data>`; `SignalStrength:{...}` vs flat list) — exactly the code an Android update can break — have no regression net; a format drift silently degrades the UI (nulls everywhere) and can blind the drop watchdog (A-181's family) with nothing failing loudly.
+
+Probe: `grep -c '_parse_signal\|_parse_registration\|_parse_band' test_server.py` → 0. Evidence: `web/server.py:649-756` (signal object/legacy), `:757-815` (registration), test_server.py absent coverage; A-163 covers the diag protocol tests, not the server parsers. Affected: regression risk on ROM/Android updates; compounds A-163. Remediation: fixture-based tests for both object and legacy formats of each parser (the modem_logs/ evidence files are ready-made fixtures). Confirmed.
+
+### A-185 — Drop-log snapshots persist radio-buffer contents (IMSI/phone numbers) in world-readable files (P2)
+
+When drop logging is enabled, each episode snapshot (`_drop_snapshot_text`) writes the last 40 PHONE0 lines of `logcat -b radio` (RIL traffic — IMSI, dialed/received numbers, cell identifiers), plus wifi status (SSID/BSSID), call state, and net counters. The radio buffer is root/radio-group protected on Android; the server runs as root and **extracts those lines into plain files**: `_drop_log_loop` writes episodes with `open(w.episode_file, 'w')` — no explicit mode, no O_NOFOLLOW — landing in `config/drop_log/` created by `os.makedirs(..., exist_ok=True)` inside the world-writable config tree (A-180; root umask 000 → 777 dir, 666 files). Any unprivileged app can read the snapshots (IMSI/phone-number exfiltration — a privacy boundary the radio buffer normally enforces) and can append forged `DROP`/`RECOVERED` lines (log poisoning, same family as A-180). The files persist until the next module update wipes them (A-173) — a long exposure window.
+
+Evidence: `web/server.py:324-345` (radio-buffer tail in snapshot), `:359-380` (`open(..., 'w')` default mode, `os.makedirs` in the 777 tree), A-180 (config perms), A-173 (wipe window). Affected: every device with drop logging enabled while an episode occurs. Remediation: write snapshots with 0o600 (and 700 for drop_log/), never persist raw radio-buffer lines (redact IMSI/numbers or drop the tail), and add O_NOFOLLOW. Confirmed (static — mode/placement from code; radio-buffer sensitivity is the platform's own protection).
+
+### A-186 — The documented crash bands (7/66) are exposed in every default path except the Rogers whitelist (P2)
+
+README: "LTE bands **7 and 66 are intentionally disabled** — a community-validated fix for Canadian carriers: the SM8250 modem can crash during 66↔7 handover." That exclusion exists ONLY in `_ROGERS_BANDS`. Every other path exposes the crash pair on the same SM8250 hardware:
+
+- `_ALL_BANDS` (`web/server.py:453-456`) — the non-Rogers default — includes LTE 7, 66 and NR 7, 66; the README itself says non-Rogers get "unrestricted (all bands)".
+- UI fallback `DEFAULT_LTE`/`DEFAULT_NR` (`web/index.html`) — the unreachable-server state — includes 7 and 66.
+- The UI band catalogs present 7 and 66 as selectable buttons; the server's 1-79 validation accepts them; a QMI apply of 66 succeeds (the crash fires later on 66↔7 handover, not at apply), and the mirror persists it to bands.json — so boot-apply re-applies the crash pair on every boot.
+- A mid-drop reset (operator prop empty → `seed_config_if_absent` skips; `read_config` falls back to the all-bands list) lands the user on 66/7.
+
+A Bell/Telus user (same alioth/SM8250) hitting "Reset to defaults" gets the documented crash pair selected and saved — contradicting the README's "intentionally disabled" claim, which holds only for the Rogers whitelist.
+
+Probe: `_ALL_BANDS` and `DEFAULT_LTE/NR` list inspection (66 and 7 present); README:95 documents the crash + the intentional-disable claim; `_normalize_bands` accepts 1-79 (66 passes); `_save_config_file` mirrors unconditionally. Evidence: `web/server.py:453-456`, `:1122-1149` (validation), `:1395-1400` (mirror), `web/index.html` catalogs, README:95. Affected: non-Rogers carriers on SM8250 devices, mid-drop resets. Remediation: exclude 7/66 from the all-bands default and the UI fallback (keep them reachable only via explicit user action with a warning), or block them server-side for SM8250. Confirmed (static — lists + README claim).
+
+### A-187 — Long drop episodes produce multiple files, only the last gets a recovery stamp (P3)
+
+When an episode outlasts `DROP_SNAP_GAP` (60s), `_drop_log_loop` creates a NEW episode file (a refresh so the radio tail stays relevant) and the old file is never touched again — the recovery stamp (`=== RECOVERED … ===`) is appended only to the last file. One drop of 3 minutes therefore produces 3 files, the first two of which permanently look like un-recovered drops. With `read_drop_log` returning filenames only (A-174), the file count is the operator's only signal — it overstates the drop count 3x and understates recovery (all but the last file show no recovery). The long-episode refresh also rewrites `=== DROP DETECTED ===` per file, so the same episode looks like a chain of separate drops.
+
+Probe: trace the loop with `DROP_SNAP_GAP = 1` and a 3-poll drop → 3 files, recovery line on the last only. Evidence: `web/server.py:381-387` (refresh creates a new file), `:391-398` (recovery stamps only `w.episode_file` — the last one). Affected: drop-log analysis on long outages (the device's observed drops lasted minutes). Remediation: keep one file per episode (append the refresh, don't rotate) or stamp all files of an episode on recovery; group files per episode in `read_drop_log`. Confirmed (code trace).
+
+### A-188 — Drop-logger episode state is lost on server restart mid-episode (P3)
+
+`_DROP_WATCH` (in_drop, drop_start, episode_file) is module-level in-memory state (`web/server.py:268`). The server restarts on every API restart (`POST /api/restart` → service.sh kills and respawns — also at boot) and the daemon thread dies with it. A restart while the radio is down orphans the episode file — no `=== RECOVERED ===` line is ever appended — and the fresh watchdog re-detects the still-down radio as a brand-new episode, so one outage yields two files, neither with a correct recovery (the orphan's recovery is missing, the new file's duration starts from the restart). Compounds A-181 (dumpsys-None false recovery) and A-187 (multi-file episodes).
+
+Evidence: `web/server.py:268` (`_DROP_WATCH = _DropWatch()` at import — state resets with the process), `:1215-1231` (restart respawns the server), A-187 (file rotation). Affected: drop analysis across restarts — a restart is plausible exactly during an outage (the user diagnosing the drop clicks Restart). Remediation: persist episode state (start timestamp + file) in settings.json or the drop_log dir on detection, and reconcile open episodes at startup. Confirmed (code trace).
+
+### A-189 — The test suite codifies the loopback-trust flaw as intended behavior (P2)
+
+`TestAuth` asserts the A-178 vulnerability as correct: `test_loopback_exempt_without_token` (`test_server.py:254-256`), `test_ipv6_loopback_exempt` (`:258-260`), and `test_loopback_request_not_gated_end_to_end` (`:321-324`) all assert that any loopback client bypasses authentication on every action — exactly the privilege-escalation surface A-178 documents. Fixing A-178 (requiring a token or device-local secret for state-changing loopback calls) breaks these tests, so the suite is a concrete barrier to the security remediation — a maintainer running the tests sees green and the flaw is re-verified as intended. Separately, the `allowed()` helper (`:243-252`) reimplements the gate sequence (`_auth_required` → `_check_auth`) instead of exercising `handle_api`, so a divergence between the helper's sequence and the real dispatch would pass tests while the shipped path differs (the end-to-end tests at `:307-324` partially close this).
+
+Evidence: `test_server.py:243-252,254-260,321-324`; A-178 (the loopback trust model). The mirror-on-failure behavior (A-186-family write persistence) has NO cementing test — `test_write_config_invalid_never_applies` covers validation-failure only, and no test exercises `_save_config_file` on a valid-but-failed apply. Affected: A-178 remediation, test realism. Remediation: rewrite the three tests to require credentials from loopback for state-changing actions (keep read-only diagnostics exempt); add a mirror-on-failure test that pins the intended (or fixed) semantics. Confirmed (test bodies read).
+
+### A-190 — The UI logs a false DROP whenever the server is unreachable (P3)
+
+`serverDown()` calls `logDrop('Server unreachable — …')` (`web/index.html:1343-1349`), so every server outage produces a red DROP entry in the in-page history — including the server restart the user just triggered with "Restart server", a LAN disconnect, a Wi-Fi blip, or a boot in progress. The history conflates radio drops (the thing the drop record exists for) with connectivity failures, showing "drops" that never happened. Compounds A-182 (history is ephemeral) and A-187 (file-count confusion) — three independent ways the visible drop record lies.
+
+Evidence: `web/index.html:1343-1349` (`serverDown` → `logDrop`), `:1509-1528` (`logEntry`/`logDrop` tags), `:2017-2027` (`restartServer` triggers the outage). Affected: Diag tab history interpretation on every page. Remediation: tag connectivity failures as `NET` (or `ERR`), reserve `DROP` for service_state transitions; suppress the entry when the outage follows a user-initiated restart. Confirmed (code read).
+
+### A-191 — The LAN token input is a plain text field (P3)
+
+`#lan-token-input` is `type="text"` (`web/index.html:1054`), so the bearer token is visible in cleartext while typed and while the field holds focus — on the phone's own screen (KSU WebUI) this is exposed to shoulder-surfing and to any screen-recording/screen-capture app or accessibility layer. A-130 covers the masked DISPLAY of the stored token; the input itself is unmasked. The token is the LAN remote-control credential (A-178).
+
+Evidence: `web/index.html:1054`. Affected: token entry on the phone. Remediation: `type="password"` with an eye-toggle (matching `lan-token-show`'s pattern). Confirmed.
+
+### A-192 — Deleting a preset has no confirmation and no undo (P3)
+
+The delegated click handler maps `data-action="del"` straight to `deletePreset(i)` (`web/index.html:1226-1230` — the delegated listener, `:1267-1272` — `deletePreset` splices + saves immediately). Presets are the user's curated band configurations (the Rogers 13/10 work, region combos), stored only in localStorage under `PRESETS_KEY` — one misclick on "Delete" permanently destroys one with no confirm, no undo, no trash. Every other destructive action in the UI has a guard: the modem reset uses a modal, the LAN change is a toggle.
+
+Evidence: `web/index.html:1226-1230,1267-1272`; the reset-modal pattern at `:1293-1300` (the established confirm convention). Affected: Settings → Presets. Remediation: confirm modal for delete (mirroring reset-modal), or a 2-click "Delete → Confirm" affordance. Confirmed (code read).
+
+### A-193 — A user-initiated modem reset logs a false DROP in the event history (P3)
+
+`confirmModemReset()` POSTs the reset, which powers the radio off and on (3s apart, or the 6s airplane toggle). During that window the registration poll sees the radio leave IN_SERVICE and `checkRegChange` fires `logDrop('Service lost: …')` — a red DROP entry caused by the user's own reset button. The history cannot distinguish a user-initiated reset from an outage, so a deliberate reset looks like a radio drop (same family as A-190's server-down entries — the visible drop record mixes user actions with failures). Compounding A-190: both the restart and the reset — the two things a user does to FIX a drop — each manufacture false DROP entries.
+
+Probe: trace `confirmModemReset` (POST) → modem_reset powers radio off → `pollRegistration` (2s) sees POWER_OFF → `checkRegChange` IN_SERVICE→POWER_OFF → `logDrop`. Evidence: `web/index.html:1293-1311` (`confirmModemReset`), `:1431-1447` (`checkRegChange`), `web/server.py:1500-1557` (reset powers radio off); A-190 (server-down entries). Affected: Diag tab history interpretation. Remediation: suppress DROP tagging while a reset/restart is in flight (set a `userInitiated` flag in confirmModemReset/restartServer, cleared on the next IN_SERVICE poll). Confirmed (code trace).
+
+### A-194 — Every QMI call pays a fixed ~3s discovery with only ~1.4s of timeout margin left (P2 extension of A-64)
+
+A-64 covers the worst-case discovery (98s) vs the 5s/8s subprocess timeouts. The sharper edge: `find_nas()` has a FIXED `time(NULL) + 3` second QRTR enumeration wait on EVERY invocation (no caching — each `qmi_band --get`/`--set` re-discovers from scratch), so the minimum discovery before the first response is ~3s + one 600ms probe ≈ 3.6s. The GET timeout is 5s — a **~1.4s margin** — so a modem that answers its first probe even slightly slowly (QRTR latency, radio instability — the exact conditions this module exists to diagnose) kills `qmi_band --get`; `/api/read` and `/api/health` fall back to diag/config while the radio is merely slow, not down. The SET (8s) leaves ~4s after the same fixed 3s. Every QMI read/apply also re-pays the full 3s enumeration, so the UI's 2s signal/registration polling and the health polls each spawn a qmi_band that burns 3s+ discovering before a single byte of band data — wasted subprocess time on every poll that touches QMI.
+
+Evidence: `qmi/qmi_band.c:608-673` (fixed `time(NULL)+3` wait, per-call discovery, no cache), `web/server.py:228-229` (5s/8s), `:1277-1281` (`_run_qmi(["--get"], 5)`), A-64. Affected: read/health/apply paths during slow-modem conditions; QMI-path latency on every call. Remediation: cache the discovered NAS endpoint (or persist it) across invocations, and/or raise QMI_GET_TIMEOUT above the fixed enumeration + probe budget. Confirmed (code read; the 3s minimum is unconditional).
+
+### A-195 — The README's screenshots show the pre-v2.6 dark UI while the shipped skin is white (P3 extension of A-19)
+
+`bands.png`, `diag.png`, and the settings screenshot referenced in the README were captured from the dark v2.5 skin; v2.6 shipped the white mobile skin (and the stale dark `index.html` remains at the repo root, A-157). A reader following the README sees a dark UI that no shipped artifact produces (root excepted). A-19 flagged the settings.png staleness; the same drift now applies to all three screenshots after the skin change, and the tracked PNGs predate the white tokens (`web/index.html:649-672`).
+
+Evidence: tracked `bands.png`/`diag.png` (dark-skin captures), README screenshot references, A-19, A-157. Affected: documentation accuracy. Remediation: re-capture the three screenshots from the v2.6 white skin (or the WebUI). Confirmed (tracked assets predate the white skin; v2.6 zip carries only code, no PNGs).
+
+### A-196 — Drop detection and modem recovery exist but are never connected: no auto self-heal (P2)
+
+The module has both halves of a self-healing loop and connects neither. Detection: the drop watchdog (`_drop_log_loop`, `web/server.py:347-403`) recognizes OUT_OF_SERVICE/POWER_OFF/EMERGENCY_ONLY. Recovery: the `modem_reset` endpoint (`:1500-1557`) performs the device-verified airplane-mode toggle / radio power cycle that the device notes show is the ONLY thing that brings the radio back ("Recovery ONLY after external airplane toggle (no auto self-heal)", 2026-07-14 drop investigation). Nothing calls `modem_reset` from the watchdog, and nothing in the drop logger attempts recovery — the user's core pain (radio dies, must manually toggle airplane mode, no self-heal) is a shipped behavior, not a limitation of the API. The drop logger exists to correlate the drop; the reset exists to fix it; the module ships with the two features permanently unconnected.
+
+This is a designed omission, not a crash — but it is the module's central user story (the device evidence drove the v2.5 logger), and the pieces (detection state, reset endpoint, `wait_radio` precedent in service.sh) are all present. Remediation (with the loop-guard caveat): a bounded auto-recovery — on drop detection, after a grace period, invoke the reset path once per episode (rate-limited, e.g. max N resets/hour) and re-check IN_SERVICE; the reset's success criterion must extend to recovery (A-197) or the auto-recovery would declare success while the radio is still dead.
+
+Evidence: `web/server.py:347-403` (watchdog never calls reset), `:1500-1557` (reset exists), service.sh `wait_radio` (the bounded-wait precedent), device notes ("no auto self-heal"). Confirmed (code + device evidence).
+
+### A-197 — The modem-reset success criterion is "radio powered off", not "radio recovered" (P3)
+
+Both reset paths verify the radio reached POWER_OFF (via `_wait_for_radio_state("POWER_OFF")`) and then report `{"ok": True}` immediately after re-enabling — neither waits for the radio to leave POWER_OFF or reach IN_SERVICE. The docstring says exactly this: "The radio is verified to reach POWER_OFF before success is reported." Re-camping takes 30s+ after a power cycle; a user reading `ok: true` after a reset that powered the radio off and back on believes the drop is fixed while the radio may still be OUT_OF_SERVICE — the reset reports success for a recovery it never observed. This compounds A-196: an auto-recovery wired to this endpoint would terminate (and rate-limit against) recoveries that never happened.
+
+Evidence: `web/server.py:1516-1517` (radio-power path returns ok:true after `radio power on`, no state wait), `:1548-1551` (airplane path returns ok:true after `_disable_airplane()`, no IN_SERVICE wait), `:1526-1528` (docstring states POWER_OFF-only criterion). Affected: reset UX and any future auto-recovery. Remediation: after re-enabling, wait bounded for IN_SERVICE (or at minimum for non-POWER_OFF) before reporting ok:true, mirroring `wait_radio`; report the observed post-reset state otherwise. Confirmed (code read).
+
+### A-198 — The root-exec boundary widens to third-party runtimes in the fallback chain, with no integrity check (P2)
+
+The server runs as root and execs three non-module paths when the bundled artifacts are absent, with no hash/ownership verification of what it runs:
+
+- `QMI_BIN` fallback: `web/server.py:225-227` — when the module's `qmi/qmi_band` is missing, the server silently execs `/data/local/tmp/qmi_band` as root.
+- Python fallback chain: `service.sh:20-23` — bundled → `/data/data/com.termux/files/usr/bin/python3` (Termux app) → `/data/local/tmp/pyroot/usr/bin/python3.14` (a manually-planted runtime in the shared adb temp dir). The whole server runs from whichever lands, as root.
+
+The device's own observed state was "bundled python missing, using pyroot fallback" (v2.5 install — A-152/A-177) — the module was executing its HTTP server from `/data/local/tmp/pyroot`, a directory the module's own deployment workflow treats as adb-push scratch (`/sdcard` push is broken post-reboot). A tampered or planted `/data/local/tmp/qmi_band` or pyroot tree (adb left open, a compromised shell script, another module's payload) executes as root with zero verification — the module's root-exec surface is not its own directory. This is distinct from A-180 (config perms) and A-178 (loopback API): it is the *binary* trust boundary.
+
+Evidence: `web/server.py:225-227` (QMI fallback), `service.sh:20-23` (python fallbacks), on-device log "using pyroot fallback". Affected: any device with the module installed where the bundled artifacts are missing. Remediation: refuse non-module runtimes by default (log loudly instead of silently substituting), verify the fallback binary against the shipped hash, or restrict fallbacks to a developer flag. Confirmed (code + observed device state).
+
+### A-199 — A transient IN_SERVICE blip closes the drop episode and stamps a false recovery (P3 extension of A-181)
+
+The watchdog's recovery branch fires on ANY non-drop state, including a real-but-transient `IN_SERVICE` (a flicker between two OUT_OF_SERVICE polls): the episode is closed, `=== RECOVERED (duration Ns) ===` is stamped, and the next poll (radio down again) opens a brand-new episode. The 10s polling cannot distinguish a blip from a recovery, so a flickering drop produces a false short-duration recovery plus episode fragmentation (compounding A-187's multi-file and A-181's dumpsys-None false recovery). The drop duration recorded is the blip, not the outage.
+
+Evidence: `web/server.py:386-393` (recovery branch on any non-drop state), A-181 (None case, same branch), A-187 (episode fragmentation). Affected: drop-duration accuracy on flickering outages. Remediation: require N consecutive non-drop polls (hysteresis) before stamping recovery, matching the drop-detection latency. Confirmed (code trace).
+
+### A-200 — /api/band-camping always errors: a pathlib.Path is returned un-stringified in the JSON (P1)
+
+`BAND_CAMPING_LOG` is a `pathlib.Path` (`web/server.py:241`, `MODDIR / "config" / "band_camping.log"`), and both return paths of `read_band_camping` return it raw — `{"log": BAND_CAMPING_LOG}` at `:1490` and `:1502`. `json.dumps` raises `TypeError: Object of type PosixPath is not JSON serializable`, `handle_api`'s catch turns it into `{"ok": false, "error": "Object of type PosixPath is not JSON serializable"}`, and the endpoint fails on EVERY call, on every platform, in every shipped version. The UI polls it every 5s (`index.html:1129,1346-1349`), `updateCamping` throws on `!r.ok` (`:1478-1481`), so the "Camped" live chip (`:995`) shows "—" and the "Band camping" list shows the empty state "No serving-cell samples yet." (`:1454`) forever — while the background sampler keeps writing the log (A-201). The feature's documented purpose (server.py:238-240: "so a band force can be validated offline — does the modem ever camp on a banned band?") is completely unfulfilled, and the misleading empty state masks the error. No test covers the endpoint (A-184's gap — the camping reader is one of the untested paths).
+
+Evidence: `web/server.py:241,1490,1502`; `index.html:995,1129,1454,1478-1481`; **live probe reproduced: `GET /api/band-camping?action=band-camping&limit=1` → `{"ok": false, "error": "Object of type PosixPath is not JSON serializable"}`**. Affected: every user of the camping UI + offline validation. Remediation: `str(BAND_CAMPING_LOG)` in both returns, or return a `path` field; add an endpoint test (A-184). Confirmed (code + live probe).
+
+### A-201 — The band-camping sampler runs unconditionally every 5s forever, writing an unrotated log, with no way to disable it (P3)
+
+`_band_camping_loop` starts at server boot with no settings toggle (`web/server.py:1631`), unlike the v2.5 drop logger: it runs `_run_dumpsys("telephony.registry")` — a full binder dump — every `BAND_CAMPING_INTERVAL` = 5s, 24/7, for the lifetime of the module, and appends one CSV line per poll (`:926-939`) with no rotation, cap, or size limit: ~17,280 lines/day of unbounded growth in the config tree (A-180's 777 directory). The only consumer is the endpoint that crashes (A-200), so the entire feature is dead weight: a permanent system_server/binder load added to the very radio stack being diagnosed, plus unbounded disk growth, serving a reader nobody can use.
+
+Evidence: `web/server.py:242,920-939,1631` (no gate), A-200 (dead reader), A-180 (config dir). Affected: every installed module, always on. Remediation: gate the sampler on a settings toggle (like drop-log), rotate/trim the log, or defer polling to the UI request. Confirmed (code trace).
+
+### A-202 — saveBands' confirmation read-back clobbers the user's selection and corrupts the userTouched guard (P3)
+
+After a successful write, `saveBands` confirms by polling /api/read once and applies the result unconditionally — `applyConfig(d2.lte, d2.nr, d2.source)` (`web/index.html:1301-1306`) — with NO `userTouched` guard. The guard exists exactly for this: `loadBands` (`:1263-1265`) — "Never clobber an in-progress selection" — only updates the source when `userTouched` is set, leaving the user's selection intact on every other refresh path. `saveBands` is the ONE path that clobbers: the user just toggled bands (userTouched=true), saves, and the read-back replaces their selection with the modem's report. With A-150 (no NV echo validation) and A-151 (root mirror masking a failed/partial apply), the read-back can show the PRE-apply state — the grid reverts to the old bands right after the "Applied (source: …)" toast — and because `userTouched` is still true, every subsequent poll now protects the READ-BACK state instead of the user's selection: the guard's semantics are silently corrupted and the user's edits are lost from view. The confirmation was intended to reflect applied truth; the defect is consuming it through a path that bypasses the very guard the codebase established.
+
+Evidence: `web/index.html:1263-1265` (guarded loadBands) vs `:1301-1306` (unguarded saveBands read-back); A-150/A-151 (unreliable read the read-back consumes). Affected: any save where the modem reports differently than requested (partial apply, mirror staleness, band 66/7 failure). Remediation: guard the read-back with `if (!userTouched)`, or only refresh `source`/summary on the read-back. Confirmed (code trace).
+
+### A-203 — HTTP 401 (auth failure) is routed into serverDown() by every caller: a false "server unreachable" banner plus a fabricated DROP entry while the server is up (P3)
+
+`apiFetch` surfaces 401s as a re-auth prompt (`web/index.html:1837-1841` — `if (r.status === 401) showReAuth(); return r;`) — but every caller then treats the 401 as a generic failure: `if (!r.ok) throw new Error('HTTP ' + r.status)` → the catch funnels it into `serverDown(e)` → `showBanner()` + `logDrop('Server unreachable — HTTP 401')` (`:1343-1349`). With a stale stored token on the LAN page (the token was regenerated on the phone), every poll 401s: the page reports the server DOWN and writes a fabricated "DROP — Server unreachable — HTTP 401" history entry — a third source of false drops (A-190: restart/disconnect, A-193: user modem reset, A-203: auth failure) — while the server is up and merely rejecting the credentials. The re-auth mechanism is undermined: the user sees the server-down banner + a DROP alongside the token prompt. `saveLanToken` recovers the banner (`:1908-1912`) but the false DROP entry and the misleading banner remain logged.
+
+Evidence: `web/index.html:1837-1841` (apiFetch 401 → showReAuth), `:1264-1270` (loadBands catch → serverDown), `:1375-1382` (pollSignal catch → serverDown), `:1343-1349` (serverDown → logDrop), A-190/A-193 (prior false-drop sources). Affected: LAN pages with a missing/stale token — every 401 → false DROP + banner. Remediation: distinguish 401 from network failure (check `r.status === 401` in the callers before throwing), or make `serverDown` accept a "not-auth" marker. Confirmed (code trace).
+
+### A-204 — The UI ships three times with no sync mechanism; the root copy is already stale, and the zip ships it twice (P3)
+
+The UI exists in three committed copies: root `index.html` (stale — A-157), `web/index.html` (served by the python server), and `webroot/index.html` (the KernelSU Manager WebUI). The zip ships TWO of them (`web/` and `webroot/` — verified from `bandctl-v2.6.zip`), and the repo a third. The web/webroot copies are byte-identical today, but the design has no sync step: a UI change must be applied to multiple committed copies by hand, and the root copy's staleness (A-157) is that failure mode already manifest. A future web/index.html edit that forgets webroot/ silently ships the Manager a different UI than the server page — and the module's own README ("webroot/ (KernelSU Manager WebUI)") describes them as distinct things, hiding the duplication. The drift risk is real and has already occurred once (the root copy).
+
+Evidence: `bandctl-v2.6.zip` entries (`web/index.html` + `webroot/index.html`), `git ls-files` (root `index.html` + `web/index.html` + `webroot/index.html`), `diff web webroot` (identical except `server.py`), A-157 (root copy stale). Affected: any future UI change; the Manager and the server page diverge silently. Remediation: generate `webroot/index.html` from `web/index.html` in the build (or make one a symlink), and delete the root copy. Confirmed (tree + zip listing).
+
+### A-205 — The project's own Makefile `push` target feeds the A-198 root-exec fallback (P3)
+
+`qmi/Makefile`'s `push` target runs `adb push qmi_band /data/local/tmp/` + `adb shell chmod 755 /data/local/tmp/qmi_band` — dropping the freshly-built binary into exactly the path the server's `QMI_BIN` fallback execs as root when the module binary is missing (`web/server.py:225-227`). The A-198 fallback is not a hypothetical attacker surface: it is the project's own documented dev workflow (the README's `adb forward` testing + this Makefile target, and the module's own convention of pushing to `/data/local/tmp` because `/sdcard` push is broken post-reboot). The dev tooling legitimizes a world-adjacent root-exec target, and a stale/planted binary there (from any earlier build, another project, or an attacker with shell access) is silently exec'd by the root server — the very "tampered binary executes as root" scenario A-198 describes, made routine by the build system.
+
+Evidence: `qmi/Makefile` (push target), `web/server.py:225-227` (fallback), A-198 (root-exec boundary). Affected: any dev machine or device where the fallback path contains a binary. Remediation: push to a module-private path, or verify the binary hash before exec (A-198's remediation). Confirmed (Makefile + code).
+
+### A-206 — The README's settings.png documents a control v2.x removed ("Auto-disable bands on boot"); the v2.x boot-apply has no UI disable (P3)
+
+Vision inspection of `settings.png` shows a Settings tab with an "Auto-disable bands on boot" toggle and "Disable unchecked bands at boot (applied on next boot)" — a control that does NOT exist in the v2.6 settings panel (read in full: Config Summary, Presets, Export/Import, Network access, Debug — no boot-apply toggle). The screenshot is doubly stale: dark skin (A-195) AND a removed control — the docs' Settings tab is a different product than the shipped one. The behavioral gap is real: the v2.x boot-apply is always-on, gated only by `config/bands.json` existence (`web/server.py:508-512`, README "config-file absent = no-op"), with no UI control to disable it — a user who wants to stop the boot re-apply must know to delete the config file (or know it from the README's parenthetical). That means A-186's crash-pair config (66/7), once saved, re-applies at every boot with no UI off-switch. [Note: the upgrade-behavior-change framing was dropped — A-173 shows module updates wipe the config dir, so no bands.json survives an upgrade to force the behavior on.]
+
+Evidence: `settings.png` (vision-verified "Auto-disable bands on boot" text), v2.6 `web/index.html` settings panel (no such control), `web/server.py:508-512` (config-gated always-on boot-apply), A-195 (dark skin), A-186 (crash pair), A-173 (config wipe on update). Affected: anyone relying on the screenshot to find the disable control, and anyone who wants the boot-apply off. Remediation: re-capture the screenshots against v2.6, and add a UI toggle to disable the boot-apply (or surface the delete-config disable path in the UI). Confirmed (vision + code).
+
+### A-207 — Drop-log snapshots accumulate without rotation or cap: privacy-sensitive files grow unbounded in the world-writable config tree (P3 extension of A-201/A-185)
+
+The drop logger writes one file per episode (`drop_YYYYMMDD_HHMMSS.txt`) and never rotates, trims, or caps them — `_drop_log_files()` lists only the newest 20 (`web/server.py:408-412`), but the files themselves accumulate forever. The camping log has the identical gap (A-201); the drop log is the sharper instance because the content is privacy-sensitive (last 40 radio-buffer lines with IMSI/numbers — A-185) and the files live in the A-180 world-writable config tree where an unprivileged app can also append/poison them. Over the module's lifetime the directory grows without bound, and the oldest snapshots (the historical evidence the drop research depends on) silently age out of the API listing while remaining on disk.
+
+Evidence: `web/server.py:371-377` (episode files), `:408-412` (top-20 list, no rotation), `:407-412` (drop-log GET), A-201 (camping-log growth), A-185 (privacy), A-180 (config perms), A-187 (multi-file per long drop). Affected: long-running installs; the snapshot archive and the privacy leak both grow. Remediation: cap/rotate the drop_log dir (e.g. keep the newest N episodes), mirroring A-201's remediation for the camping log. Confirmed (code trace).
+
+### A-208 — The drop snapshot's structured registration cannot capture the IWLAN transport context: at the collapse, network_type reads "Unknown" and the parser discards the WLAN/IWLAN entry (P3, live-verified)
+
+The drop logger's stated purpose is "correlation context" for the recurring POWER_OFF/IWLAN radio drop. Live-verified against the real ml.sh-era capture (`modem_drop_20260720_165632.txt` — healthy `IN_SERVICE/IN_SERVICE` + an `mNetworkRegistrationInfos` entry with `transportType=WLAN accessNetworkTechnology=IWLAN`, then collapse to `OUT_OF_SERVICE`): when the watchdog DOES trigger at the collapse, the snapshot's registration reads `{"service_state": "OUT_OF_SERVICE", "data_state": "OUT_OF_SERVICE", "network_type": "Unknown", "operator": null, ...}` — the collapsed block's `getRilDataRadioTechnology=0(Unknown)` — and the parser never extracts `mNetworkRegistrationInfos` at all, so the WLAN/IWLAN transport entry that precedes every observed drop is structurally absent from the structured snapshot. The wifi side is captured (`_wifi_status` — link + inet), and the raw radio tail may contain IWLAN session lines, but the structured context cannot distinguish an IWLAN/VoWiFi-handover drop (the actual observed mechanism) from a plain radio drop — the reader sees "Unknown" technology, not the IWLAN transport. A-176 covers the TRIGGER side (the IWLAN phase produces zero watchdog activity — also live-confirmed: 5 healthy+IWLAN polls produced no episode); A-208 covers the CONTENT side (even a correct trigger yields a snapshot whose structured registration lacks the transport evidence).
+
+Evidence: `web/server.py:324-328` (snapshot registration = the thin parsed dict), `_parse_registration` (extracts service/data/network/operator/roaming only), live harness (real capture through `_drop_log_loop`: IWLAN phase → no episode; collapse → snapshot with `network_type: "Unknown"`), A-176 (trigger side). Affected: every drop diagnosis relying on the structured snapshot. Remediation: parse + include `mNetworkRegistrationInfos`/WLAN-transport state in the snapshot registration (or capture the pre-collapse transport state). Confirmed (live run with real capture data).
+
+### A-209 — The watchdog chain had never been exercised with real-format dumpsys: the unit tests feed synthetic strings, and a real registry's nested braces + dual RAT blocks + IWLAN entries are unguarded (P3 extension of A-184)
+
+Until the live harness run, the watchdog chain (detection → snapshot → rotation → recovery stamp) had only ever seen the synthetic strings in `test_server.py` (`test_drop_state_detects_power_off` feeds a flat `"mServiceState={mVoiceRegState=3(POWER_OFF)...}"`). The real `dumpsys telephony.registry` is structurally different: `mNetworkRegistrationInfos` contains NESTED braces inside `mServiceState`, the registry carries dual-RAT blocks (healthy + collapsed), IWLAN transport entries, and `mSignalStrength` blocks. The live run proved the current code handles the real format (trigger, snapshot, rotation, recovery all worked — A-208/A-187/A-176 verified), but nothing guards it: a future parser change (e.g. fixing A-01/A-151's protocol work, or the A-184 parser tests) could silently break the drop logger against the real registry with no test catching it. The chain is the module's reason for existing (the drop investigation) and has zero integration coverage.
+
+Evidence: `test_server.py:679-689` (synthetic-string watchdog tests), real capture format (nested braces, dual blocks), live harness result (real format works today). Affected: future parser/maintenance changes. Remediation: add an integration test feeding a real-format registry capture (the modem_logs/ captures are the fixture) through `_drop_log_loop` with fast intervals, asserting the episode + recovery stamp. Confirmed (live run + test inventory).
+
+### A-210 — v2.6 REVERTED the shipped v2.2–v2.4 diag-protocol fix: released NV-echo validation and the compatible 3-arg signatures regressed to the v1.0-era file (P0 extension of A-01/A-150)
+
+The v2.4 release's `diag/protocol.py` (8159 B, byte-identical across v2.2–v2.4) defines `parse_nv_read_response(response, expected_nv_id=None, expected_sub_id=None)` and the write equivalent, with the echo guards `if expected_nv_id is not None and nv_id != expected_nv_id: return None` (v2.4:143-186, guards 166-168/207-209) — the LTE-vs-NR misattribution guard. The shipped v2.6 `diag/protocol.py` is byte-identical to the v1.0/v1.7/v2.1 file (7084 B): 2-arg unguarded `def parse_nv_read_response(response: bytes)` (v2.6:143, write at :172), zero `expected_nv_id` occurrences (verified). Meanwhile v2.6 `diag_client.py` is byte-identical to v2.4's and still calls the 3-arg form (diag_client.py:370,379). So the v2.4→v2.6 upgrade LOSES a shipped bugfix: diag-only devices hit the A-01 TypeError and lose the A-150 echo validation. This corrects A-01's framing ("the compatible signature existed only in the uncommitted v2.6.1 worktree" — false: v2.2–v2.4 all shipped it) and A-150's (documents the v2.6 absence without the regression point). The version-pair proof is new.
+
+Evidence: `bandctl-v2.4.zip` diag/protocol.py (6 `expected_nv_id` hits) vs shipped `diag/protocol.py:143,186` (0 hits); `diag_client.py:370,379` (3-arg call sites). Affected: every v2.6 upgrade on a diag-transport device. Remediation: restore the v2.4 protocol.py (the A-01/A-151 build-gate fix) — this is a release regression, not a new defect. Confirmed (zip diff + byte counts).
+
+### A-211 — POST /api/export follows attacker-planted symlinks in the world-writable config dir: unprivileged app achieves arbitrary root file write (P1)
+
+`export_config()` (`web/server.py:1402-1416`) writes into `EXPORT_DIR = MODDIR/config` with plain `open(path, 'w')` and a fully predictable name — `bandctl-export-%Y%m%d-%H%M%S.%03d.json` (1000 variants per second, `:1410-1412`). `config/` is mode 777 on-device (A-180) and POST /api/export is callable unauthenticated from any loopback client (A-26/A-178). An unprivileged app plants ~2000 symlinks covering the current+next second's export names pointing at arbitrary targets, POSTs /api/export, and the root server opens through one symlink (`'w'` truncates) and writes attacker-chosen JSON (the raw unvalidated body — A-155) to the target: root-privileged arbitrary file write to any path the server's domain can write (service.sh overwrite = boot DoS, web/index.html replacement, other apps' /data/data files). This exceeds A-180 (write inside config/ only). The fix pattern exists in the same file: `_atomic_write_json` opens its temp with O_NOFOLLOW and its docstring (`:187-191`) states exactly this threat model. The same unprotected-open family affects the drop-log writers (`open(w.episode_file,'w')` :379, recovery append :393, camping append :935).
+
+Evidence: `web/server.py:1402-1416` (plain open + predictable name), `:196-198` (O_NOFOLLOW in _atomic_write_json), A-180/A-26/A-178/A-155 preconditions. Affected: every installed module with the 777 config dir. Remediation: O_NOFOLLOW|O_EXCL into a random temp name + os.replace() over the timestamped name (mirror _atomic_write_json); fix A-180 at the source (0755 root-owned config/); apply O_NOFOLLOW to the drop-log/camping writers. Confirmed (code trace + the codebase's own threat-model docstring).
+
+### A-212 — The bundled python's `_ssl` and `_hashlib` can never load on-device: DT_NEEDED libssl.so.3/libcrypto.so.3 are absent from the bundle and unsatisfiable by bionic (P2)
+
+The shipped `python/lib/python3.14/lib-dynload/_ssl.cpython-314-aarch64-linux-android.so` has `DT_NEEDED = libandroid-support.so, libssl.so.3, libcrypto.so.3, libpython3.14.so, libc.so`, and `_hashlib...so` needs `libcrypto.so.3`; `usr/lib/` contains no libssl.so.3/libcrypto.so.3 (verified: zero libssl/libcrypto entries in the zip), and bionic ships only unversioned BoringSSL `libssl.so`/`libcrypto.so` — it cannot substitute Termux's SONAME. So `import ssl` and `import _hashlib` fail on-device: TLS/HTTPS is dead and hashlib silently falls back to pure-Python (`hashlib.py:169-178` guards the import; `urllib/request.py:109-112` sets `_have_ssl=False`; `hmac.py:6-9` falls back). Nothing in the current code paths hard-fails (all service.sh traffic is cleartext loopback HTTP), but the runtime is not what it claims: the A-52 remediation (TLS for LAN mode) is structurally impossible with this bundle, and the failure is silent. The 64/64 suite passes on the macOS dev box (system python has its own libssl) and cannot detect it. A-179 verified the launcher RUNPATH + .py/.so file existence but never the DT_NEEDED shared-lib closure. The same incomplete-Termux-extraction pattern affects other non-closure modules: `_sqlite3`→libsqlite3.so, `_curses`→libncursesw.so.6, `_gdbm`→libgdbm.so, `_zstd`→libzstd.so.1, `readline`→libreadline.so.8, `_multiprocessing`→libandroid-posix-semaphore.so, and usr/lib/libcrypt.so→libcrypto.so.3 — all absent.
+
+Evidence: `bandctl-v2.6.zip` python/ entries (0 libssl/libcrypto, 1 `_ssl.cpython-314-aarch64-linux-android.so`), objdump DT_NEEDED of the two modules + libpython3.14.so (resolvable), `hashlib.py:169-178` / `urllib/request.py:109-112` / `hmac.py:6-9` import guards. Affected: any https path, hashing perf, or the A-52 TLS remediation. Remediation: bundle libssl.so.3/libcrypto.so.3 (Termux build) or strip the dead modules; verify the DT_NEEDED closure in CI. Confirmed (zip listing + dynamic-section inspection).
+
+### A-213 — qmi_band's timeout loops use wall-clock `time(NULL)`: a backward clock step (NITZ/carrier sync) stretches every probe/discovery timeout by the skew and can overflow the poll() argument; forward steps truncate waits (P2 extension of A-64/A-194)
+
+`probe_raw()` (qmi_band.c:302-305), `find_nas()` (:609-612) and `do_scan()` (:432-435) capture `end = time(NULL) + <budget>` once from CLOCK_REALTIME and compute each `poll()` timeout as `(int)(end - time(NULL)) * 1000`. A backward clock correction of Δ makes `time(NULL) < end` hold for Δ, inflating the 800ms probe to Δ+1.4s and the fixed 3s enumeration to Δ+3s — the exact NITZ/carrier time-sync event the drop investigation tracks; a large step overflows `int` in the ms computation (signed-overflow UB). A forward step truncates: `probe_raw` returns 0 instantly ("timeout") and the enumeration breaks early. `recv_response()` (:329-345) already uses `clock_gettime(CLOCK_MONOTONIC)` with 200ms slices — same file, same purpose — proving the wall-clock pattern is not deliberate. Directly worsens A-194: a backward step during a UI read makes the server's 5s kill (web/server.py:228-229) fire on a healthy modem.
+
+Evidence: `qmi/qmi_band.c:302-305,432-435,609-612` (wall-clock) vs `:329,337-345` (monotonic); `web/server.py:228-229` (5s/8s kill bounds). Affected: QMI reads/writes around any clock adjustment. Remediation: replace the three loops with the CLOCK_MONOTONIC deadline pattern from recv_response. Confirmed (code trace — airtight: end captured once, subtraction is wall-clock).
+
+### A-214 — Concurrent drop-logger loops (the documented double-start race) make the A-128 filename collision systematic: the second loop's snapshot is silently skipped and its RECOVERED stamp is appended into the first loop's file — one file claims two recoveries for one drop (P2 extension of A-128/A-22/A-183)
+
+A-128 frames the `drop_YYYYMMDD_HHMMSS` collision as a rare same-second coincidence; A-22/A-183 document that two server instances DO run concurrently (boot double-start, the `pgrep -f server.py` kill + respawn races). Each instance runs its own `_drop_log_loop` with its own `_DROP_WATCH` against the SAME DROP_LOG_DIR with unsynchronized 10s polls — so two loops detecting the same outage within one wall second is the rule. Live harness proof (two loops, one dir): one file ends `DROP DETECTED + snapshot + RECOVERED + RECOVERED`, the second loop's correlation snapshot (registration/wifi/counters/radio tail) lost. Compounds A-181/A-199 (false recoveries) into the surviving file.
+
+Evidence: `web/server.py:371-372` (second-precision names), `:378` (exists() guard skips the second loop's snapshot), `:393-394` (recovery appends to whatever episode_file points at), `:268` (module-level watch), `service.sh:51-53` (double-start race); harness `/tmp/watchharness/results2/scn_j/`. Affected: every drop during a double-started window — corrupted drop record. Remediation: unique per-instance filenames (pid/random suffix), or inode-check the recovery append, or serialize drop-log writes with a file lock. Confirmed (two-loop harness run).
+
+### A-215 — A same-second successor loop stamps its RECOVERED into the A-188 orphaned episode file: the orphan looks complete (DROP + snapshot + RECOVERED) while being a chimera, inverting A-188's observable (P2 extension of A-188)
+
+A-188 asserts the restart-orphaned episode file "never gets a RECOVERED line". Harness scenario f2 (freeze loop1 after detection, fresh `_DROP_WATCH` + loop2 within the same second, recover): the successor's recovery lands in the ORPHAN — one file with `DROP DETECTED 23:29:35 + snapshot + RECOVERED 23:29:36 (duration 0s)` — the stamp's second differing from the filename/header's, the snapshot from the pre-restart loop, the recovery from the post-restart loop, the successor's episode absent. The operator reads a false "recovered" for the very outage A-188 says leaves no recovery — the misleading stamp hides the evidence loss it was supposed to flag.
+
+Evidence: `web/server.py:393-394` (recovery append targets episode_file — which the successor set to the same-second name), `:378` (guard skips the successor's snapshot), `:352/:268` (fresh watch per loop); harness `/tmp/watchharness/results2/scn_f2/`. Affected: restart mid-drop when recovery lands within the start second (fast restart, or the double-start race). Remediation: same as A-214 (unique names), plus persist episode identity (drop_start/watch id) in the file header and treat a recovery whose stamp second differs from the file's as suspicious. Confirmed (harness run).
+
+### A-216 — The documented "config-file absent = no-op" boot-apply contract was silently removed in v2.3: v2.0 genuinely implemented the disable, the v2.3+ seed recreates the Rogers file, and the docstring + README still promise the v2.0 contract (P2)
+
+v2.0's `boot_apply()` docstring: "The config file is the source of truth here - it is NEVER rewritten. Missing or unreadable config ... are skips" with `if not os.path.exists(CONFIG_FILE): return {ok:True, skipped:True}` (v2.0:781-799) and NO `seed_config_if_absent` anywhere — deleting bands.json genuinely disabled boot re-apply. v2.3's boot_apply() first calls `seed_config_if_absent()` (v2.3:1147; v2.6:1350) and the server seeds at startup (v2.6:1637, def :503-524), recreating the Rogers bands.json on any 302720 SIM — while the v2.3/v2.6 docstring still says "it is NEVER rewritten. A missing or unreadable config is a skip" (v2.6:1343-1345) and README.md:60 still promises "config-file absent = no-op". Rogers users who disabled boot re-apply per the documented method silently get it re-enabled after upgrading to v2.3+ (the update wipes config — A-173 — and the seed recreates it). A-119 documents the v2.6 state but not the v2.0-genuine-disable, the v2.3 regression point, or the self-contradictory docstring+README.
+
+Evidence: `bandctl-v2.0.zip` (no seed; exists-skip at 793-799), v2.3/v2.6 `web/server.py:503-524,1350,1343-1345,1637`, `README.md:60`. Affected: Rogers users who disabled boot-apply per docs. Remediation: remove the seed from boot_apply (or add the A-206 disable toggle) and fix the docstring + README to the real contract. Confirmed (version diff).
+
+### A-217 — qmi_band --set gates the NR5G mode-preference flag on the parsed token COUNT, not the valid-band mask: out-of-range NR input flips the flag with all-zero SA/NSA masks, prints a lying count, and exits 0 (P2 extension of A-164/A-165/A-166)
+
+`build_nr_masks()` returns the raw `parse_csv` count (`return n`, qmi_band.c:266) after skipping `b < 1` (:258) and `idx < 8` (:264) — not the count of bands that survived. `main()` then sets `mode_pref |= QMI_RAT_NR5G` from that count (:729-731). `qmi_band --set 1 513` (or the A-166 ERANGE case) prints `SET lte bands=1 nr bands=1 mode=0x0050`, sends the LTE+NR5G preference with two all-zero 64-byte NR masks, and exits 0 — the modem is asked to "prefer NR5G" with an empty band list. The LTE side has the parallel guard (`nlte <= 0 || lte == 0` → refuse, :727-728); the NR side has no zero-mask guard, and empty-string input (`--set 1 ""`) correctly yields n=0 → no flag — so two "no valid NR bands" inputs diverge. Server flow is protected (`_validate_bands` caps 1..79), so reach is direct CLI — same as A-166.
+
+Evidence: `qmi/qmi_band.c:251-267` (return n), `:724-731` (flag from count), `:727-728` (LTE guard), `:732` (misleading printf). Affected: scripted/direct `--set` users. Remediation: return the valid-band count and gate the NR5G flag on the non-empty mask, refusing when NR input is non-empty but produces zero masks. Confirmed (code trace).
+
+### A-218 — test_invalid_token_normalized_to_null cements the A-105 remote-lockout state as the intended contract (P2 extension of A-189)
+
+`_load_settings` (web/server.py:167-172) accepts `bind:"0.0.0.0"` even when the token is invalid, producing `{bind:"0.0.0.0", token:None}` — the exact A-105 state (LAN "on", every non-loopback client 401-gated, no credential exists, remote lockout with the server bound to 0.0.0.0). `test_server.py:103-108` asserts that dict as the expected contract — A-105's remediation (downgrade the bind to 127.0.0.1 or force a token when the token is invalid) fails the test. A-189 scoped its cementing finding to the three TestAuth exemption tests + the `allowed()` helper; this is TestSettingsLoad cementing a different defect (A-105) via a different assertion.
+
+Evidence: `test_server.py:103-108`; `web/server.py:167-172`. Affected: the A-105 P1 lockout fix. Remediation: rewrite the test to assert the fixed contract (invalid token must downgrade the bind). Confirmed (test body + code).
+
+### A-219 — test_snapshot_text_includes_context cements the A-185 radio-buffer privacy leak into drop snapshots (P2 extension of A-189)
+
+`_drop_snapshot_text` (web/server.py:324-345) appends the last 40 PHONE0 `logcat -b radio` lines (raw RIL traffic: IMSI, dialed numbers, cell IDs) to every drop snapshot — the A-185 privacy leak into the world-readable config tree. `test_server.py:686-703` asserts `'radio tail' in text` (:703), pinning that the section must exist — A-185's remediation (redact or drop the raw tail) breaks the test. The test's own fixture sanitizes the tail to a benign `REG_HOME` line, so it pins the leak MECHANISM while never asserting leaked content — green tests while real snapshots exfiltrate IMSI/numbers.
+
+Evidence: `test_server.py:686-703`; `web/server.py:329-344` (logcat tail + PHONE0 filter). Affected: the A-185 privacy fix. Remediation: assert the redacted contract (no raw radio-buffer lines, or an explicit 'radio tail omitted' marker) and add a no-PHONE0-payload assertion. Confirmed (test body + code).
+
+### A-220 — The token-return tests cement the A-178 mint-and-exfiltrate vector: the suite asserts the fresh bearer token IS returned in the enable/regenerate response (P2 extension of A-189)
+
+`update_settings` (web/server.py:1187-1213) mints a token on enable and returns it in the HTTP response (`"token": SETTINGS["token"] if created else None`). With loopback unauthenticated (A-189's exemption tests), any local app/web page can POST `{"lan_enabled":true}` and receive the fresh bearer token in the body — the "mint AND steal" half of A-178. `test_enable_creates_token_and_returns_it_once` (`test_server.py:161-177`: `assertIsInstance(first["token"], str)`, `len == 32`) and `test_regenerate_rotates_and_returns_new_token` (`:179-188`: response token echoes SETTINGS) assert the disclosure as intended. A fix that stops returning credentials to unauthenticated callers breaks both — a barrier independent of the three exemption tests A-189 flagged.
+
+Evidence: `test_server.py:161-188`; `web/server.py:1205-1212`; A-178 ("creates AND returns a fresh token in the response"). Affected: the A-178 security fix. Remediation: assert the credential is NOT disclosed (return a `token_minted` flag), or gate the mint on auth. Confirmed (test bodies + code).
+
+### A-221 — _parse_qmi_get sorts the NR union lexicographically as strings: '1','10','2' ordering disagrees with the numeric LTE order (P3)
+
+`nr = sorted(set(sa or []) | set(nsa or []))` (web/server.py:570) string-sorts band numbers, so a read with NR {1,10,2} returns `['1','10','2']` while LTE keeps the C printer's numeric order — the two lists disagree, the UI/API "current bands" render out of order, and a re-apply CSV built from `nr` is non-numeric. Sets are unaffected — functionally harmless, order-only.
+
+Evidence: `web/server.py:570` (string sort), consumed at `:1278-1283` and `:1564-1568`. Probe: `_parse_qmi_get('    LTE bands: 1 2\n    NR5G SA bands: 1 10\n    NR5G NSA bands: 2 3\n')` → `{'lte': ['1','2'], 'nr': ['1','10','2','3']}`. Remediation: `sorted(..., key=int)`. Confirmed (code + probe).
+
+### A-222 — Saving a preset with an empty name is a silent no-op: the modal stays open with no error or hint (P3)
+
+`confirmSavePreset()` does `var name = ($('preset-name-input').value || '').trim(); if (!name) return;` (web/index.html:1690-1693) — with an empty name the modal simply stays open and nothing happens; no toast, no inline error, no focus state change. Every other invalid-input path in the UI reports (toasts, status lines). A user who clicks Save before typing (or with only spaces) gets zero feedback about why the modal will not close.
+
+Evidence: `web/index.html:1690-1693` (confirmSavePreset empty-name return), the modal markup `:1070-1077`. Affected: preset users on a misclick. Remediation: toast "Enter a name" (or disable Save until non-empty). Confirmed (live UI drive: click Save with empty field → modal stays, no feedback, zero console errors).
+
+### A-223 — loadPreset/onImportFile desync the tab bar from location.hash: the current tab becomes a dead tap until the hash changes (P3)
+
+`loadPreset()` and `onImportFile()` call `switchTab('bands')` (web/index.html:1720, 1790) — which updates the panels and the tab buttons' active state — but never touch `location.hash`, which still holds the previous tab (e.g. `#settings`). The delegated tab handler (`:2010-2013`) sets `location.hash = tab.dataset.tab` and relies on the hashchange listener — so tapping the tab whose hash is ALREADY current (e.g. Settings) fires no hashchange and does nothing: the user is stuck on the bands view with the settings button a dead tap. Live-confirmed: after loading a preset from the Settings tab, the Settings tab button cannot return the user to Settings.
+
+Evidence: `web/index.html:1720,1790` (switchTab without hash update), `:2010-2013` (delegated tab handler), `:2068-2070` (hashchange → onHash). Affected: preset-load/import users. Remediation: set `location.hash = 'bands'` in both functions (or make the tab handler compare the active panel, not the hash). Confirmed (live UI drive).
+
 ## Not yet fixed
 
 All findings above remain open unless explicitly marked otherwise by a later
