@@ -18,6 +18,8 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
    - **Browser** — open **http://localhost:8080** from the device browser.
    - From a computer: `adb forward tcp:8080 tcp:8080`, then open http://localhost:8080.
 
+   The listen port defaults to **8080** and can be changed via `"port"` in `config/settings.json` (e.g. to dodge a LAN app squatting 8080); the Web UI resolves the API base automatically, so no other configuration is needed after a restart.
+
 ## Screenshots
 
 <p align="center">
@@ -57,7 +59,7 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
   - `GET/POST /api/drop-log?action=drop-log` — debug drop logging: enable/disable the watchdog, list recorded drop snapshots
 - **Live band-camping readout** — the Diagnostics tab shows the current camped band (band + EARFCN) live, so you can see whether a forced band actually stuck.
 - **Debug drop logging** — Settings > Debug > Drop logging (default off): when enabled, a server-side watchdog stamps every radio drop (OUT_OF_SERVICE / POWER_OFF / EMERGENCY_ONLY) with correlation context — registration state, call state, Wi-Fi link/AP, data counters, radio-buffer tail — and records the recovery duration. Snapshots land in `config/drop_log/` and survive reboots; the toggle is live, no restart needed.
-- **Boot-time band re-apply** — the persisted config is re-applied automatically at every boot (pre-unlock, no app needed); config-file absent = no-op. There is no UI toggle to disable the boot re-apply. To stop it, delete `config/bands.json` — but note the server re-seeds the carrier default on Rogers (302720) devices, so there the re-apply resumes at the next server start or `POST /api/boot-apply` call.
+- **Boot-time band re-apply** — the persisted config is re-applied automatically at every boot (pre-unlock, no app needed); config-file absent = no-op. There is no UI toggle to disable the boot re-apply. To stop it, delete `config/bands.json` — the server **never re-seeds it** (the boot-apply path is read-only w.r.t. the config), so a missing file stays a permanent no-op until you save/apply a new config from the UI.
 - **Carrier-aware defaults** — Rogers (302720) gets a curated whitelist; other carriers get unrestricted defaults until you lock bands.
 - **RSRP graph UI** — the web UI plots signal strength over time.
 - **Config persistence** — band settings are mirrored to `/data/adb/modules/bandctl/config/bands.json` and survive reboots.
@@ -82,7 +84,7 @@ By default the server listens on **127.0.0.1 only** — reachable from the phone
 
 ## Band configuration
 
-Default config on Rogers (MCC/MNC 302720), seeded automatically by the server on first boot (`config/bands.json`):
+Default config on Rogers (MCC/MNC 302720), written by the installer (`customize.sh`) on install (`config/bands.json`):
 
 ```json
 {
@@ -96,8 +98,8 @@ LTE bands **7 and 66 are intentionally disabled** — a community-validated fix 
 ## Development / testing
 
 - Tested on: **Poco F3 (alioth)**, **ArrowOS 13.1**, kernel **4.19.325-cip130**.
-- Tests: **264/264 passing** (`python3 -m pytest test_server.py test_diag_client.py test_diag_protocol.py -q`).
-- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `webroot/` (KernelSU Manager WebUI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), `config/bands.json` (reference default band config; the zip ships without it and the server seeds it on first boot), and `tools/check_release_zip.py` (release gate: run `python3 tools/check_release_zip.py bandctl-*.zip` before publishing — it fails a zip missing the bundled interpreter, whose `diag/protocol.py` differs from the tested copy, or whose `_ssl`/`_hashlib` DT_NEEDED closure is unsatisfiable on bionic).
+- Tests: **267/267 passing** (`python3 -m pytest test_server.py test_diag_client.py test_diag_protocol.py -q`; the web UI also has a dev-only jsdom suite under `tests/js/`).
+- The repo contains the complete module source: `customize.sh` (installer), `service.sh` (boot service), `web/` (pure-stdlib Python HTTP server + UI), `diag/` (pure-Python diag protocol stack), `qmi/` (the QRTR QMI band client — `qmi_band.c` + Makefile, built static for aarch64 with musl; only the binary ships in the module zip), `python/` (bundled Python 3.14 runtime, shipped in the zip), `config/bands.json` (reference default band config; the zip ships without it and the installer seeds it on first install), and `tools/check_release_zip.py` (release gate: run `python3 tools/check_release_zip.py bandctl-*.zip` before publishing — it fails a zip missing the bundled interpreter, whose `diag/protocol.py` differs from the tested c…
 
 ## License
 
