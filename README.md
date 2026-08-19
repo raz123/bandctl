@@ -23,21 +23,12 @@ A standalone KernelSU module for LTE/NR band control and modem diagnostics on Qu
 ## Screenshots
 
 <p align="center">
-  <img src="bands.png" alt="Bands tab" width="180" />
-  <br />
-  <em>Bands tab — LTE/NR band tiles with live active counts</em>
-</p>
-
-<p align="center">
-  <img src="diag.png" alt="Diagnostics tab" width="180" />
-  <br />
-  <em>Diagnostics tab — live signal graph, RSRP/RSRQ, registration chips</em>
-</p>
-
-<p align="center">
+  <img src="bands.png" alt="Bands tab" width="180" />&nbsp;
+  <img src="diag.png" alt="Diagnostics tab" width="180" />&nbsp;
   <img src="settings.png" alt="Settings tab" width="180" />
-  <br />
-  <em>Settings tab — config summary, presets, export/import, network access, debug drop logging</em>
+</p>
+<p align="center">
+  <em>Bands tab &middot; Diagnostics tab &middot; Settings tab</em>
 </p>
 
 ## Features

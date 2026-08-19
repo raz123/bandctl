@@ -1,6 +1,6 @@
 id=bandctl
 name=Band Controller
-version=2.7.3
-versionCode=23
+version=2.7.4
+versionCode=24
 author=ohmypi
-description=Standalone web UI for LTE/NR band control and modem diagnostics. Direct QMI band apply (QRTR), re-applies your band config automatically at boot, bundled Python runtime — no Termux, no third-party apps.
+description=LTE/NR band control + modem diagnostics web UI. Direct QMI apply, no third-party apps.
