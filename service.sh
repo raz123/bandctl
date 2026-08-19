@@ -38,6 +38,19 @@ if [ -r "$MODDIR/config/settings.json" ]; then
     *) PORT=$_PORT ;;
   esac
 fi
+# Bearer token for state-changing actions (A-178/A-189: the server requires
+# the token even from loopback when one is configured, so boot re-apply
+# must send it or it 401s silently every boot). Read from settings.json
+# like the port; absent/null/invalid token -> no Authorization header.
+TOKEN=""
+if [ -r "$MODDIR/config/settings.json" ]; then
+  _TOK=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$MODDIR/config/settings.json" | head -n1)
+  case "$_TOK" in
+    ''|*[!A-Za-z0-9_-]*) : ;;   # absent / non-bearer-safe -> no header
+    *) TOKEN=$_TOK ;;
+  esac
+fi
 LOG="$MODDIR/config/bandctl.log"
 SERVER_LOG="$MODDIR/config/server.log"
 
@@ -207,12 +220,15 @@ if wait_server; then
     # failure is logged with its rc — never as a blank "boot-apply -> " line.
     resp=$("$PYTHON" -c 'import sys, urllib.request
 try:
-    req = urllib.request.Request(sys.argv[1], method="POST")
+    headers = {}
+    if len(sys.argv) > 2 and sys.argv[2]:
+        headers["Authorization"] = "Bearer " + sys.argv[2]
+    req = urllib.request.Request(sys.argv[1], method="POST", headers=headers)
     with urllib.request.urlopen(req, timeout=120) as r:
         sys.stdout.write(r.read().decode("utf-8", "replace"))
         sys.exit(0 if r.status == 200 else 1)
 except Exception:
-    sys.exit(1)' "http://127.0.0.1:$PORT/api/boot-apply?action=boot-apply" 2>/dev/null)
+    sys.exit(1)' "http://127.0.0.1:$PORT/api/boot-apply?action=boot-apply" "$TOKEN" 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "$(date) bandctl: boot-apply -> $resp" >> "$LOG"
