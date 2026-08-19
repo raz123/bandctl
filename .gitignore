@@ -1,7 +1,8 @@
 __pycache__/
-*.pyc
+*.py[cod]
+node_modules/
+council/
 
 # host test binary built by `make -C qmi test`
 qmi/test_qmi_band
 qmi/test_qmi_band.dSYM/
-node_modules/

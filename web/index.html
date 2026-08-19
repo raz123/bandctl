@@ -847,10 +847,10 @@ button, input { font: inherit; }
 .readout .unit { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1; }
 
 .chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.chip { min-width: 0; min-height: 70px; padding: 11px 10px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink); }
+.chip { display: flex; flex-direction: column; align-items: stretch; overflow: hidden; min-width: 0; min-height: 70px; padding: 11px 10px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink); }
 .chip .state-chip-top { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
 .chip .label { display: block; min-width: 0; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.chip .chipval { display: block; margin-top: 5px; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; line-height: 1.3; overflow-wrap: break-word; } /* A-003: show full state, wrap instead of truncating */
+.chip .chipval { display: block; margin-top: 5px; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; line-height: 1.3; white-space: normal; overflow-wrap: break-word; } /* A-003: show full state, wrap instead of truncating */
 .state-icon { flex: 0 0 auto; width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .state-icon.check-icon circle { fill: transparent; stroke: var(--line-strong); }
 .state-icon.check-icon path { stroke: transparent; }
